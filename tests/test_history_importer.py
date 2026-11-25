@@ -145,3 +145,86 @@ def test_build_stations_from_history_generates_2_to_4_stations() -> None:
         assert len(st.seed_artists) >= 1
         assert st.max_popularity_views > 0
         assert st.exploration_rate > 0
+
+
+def test_japanese_takeout_filters_ads_tutorials_cooking_and_normalizes_topic_and_brackets(tmp_path: Path) -> None:
+    """[M6] Japanese Takeout must reject tutorials/cooking/ads and normalize '- トピック' and '「...」'."""
+    takeout_path = tmp_path / "watch-history.json"
+    entries = [
+        {
+            "header": "YouTube",
+            "title": "Python入門 - 第1回 変数とは を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=non1",
+            "subtitles": [{"name": "プログラミング教室"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "【料理】簡単パスタ - 10分レシピ を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=non2",
+            "subtitles": [{"name": "Cooking Channel"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Some Brand Spring Sale を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=ad01",
+            "subtitles": [{"name": "BrandOfficial"}],
+            "details": [{"name": "From Google Ads"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Earplugs を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=mus1",
+            "subtitles": [{"name": "Oberhofer - トピック"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "「Levels」を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=mus2",
+            "subtitles": [{"name": "Avicii - Topic"}],
+        },
+    ]
+    takeout_path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+    records = parse_takeout_watch_history(takeout_path)
+    by_artist = {r["artist"]: r["title"] for r in records}
+    assert by_artist == {"Oberhofer": "Earplugs", "Avicii": "Levels"}
+
+
+def test_invalid_browser_auth_exposes_warnings_in_summary_and_api(tmp_path: Path) -> None:
+    """[M7] Expired/invalid browser.json must surface clear warnings in summary and /stations/import-history."""
+    from fastapi.testclient import TestClient
+
+    from src.radio_server import create_app
+
+    bad_browser = tmp_path / "browser.json"
+    bad_browser.write_text(json.dumps({"cookie": "SAPISID=expired"}), encoding="utf-8")
+    out_yaml = tmp_path / "stations.yaml"
+
+    summary = generate_stations_yaml(
+        output_path=out_yaml,
+        browser_auth_path=bad_browser,
+        takeout_path=tmp_path / "missing.json",
+        offline=True,
+    )
+    assert summary["fallback_used"] is True
+    assert summary["warnings"], "Expected non-empty warnings for invalid/expired browser.json"
+    assert any("browser.json" in w or "ytmusicapi" in w.lower() for w in summary["warnings"])
+
+    app = create_app(
+        db_path=tmp_path / "r.db",
+        stations_path=out_yaml,
+        model_dir=tmp_path / "m",
+        auto_dig=False,
+    )
+    client = TestClient(app)
+    res = client.post(
+        "/stations/import-history",
+        json={
+            "browser_auth_path": str(bad_browser),
+            "takeout_path": str(tmp_path / "missing.json"),
+            "num_stations": 3,
+            "offline": True,
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["warnings"], "API response must expose auth warnings"

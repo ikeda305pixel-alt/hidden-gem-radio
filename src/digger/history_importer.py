@@ -15,9 +15,10 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ytmusicapi import YTMusic
 
@@ -50,8 +51,8 @@ _TAKEOUT_PREFIX_EN = re.compile(r"^Watched\s+", re.IGNORECASE)
 _TAKEOUT_SUFFIX_JP = re.compile(r"\s*を視聴しました\s*$")
 _NON_MUSIC_TITLE_RE = re.compile(
     r"\b(?:tutorial|full course|news|podcast|gameplay|walkthrough|review|unboxing|"
-    r"vlog|reaction|trailer|episode\s*\d+|lecture|interview|highlights|shorts)\b|"
-    r"(?:ニュース|速報|解説|講座|実況|レビュー|開封|切り抜き|まとめ|生配信|雑談)",
+    r"vlog|reaction|trailer|episode\s*\d+|lecture|interview|highlights|shorts|recipe|cooking)\b|"
+    r"(?:ニュース|速報|解説|講座|入門|第\d+回|実況|レビュー|開封|切り抜き|まとめ|生配信|雑談|料理|レシピ)",
     re.IGNORECASE,
 )
 _MUSIC_SIGNAL_TITLE_RE = re.compile(
@@ -60,13 +61,15 @@ _MUSIC_SIGNAL_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _MUSIC_CHANNEL_RE = re.compile(
-    r"(?:\s*-\s*topic$|vevo$|records?$|music$|official$|sounds?$|recordings?$)",
+    r"(?:\s*-\s*(?:topic|トピック)$|vevo$|records?$|music$|official\s*(?:music|artist)|sounds?$|recordings?$)",
     re.IGNORECASE,
 )
 _CHANNEL_CLEAN_RE = re.compile(
-    r"(?:\s*-\s*topic$|\s*official\s*vevo$|\s*vevo$|\s*official\s*channel$|\s*official$)",
+    r"(?:\s*-\s*(?:topic|トピック)$|\s*official\s*vevo$|\s*vevo$|\s*official\s*(?:music|artist|channel)$|\s*official$)",
     re.IGNORECASE,
 )
+_JP_BRACKET_TITLE_RE = re.compile(r"^[「『](.+?)[」』]$")
+_AD_DETAIL_RE = re.compile(r"(?:google\s*ads|広告)", re.IGNORECASE)
 
 
 def default_fallback_stations() -> list[StationConfig]:
@@ -108,19 +111,36 @@ def _clean_channel_artist(channel_name: str) -> str:
 
 def _clean_takeout_title(raw_title: str) -> str:
     title = _TAKEOUT_PREFIX_EN.sub("", raw_title or "")
-    title = _TAKEOUT_SUFFIX_JP.sub("", title)
-    return title.strip()
+    title = _TAKEOUT_SUFFIX_JP.sub("", title).strip()
+    match = _JP_BRACKET_TITLE_RE.match(title)
+    if match:
+        title = match.group(1).strip()
+    return title
 
 
-def parse_takeout_watch_history(takeout_path: Path | str) -> list[dict[str, Any]]:
+def _is_google_ad_entry(entry: dict[str, Any]) -> bool:
+    details = entry.get("details") or []
+    for item in details:
+        if isinstance(item, dict) and _AD_DETAIL_RE.search(str(item.get("name") or "")):
+            return True
+    return False
+
+
+def parse_takeout_watch_history(
+    takeout_path: Path | str,
+    warnings: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Extract music video watch entries from Google Takeout `watch-history.json`."""
     path = Path(takeout_path)
     if not path.exists():
         return []
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Failed to parse Takeout JSON %s: %s", path, exc)
+    except (OSError, ValueError) as exc:
+        msg = f"Failed to parse Takeout JSON {path}: {exc}"
+        logger.warning(msg)
+        if warnings is not None:
+            warnings.append(msg)
         return []
 
     if not isinstance(raw, list):
@@ -130,6 +150,10 @@ def parse_takeout_watch_history(takeout_path: Path | str) -> list[dict[str, Any]
     for entry in raw:
         if not isinstance(entry, dict):
             continue
+        # [M6] Exclude sponsored/Google Ads watch entries
+        if _is_google_ad_entry(entry):
+            continue
+
         header = str(entry.get("header") or "")
         url = str(entry.get("titleUrl") or "")
         raw_title = str(entry.get("title") or "")
@@ -148,9 +172,9 @@ def parse_takeout_watch_history(takeout_path: Path | str) -> list[dict[str, Any]
 
         has_music_channel = bool(channel_name and _MUSIC_CHANNEL_RE.search(channel_name))
         has_music_title = bool(_MUSIC_SIGNAL_TITLE_RE.search(title))
-        has_artist_dash_track = " - " in title and len(title.split(" - ", 1)[0].strip()) <= 45
 
-        if not (is_yt_music or has_music_channel or has_music_title or has_artist_dash_track):
+        # [M6] Do NOT treat bare " - " as music without a music channel or music title signal
+        if not (is_yt_music or has_music_channel or has_music_title):
             continue
 
         # Extract artist and clean track title
@@ -160,7 +184,7 @@ def parse_takeout_watch_history(takeout_path: Path | str) -> list[dict[str, Any]
             left, right = title.split(" - ", 1)
             if 1 <= len(left.strip()) <= 45:
                 artist = left.strip()
-                track_title = right.strip()
+                track_title = _clean_takeout_title(right.strip())
         if not artist and channel_name:
             artist = _clean_channel_artist(channel_name)
         if not artist:
@@ -181,6 +205,7 @@ def parse_takeout_watch_history(takeout_path: Path | str) -> list[dict[str, Any]
 def parse_ytmusic_history_and_likes(
     yt_client: YTMusic,
     liked_limit: int = 100,
+    warnings: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch history & liked songs via authenticated ytmusicapi client."""
     records: list[dict[str, Any]] = []
@@ -200,8 +225,11 @@ def parse_ytmusic_history_and_likes(
                         "source": "ytmusic_history",
                     }
                 )
-    except Exception as exc:
-        logger.warning("ytmusicapi get_history() failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"ytmusicapi get_history() failed (auth may be expired): {exc}"
+        logger.warning(msg)
+        if warnings is not None:
+            warnings.append(msg)
 
     try:
         liked = yt_client.get_liked_songs(limit=liked_limit) or {}
@@ -218,8 +246,11 @@ def parse_ytmusic_history_and_likes(
                         "source": "ytmusic_liked",
                     }
                 )
-    except Exception as exc:
-        logger.warning("ytmusicapi get_liked_songs() failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"ytmusicapi get_liked_songs() failed (auth may be expired): {exc}"
+        logger.warning(msg)
+        if warnings is not None:
+            warnings.append(msg)
 
     return records
 
@@ -351,21 +382,28 @@ def generate_stations_yaml(
     """Read available history sources, generate 2-4 stations, and write config/stations.yaml."""
     records: list[dict[str, Any]] = []
     sources_used: list[str] = []
+    warnings: list[str] = []
 
     browser_path = Path(browser_auth_path)
     if browser_path.exists():
         try:
             yt = YTMusic(str(browser_path))
-            yt_records = parse_ytmusic_history_and_likes(yt)
+            yt_records = parse_ytmusic_history_and_likes(yt, warnings=warnings)
             if yt_records:
                 records.extend(yt_records)
                 sources_used.append(f"ytmusicapi:{browser_path}")
-        except Exception as exc:
-            logger.warning("Skipping browser auth %s due to error: %s", browser_path, exc)
+            elif not warnings:
+                warnings.append(
+                    f"ytmusicapi auth {browser_path} loaded but returned 0 history/liked tracks."
+                )
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Failed to load ytmusicapi browser auth {browser_path} (expired or invalid): {exc}"
+            logger.warning(msg)
+            warnings.append(msg)
 
     takeout_file = Path(takeout_path)
     if takeout_file.exists():
-        takeout_records = parse_takeout_watch_history(takeout_file)
+        takeout_records = parse_takeout_watch_history(takeout_file, warnings=warnings)
         if takeout_records:
             records.extend(takeout_records)
             sources_used.append(f"takeout:{takeout_file}")
@@ -397,7 +435,7 @@ def generate_stations_yaml(
                 lb_client.close()
 
     meta = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "sources_used": sources_used if sources_used else ["default_seed_fallback"],
         "records_imported": len(records),
         "fallback_used": fallback_used,
@@ -411,6 +449,7 @@ def generate_stations_yaml(
         "records_imported": len(records),
         "sources_used": meta["sources_used"],
         "fallback_used": fallback_used,
+        "warnings": warnings,
     }
 
 

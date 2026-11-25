@@ -309,10 +309,12 @@
       player: null,
       playerReady: false,
       consecutiveErrors: 0,
-      fetchingQueue: false,
+      prefetchPromise: null,
+      retryTimerId: null,
     };
 
     const MAX_CONSECUTIVE_ERRORS = 8;
+    const RETRY_BACKOFF_MS = 3000;
 
     const el = {
       statusPill: document.getElementById("statusPill"),
@@ -330,6 +332,32 @@
 
     function setStatus(msg) {
       el.statusPill.textContent = msg;
+    }
+
+    function normalizeArtistName(name) {
+      return String(name || "")
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    function clearRetryTimer() {
+      if (state.retryTimerId !== null) {
+        clearTimeout(state.retryTimerId);
+        state.retryTimerId = null;
+      }
+    }
+
+    function scheduleQueueRetry() {
+      if (state.retryTimerId !== null || !state.activeStationId) return;
+      const stationAtSchedule = state.activeStationId;
+      setStatus("3秒後に次曲を再取得します...");
+      state.retryTimerId = setTimeout(async () => {
+        state.retryTimerId = null;
+        if (state.activeStationId !== stationAtSchedule || state.currentTrack) return;
+        await playNextFromQueue();
+      }, RETRY_BACKOFF_MS);
     }
 
     function escapeHtml(str) {
@@ -371,9 +399,9 @@
 
     function renderNowPlaying(track) {
       if (!track) {
-        el.trackTitle.textContent = "再生可能な候補が見つかりません";
-        el.trackArtist.textContent = "「候補を追加ディグ」を押してください";
-        el.reasonLine.textContent = "推薦理由: 候補プールが空です";
+        el.trackTitle.textContent = "再生可能な候補を取得中...";
+        el.trackArtist.textContent = "自動で再試行します（手動は「候補を追加ディグ」）";
+        el.reasonLine.textContent = "推薦理由: 候補プール待機中";
         return;
       }
       el.trackTitle.textContent = track.title;
@@ -388,30 +416,40 @@
       return res.json();
     }
 
+    // [M2] Share in-flight prefetch Promise so concurrent callers await instead of returning early
     async function ensurePrefetchQueue(targetSize = 3) {
-      if (!state.activeStationId || state.fetchingQueue) return;
-      if (state.queue.length >= targetSize) return;
-      state.fetchingQueue = true;
-      try {
-        const exclude = [
-          ...(state.currentTrack ? [state.currentTrack.track_id] : []),
-          ...state.queue.map((t) => t.track_id),
-        ].join(",");
-        const need = Math.max(1, targetSize - state.queue.length);
-        const data = await fetchJson(
-          `/queue/next?station_id=${encodeURIComponent(state.activeStationId)}&count=${need}&exclude=${encodeURIComponent(exclude)}`
-        );
-        for (const item of data.items || []) {
-          if (!state.queue.some((q) => q.track_id === item.track_id)) {
-            state.queue.push(item);
-          }
-        }
-        renderQueue();
-      } catch (err) {
-        setStatus("キュー取得待機中");
-      } finally {
-        state.fetchingQueue = false;
+      if (!state.activeStationId) return;
+      if (state.prefetchPromise) {
+        await state.prefetchPromise;
+        if (state.queue.length >= targetSize) return;
       }
+      if (state.queue.length >= targetSize) return;
+
+      const stationId = state.activeStationId;
+      state.prefetchPromise = (async () => {
+        try {
+          const exclude = [
+            ...(state.currentTrack ? [state.currentTrack.track_id] : []),
+            ...state.queue.map((t) => t.track_id),
+          ].join(",");
+          const need = Math.max(1, targetSize - state.queue.length);
+          const data = await fetchJson(
+            `/queue/next?station_id=${encodeURIComponent(stationId)}&count=${need}&exclude=${encodeURIComponent(exclude)}`
+          );
+          if (state.activeStationId !== stationId) return;
+          for (const item of data.items || []) {
+            if (!state.queue.some((q) => q.track_id === item.track_id)) {
+              state.queue.push(item);
+            }
+          }
+          renderQueue();
+        } catch (err) {
+          setStatus("キュー取得待機中");
+        } finally {
+          state.prefetchPromise = null;
+        }
+      })();
+      await state.prefetchPromise;
     }
 
     function playTrack(track) {
@@ -420,11 +458,17 @@
       renderNowPlaying(track);
       renderQueue();
 
-      if (track && state.player && state.playerReady) {
-        state.player.loadVideoById(track.video_id);
-        setStatus("ON AIR");
+      if (track) {
+        clearRetryTimer();
+        if (state.player && state.playerReady) {
+          state.player.loadVideoById(track.video_id);
+          setStatus("ON AIR");
+        }
+        ensurePrefetchQueue(3);
+      } else {
+        // [M2] Never stall permanently on null: retry with 3-second backoff
+        scheduleQueueRetry();
       }
-      ensurePrefetchQueue(3);
     }
 
     async function playNextFromQueue() {
@@ -460,8 +504,10 @@
     }
 
     async function switchStation(stationId) {
+      clearRetryTimer();
       state.activeStationId = stationId;
       state.queue = [];
+      state.currentTrack = null;
       state.consecutiveErrors = 0;
       const st = state.stations.find((s) => s.station_id === stationId);
       el.stationLabel.textContent = st ? `ON AIR · ${st.name}` : "ON AIR";
@@ -506,7 +552,7 @@
             }
           },
           onError: async (event) => {
-            // Silent auto-fallback: never display an error popup; flag unplayable and advance
+            // Silent auto-fallback: never display an error popup; flag unplayable (100/101/150) and advance
             state.consecutiveErrors += 1;
             const failed = state.currentTrack;
             if (failed) {
@@ -521,7 +567,9 @@
               setStatus("次曲へ自動切替...");
               await playNextFromQueue();
             } else {
-              setStatus("再生可能トラック待機中");
+              state.currentTrack = null;
+              state.consecutiveErrors = 0;
+              scheduleQueueRetry();
             }
           },
         },
@@ -565,9 +613,17 @@
       } catch (_) {}
     });
 
-    // Control 4: BAD (0.0 reward + instant skip to next prefetched track)
+    // Control 4: BAD (0.0 reward + evict same artist from prefetched queue + instant skip)
     el.btnBad.addEventListener("click", async () => {
       if (!state.currentTrack) return;
+      const badArtistNorm = normalizeArtistName(state.currentTrack.artist);
+      // [M5] Immediately purge prefetched tracks by the BAD-rated artist
+      if (badArtistNorm) {
+        state.queue = state.queue.filter(
+          (item) => normalizeArtistName(item.artist) !== badArtistNorm
+        );
+        renderQueue();
+      }
       try {
         await sendFeedback("BAD");
       } catch (_) {}

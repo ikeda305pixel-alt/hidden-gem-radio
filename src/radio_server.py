@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from src.recommender.bandit import ContextualBanditRecommender
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PERMANENT_YT_UNPLAYABLE_CODES = frozenset({100, 101, 150})
 
 
 class FeedbackRequest(BaseModel):
@@ -40,7 +42,7 @@ class ImportHistoryRequest(BaseModel):
 
 
 class RadioRuntime:
-    """Holds stations, SQLite DB, digger, and per-station Contextual Bandit instances."""
+    """Holds stations, SQLite DB, digger, per-station dig locks, and Contextual Bandit instances."""
 
     def __init__(
         self,
@@ -59,6 +61,10 @@ class RadioRuntime:
 
         self.db = RadioDatabase(db_path)
         self._digger: CandidatePoolDigger | None = None
+        self._digger_init_lock = threading.Lock()
+        self._dig_state_lock = threading.Lock()
+        self._dig_locks: dict[str, threading.Lock] = {}
+        self._digging_stations: set[str] = set()
         self.stations: dict[str, StationConfig] = {}
         self.bandits: dict[str, ContextualBanditRecommender] = {}
         self.reload_stations()
@@ -66,8 +72,10 @@ class RadioRuntime:
     @property
     def digger(self) -> CandidatePoolDigger:
         if self._digger is None:
-            yt = YouTubeMusicAdapter(browser_auth_path=self.browser_auth_path)
-            self._digger = CandidatePoolDigger(self.db, yt_adapter=yt)
+            with self._digger_init_lock:
+                if self._digger is None:
+                    yt = YouTubeMusicAdapter(browser_auth_path=self.browser_auth_path)
+                    self._digger = CandidatePoolDigger(self.db, yt_adapter=yt)
         return self._digger
 
     def reload_stations(self) -> None:
@@ -90,12 +98,82 @@ class RadioRuntime:
             )
             for s in station_list
         }
+        with self._dig_state_lock:
+            for s in station_list:
+                self._dig_locks.setdefault(s.station_id, threading.Lock())
 
     def get_station(self, station_id: str) -> StationConfig:
         station = self.stations.get(station_id)
         if station is None:
             raise HTTPException(status_code=404, detail=f"Unknown station_id: {station_id}")
         return station
+
+    def _get_station_dig_lock(self, station_id: str) -> threading.Lock:
+        with self._dig_state_lock:
+            lock = self._dig_locks.get(station_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._dig_locks[station_id] = lock
+            return lock
+
+    def _run_station_dig(
+        self,
+        station: StationConfig,
+        target_pool_size: int = 60,
+        skip_if_unheard_gte: int = 0,
+    ) -> dict[str, Any] | None:
+        """Serialize digging per station so concurrent requests never launch duplicate digs."""
+        lock = self._get_station_dig_lock(station.station_id)
+        with lock:
+            if skip_if_unheard_gte > 0:
+                existing = self.db.count_playable_candidates(
+                    station.station_id,
+                    station.max_popularity_views,
+                )
+                if existing >= skip_if_unheard_gte:
+                    return {
+                        "station_id": station.station_id,
+                        "added": 0,
+                        "total_playable": existing,
+                        "skipped_duplicate_dig": True,
+                    }
+            with self._dig_state_lock:
+                self._digging_stations.add(station.station_id)
+            try:
+                return self.digger.dig_station(station, target_pool_size=target_pool_size)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
+                return None
+            finally:
+                with self._dig_state_lock:
+                    self._digging_stations.discard(station.station_id)
+
+    def _trigger_background_dig(
+        self,
+        station: StationConfig,
+        target_pool_size: int = 60,
+        min_unheard: int = 5,
+    ) -> bool:
+        """Start a single non-blocking background dig thread if one is not already active."""
+        with self._dig_state_lock:
+            if station.station_id in self._digging_stations:
+                return False
+            self._digging_stations.add(station.station_id)
+
+        def _worker() -> None:
+            self._run_station_dig(
+                station,
+                target_pool_size=target_pool_size,
+                skip_if_unheard_gte=min_unheard,
+            )
+
+        thread = threading.Thread(
+            target=_worker,
+            name=f"dig-{station.station_id}",
+            daemon=True,
+        )
+        thread.start()
+        return True
 
     def next_queue(
         self,
@@ -104,23 +182,47 @@ class RadioRuntime:
         exclude_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         station = self.get_station(station_id)
-        candidates = self.db.get_eligible_candidates(
+        min_unheard_threshold = max(count, 5)
+
+        # [M4] Judge depletion strictly on UNHEARD candidates
+        unheard = self.db.get_eligible_candidates(
             station_id=station.station_id,
             max_popularity_views=station.max_popularity_views,
             exclude_track_ids=exclude_ids,
+            include_heard_fallback=False,
         )
 
-        # Auto-dig Stage 1 candidate pool when running low
-        if self.auto_dig and len(candidates) < max(count, 5):
-            try:
-                self.digger.dig_station(station, target_pool_size=60)
-                candidates = self.db.get_eligible_candidates(
+        if self.auto_dig and len(unheard) < min_unheard_threshold:
+            if unheard:
+                # [M1] Return immediately from existing unheard pool; replenish asynchronously
+                self._trigger_background_dig(
+                    station,
+                    target_pool_size=60,
+                    min_unheard=min_unheard_threshold,
+                )
+            else:
+                # Cold empty or fully heard pool: serialize a single dig across concurrent callers
+                self._run_station_dig(
+                    station,
+                    target_pool_size=60,
+                    skip_if_unheard_gte=min_unheard_threshold,
+                )
+                unheard = self.db.get_eligible_candidates(
                     station_id=station.station_id,
                     max_popularity_views=station.max_popularity_views,
                     exclude_track_ids=exclude_ids,
+                    include_heard_fallback=False,
                 )
-            except Exception as exc:
-                logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
+
+        # [M4] Fall back to previously liked/completed tracks ONLY if unheard is still empty
+        candidates = unheard
+        if not candidates:
+            candidates = self.db.get_eligible_candidates(
+                station_id=station.station_id,
+                max_popularity_views=station.max_popularity_views,
+                exclude_track_ids=exclude_ids,
+                include_heard_fallback=True,
+            )
 
         bandit = self.bandits[station.station_id]
         ranked = bandit.rank_candidates(
@@ -193,7 +295,8 @@ def create_app(
     @app.post("/stations/{station_id}/dig")
     def dig_station(station_id: str, target_pool_size: int = Query(default=60, ge=10, le=120)) -> dict[str, Any]:
         station = runtime.get_station(station_id)
-        return runtime.digger.dig_station(station, target_pool_size=target_pool_size)
+        result = runtime._run_station_dig(station, target_pool_size=target_pool_size)
+        return result or {"station_id": station.station_id, "added": 0, "total_playable": 0}
 
     @app.get("/queue/next")
     def queue_next(
@@ -214,9 +317,15 @@ def create_app(
         station = runtime.get_station(req.station_id)
         event = req.event_type.strip().upper()
 
-        # Silent fallback path when YouTube IFrame Player fires onError (embed disabled / region block)
+        # Silent fallback path when YouTube IFrame Player fires onError
         if event == "UNPLAYABLE" or req.yt_error_code is not None:
-            updated_rows = runtime.db.mark_unplayable(video_id=req.video_id, track_id=req.track_id)
+            # [M5] Only permanently mark unplayable on embed/removal codes (100/101/150) or explicit UNPLAYABLE
+            is_permanent = req.yt_error_code is None or req.yt_error_code in _PERMANENT_YT_UNPLAYABLE_CODES
+            updated_rows = (
+                runtime.db.mark_unplayable(video_id=req.video_id, track_id=req.track_id)
+                if is_permanent
+                else 0
+            )
             exclude = {x for x in (req.track_id, req.video_id) if x}
             replacements = runtime.next_queue(station.station_id, count=1, exclude_ids=exclude)
             return {
@@ -234,13 +343,13 @@ def create_app(
         is_new_artist = normalize_artist(track.artist) not in seen_artists
 
         bandit = runtime.bandits[station.station_id]
-        reward = bandit.update(
-            track,
-            event_type=event,
+        reward = ContextualBanditRecommender.compute_reward(
+            event,
             listen_seconds=req.listen_seconds,
             duration_seconds=req.duration_seconds,
-            is_new_artist=is_new_artist,
         )
+
+        # [C1] Record feedback in SQLite FIRST, then update bandit model to preserve DB/model consistency
         runtime.db.record_feedback(
             station_id=station.station_id,
             track=track,
@@ -248,6 +357,13 @@ def create_app(
             reward=reward,
             listen_seconds=req.listen_seconds,
             duration_seconds=req.duration_seconds,
+        )
+        bandit.update(
+            track,
+            event_type=event,
+            listen_seconds=req.listen_seconds,
+            duration_seconds=req.duration_seconds,
+            is_new_artist=is_new_artist,
         )
 
         return {

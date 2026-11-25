@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 from src.models import TrackEntity, normalize_artist
 
@@ -284,6 +284,19 @@ class RadioDatabase:
             ).fetchall()
             return {str(r["track_id"]) for r in rows}
 
+    def get_skipped_or_bad_track_ids(self, station_id: str) -> set[str]:
+        """Return track IDs explicitly rejected (BAD or EARLY_SKIP) on this station."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT track_id
+                FROM feedback_events
+                WHERE station_id = ? AND event_type IN ('BAD', 'EARLY_SKIP')
+                """,
+                (station_id,),
+            ).fetchall()
+            return {str(r["track_id"]) for r in rows}
+
     def get_eligible_candidates(
         self,
         station_id: str,
@@ -294,6 +307,7 @@ class RadioDatabase:
         """Return playable candidate tracks matching popularity ceiling and 30-day BAD artist filter."""
         blocked_artists = self.get_blocked_artists_30d()
         heard_ids = self.get_recently_heard_track_ids(station_id)
+        rejected_ids = self.get_skipped_or_bad_track_ids(station_id) if include_heard_fallback else set()
         excluded = set(exclude_track_ids or set())
 
         with self._connect() as conn:
@@ -322,7 +336,7 @@ class RadioDatabase:
                 continue
             if track.track_id not in heard_ids:
                 unheard.append(track)
-            elif include_heard_fallback:
+            elif include_heard_fallback and track.track_id not in rejected_ids:
                 heard_non_bad.append(track)
 
         # Prefer strictly unheard candidates; fall back to previously liked/completed tracks only if exhausted

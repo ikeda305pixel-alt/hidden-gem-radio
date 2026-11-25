@@ -10,7 +10,6 @@ from typing import Any
 
 import yaml
 
-
 _NON_ALNUM_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
 _PAREN_NOISE_RE = re.compile(
@@ -51,7 +50,7 @@ def make_track_id(
         seed = f"mbid:{mbid.strip().lower()}"
     else:
         seed = f"key:{normalize_track_key(artist, title)}"
-    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
     return f"trk_{digest}"
 
 

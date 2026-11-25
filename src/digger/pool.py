@@ -53,7 +53,12 @@ class CandidatePoolDigger:
                 skipped_blocked += 1
                 continue
 
-            resolution = self.yt.resolve_track(track.artist, track.title, isrc=track.isrc)
+            resolution = self.yt.resolve_track(
+                track.artist,
+                track.title,
+                isrc=track.isrc,
+                max_popularity_views=station.max_popularity_views,
+            )
             if not resolution:
                 continue
             resolved_count += 1
@@ -71,8 +76,6 @@ class CandidatePoolDigger:
                 track.duration_seconds = resolution.duration_seconds
             if track.release_year is None:
                 track.release_year = resolution.release_year
-            if not track.tags:
-                track.tags = list(station.seed_tags)
 
             self.db.upsert_track(station.station_id, track)
             seed_video_ids.append(track.video_id)
@@ -98,7 +101,6 @@ class CandidatePoolDigger:
                 break
             related = self.yt.get_related_tracks(
                 seed_vid,
-                seed_tags=station.seed_tags,
                 limit=30,
             )
             for track in related:

@@ -84,7 +84,7 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             try:
                 self._yt = YTMusic(str(browser_auth_path))
                 self._songs_filter_enabled = True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load ytmusicapi auth %s (%s); falling back to anonymous mode", browser_auth_path, exc)
                 self._yt = YTMusic()
         else:
@@ -101,7 +101,7 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         for search_filter in filters:
             try:
                 rows = self._yt.search(query, filter=search_filter, limit=limit)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("ytmusicapi search failed (query=%r, filter=%r): %s", query, search_filter, exc)
                 continue
 
@@ -122,8 +122,9 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         artist: str,
         title: str,
         isrc: str | None = None,
+        max_popularity_views: int | None = None,
     ) -> PlaybackResolution | None:
-        """Resolve (artist, title) into a playable YouTube videoId with duration & views."""
+        """Resolve (artist, title) into a playable YouTube videoId respecting duration & view limits."""
         query = f"{artist} {title}".strip()
         results = self.search_playable(query, limit=6)
         if not results:
@@ -132,11 +133,15 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         target_artist = normalize_text(artist)
         target_title = normalize_text(title)
         best_item: dict[str, Any] | None = None
-        best_score = -1
+        best_score = -10_000
 
         for item in results:
             duration = parse_duration_seconds(item.get("duration_seconds"), item.get("duration"))
             if duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                continue
+
+            views = parse_view_count(item.get("views"))
+            if max_popularity_views is not None and views is not None and views > max_popularity_views:
                 continue
 
             raw_title = str(item.get("title") or "")
@@ -158,8 +163,9 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 best_score = score
                 best_item = item
 
+        # [M3] Never bypass duration/view filters by falling back to results[0]
         if best_item is None:
-            best_item = results[0]
+            return None
 
         raw_title = str(best_item.get("title") or title)
         found_artist = _extract_artist_name(best_item, raw_title)
@@ -182,10 +188,11 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         seed_tags: list[str] | None = None,
         limit: int = 25,
     ) -> list[TrackEntity]:
-        """Collect related candidate tracks via YouTube Music Watch Playlist."""
+        """Collect related candidate tracks via YouTube Music Watch Playlist without fabricating seed tags."""
+        _ = seed_tags  # Intentionally unused: Watch Playlist tracks carry no verified genre tags
         try:
             watch = self._yt.get_watch_playlist(videoId=platform_track_id, limit=limit)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("ytmusicapi get_watch_playlist failed for %s: %s", platform_track_id, exc)
             return []
 
@@ -208,12 +215,12 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 TrackEntity.build(
                     artist=artist,
                     title=title,
-                    tags=list(seed_tags or []),
+                    tags=[],  # [C2] Never copy station seed_tags onto untagged Watch Playlist tracks
                     release_year=release_year,
                     view_count=parse_view_count(item.get("views")),
                     duration_seconds=duration,
                     video_id=str(vid),
-                    source="ytmusic_watch_playlist",
+                    source="watch_playlist",
                 )
             )
         return entities

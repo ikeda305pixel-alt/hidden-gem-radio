@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -26,17 +27,19 @@ class ListenBrainzClient:
             timeout=timeout,
             follow_redirects=True,
         )
+        self._mb_lock = threading.Lock()
         self._last_mb_call = 0.0
 
     def close(self) -> None:
         self._client.close()
 
     def _mb_rate_limit(self) -> None:
-        """Respect MusicBrainz 1 req/sec rate limit."""
-        elapsed = time.monotonic() - self._last_mb_call
-        if elapsed < 1.05:
-            time.sleep(1.05 - elapsed)
-        self._last_mb_call = time.monotonic()
+        """Respect MusicBrainz 1 req/sec rate limit safely across concurrent threads."""
+        with self._mb_lock:
+            elapsed = time.monotonic() - self._last_mb_call
+            if elapsed < 1.05:
+                time.sleep(1.05 - elapsed)
+            self._last_mb_call = time.monotonic()
 
     def _get_json(self, url: str, params: dict[str, Any] | None = None, is_mb: bool = False) -> Any:
         if is_mb:
@@ -47,7 +50,7 @@ class ListenBrainzClient:
                 logger.warning("API returned %s for %s", resp.status_code, url)
                 return None
             return resp.json()
-        except Exception as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             logger.warning("API request failed for %s: %s", url, exc)
             return None
 

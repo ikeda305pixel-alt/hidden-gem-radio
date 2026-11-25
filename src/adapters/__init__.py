@@ -4,8 +4,8 @@ from src.adapters.base import AppleMusicAdapter, MusicPlatformAdapter, SpotifyAd
 from src.adapters.youtube import YouTubeMusicAdapter
 
 __all__ = [
-    "MusicPlatformAdapter",
-    "YouTubeMusicAdapter",
-    "SpotifyAdapter",
     "AppleMusicAdapter",
+    "MusicPlatformAdapter",
+    "SpotifyAdapter",
+    "YouTubeMusicAdapter",
 ]

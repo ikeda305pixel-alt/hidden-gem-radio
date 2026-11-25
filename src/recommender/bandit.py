@@ -7,12 +7,15 @@ import logging
 import math
 import os
 import pickle
+import shutil
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from mabwiser.mab import LearningPolicy, MAB
+from mabwiser.mab import MAB, LearningPolicy
 
 from src.models import RankedCandidate, TrackEntity, normalize_artist
 
@@ -22,11 +25,12 @@ _OOV_TAG_BUCKETS = 8
 _DECADE_BUCKETS = 6  # <1990, 1990s, 2000s, 2010s, 2020s+, unknown
 _VIEW_BUCKETS = 5    # <10k, 10k-50k, 50k-200k, 200k-500k, >=500k/unknown
 _TIME_BUCKETS = 4    # morning, afternoon, evening, late_night
+_WATCH_PLAYLIST_SOURCES = {"watch_playlist", "ytmusic_watch_playlist"}
 
 
 def _hash_bucket(text: str, num_buckets: int) -> int:
-    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % num_buckets
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=4).hexdigest()
+    return int(digest, 16) % num_buckets
 
 
 def _hidden_level(view_count: int | None, max_popularity_views: int) -> str:
@@ -43,7 +47,7 @@ def _hidden_level(view_count: int | None, max_popularity_views: int) -> str:
 
 
 class ContextualBanditRecommender:
-    """Per-station Contextual Bandit (MABWiser LinUCB) with local pickle persistence."""
+    """Per-station Contextual Bandit (MABWiser LinUCB) with thread-safe local persistence."""
 
     def __init__(
         self,
@@ -59,6 +63,7 @@ class ContextualBanditRecommender:
         self.exploration_rate = float(max(0.05, exploration_rate))
         self.model_path = Path(model_path) if model_path else Path(f"data/bandit_{station_id}.pkl")
         self.seed = int(seed)
+        self._lock = threading.Lock()
 
         self._mab = MAB(
             arms=["play"],
@@ -70,7 +75,8 @@ class ContextualBanditRecommender:
 
     @property
     def n_updates(self) -> int:
-        return self._n_updates
+        with self._lock:
+            return self._n_updates
 
     @property
     def feature_dim(self) -> int:
@@ -81,6 +87,7 @@ class ContextualBanditRecommender:
             + _VIEW_BUCKETS
             + _TIME_BUCKETS
             + 1  # is_new_artist
+            + 1  # is_watch_playlist_source ([C2] tagless Watch Playlist indicator)
             + 1  # intercept bias
         )
 
@@ -122,7 +129,7 @@ class ContextualBanditRecommender:
         is_new_artist: bool,
         hour: int | None = None,
     ) -> np.ndarray:
-        """Build `[tag_one_hot, release_decade, log_view_bucket, time_of_day_bucket, is_new_artist, bias]`."""
+        """Build `[tag_one_hot, release_decade, log_view_bucket, time_of_day_bucket, is_new_artist, is_watch_playlist, bias]`."""
         vec = np.zeros(self.feature_dim, dtype=np.float64)
         offset = 0
 
@@ -188,9 +195,10 @@ class ContextualBanditRecommender:
         vec[offset + tod_idx] = 1.0
         offset += _TIME_BUCKETS
 
-        # 5. is_new_artist binary indicator + intercept
+        # 5. is_new_artist, is_watch_playlist_source, intercept bias
         vec[offset] = 1.0 if is_new_artist else 0.0
-        vec[offset + 1] = 1.0
+        vec[offset + 1] = 1.0 if track.source in _WATCH_PLAYLIST_SOURCES else 0.0
+        vec[offset + 2] = 1.0
         return vec
 
     def update(
@@ -203,17 +211,18 @@ class ContextualBanditRecommender:
         is_new_artist: bool = True,
         hour: int | None = None,
     ) -> float:
-        """Immediately update LinUCB model on feedback and persist weights locally."""
+        """Thread-safely update LinUCB model on feedback and persist weights atomically."""
         reward = self.compute_reward(event_type, listen_seconds, duration_seconds)
         context = self.featurize(track, is_new_artist=is_new_artist, hour=hour).reshape(1, -1)
 
-        if self._n_updates == 0:
-            self._mab.fit(decisions=["play"], rewards=[reward], contexts=context)
-        else:
-            self._mab.partial_fit(decisions=["play"], rewards=[reward], contexts=context)
+        with self._lock:
+            if self._n_updates == 0:
+                self._mab.fit(decisions=["play"], rewards=[reward], contexts=context)
+            else:
+                self._mab.partial_fit(decisions=["play"], rewards=[reward], contexts=context)
 
-        self._n_updates += 1
-        self._save()
+            self._n_updates += 1
+            self._save_locked()
         return reward
 
     def rank_candidates(
@@ -225,7 +234,7 @@ class ContextualBanditRecommender:
         hour: int | None = None,
         limit: int = 3,
     ) -> list[RankedCandidate]:
-        """Score and rank unheard candidate tracks via MABWiser LinUCB with artist diversity."""
+        """Thread-safely score and rank unheard candidate tracks via MABWiser LinUCB."""
         if not candidates:
             return []
 
@@ -240,34 +249,36 @@ class ContextualBanditRecommender:
             ]
         )
 
-        if self._n_updates == 0:
-            # Cold-start: pure LinUCB exploration norm + subtle preference for seed-tag match
-            explore_scores = self.exploration_rate * np.linalg.norm(X, axis=1)
-            tag_overlap = np.array(
-                [len(set(t.tags) & set(self.seed_tags)) * 0.05 for t in candidates],
-                dtype=np.float64,
-            )
-            exploit_scores = tag_overlap
-            total_scores = exploit_scores + explore_scores
-        else:
-            raw_exp = self._mab.predict_expectations(contexts=X)
-            exp_list = [raw_exp] if isinstance(raw_exp, dict) else list(raw_exp)
-            total_scores = np.array([float(item["play"]) for item in exp_list], dtype=np.float64)
+        with self._lock:
+            n_updates = self._n_updates
+            if n_updates == 0:
+                # Cold-start: pure LinUCB exploration norm + subtle preference for real seed-tag match
+                explore_scores = self.exploration_rate * np.linalg.norm(X, axis=1)
+                tag_overlap = np.array(
+                    [len(set(t.tags) & set(self.seed_tags)) * 0.05 for t in candidates],
+                    dtype=np.float64,
+                )
+                exploit_scores = tag_overlap
+                total_scores = exploit_scores + explore_scores
+            else:
+                raw_exp = self._mab.predict_expectations(contexts=X)
+                exp_list = [raw_exp] if isinstance(raw_exp, dict) else list(raw_exp)
+                total_scores = np.array([float(item["play"]) for item in exp_list], dtype=np.float64)
 
-            lin_model = self._mab._imp.arm_to_model["play"]
-            exploit_scores = np.dot(X, lin_model.beta)
-            explore_scores = np.maximum(0.0, total_scores - exploit_scores)
+                lin_model = self._mab._imp.arm_to_model["play"]
+                exploit_scores = np.dot(X, lin_model.beta)
+                explore_scores = np.maximum(0.0, total_scores - exploit_scores)
 
-        # Build ranked entries
+        # Build ranked entries using ONLY genuine track tags ([C2] no fabricated matches)
         scored: list[RankedCandidate] = []
         seed_tag_set = set(self.seed_tags)
         for idx, track in enumerate(candidates):
             exploit = float(exploit_scores[idx])
             explore = float(explore_scores[idx])
             total = float(total_scores[idx])
-            mode = "活用" if (self._n_updates > 0 and exploit >= explore) else "探索"
+            mode = "活用" if (n_updates > 0 and exploit >= explore) else "探索"
             matched = [t for t in track.tags if t in seed_tag_set]
-            if not matched:
+            if not matched and track.tags:
                 matched = track.tags[:3]
             scored.append(
                 RankedCandidate(
@@ -301,37 +312,69 @@ class ContextualBanditRecommender:
             selected.extend(overflow[: limit - len(selected)])
         return selected[:limit]
 
-    def _save(self) -> None:
+    def _apply_exploration_rate_locked(self) -> None:
+        """Apply current YAML exploration_rate (alpha) to loaded MABWiser LinUCB internals."""
+        self._mab._imp.alpha = self.exploration_rate
+        for model in self._mab._imp.arm_to_model.values():
+            if hasattr(model, "alpha"):
+                model.alpha = self.exploration_rate
+
+    def _save_locked(self) -> None:
+        """Atomically persist bandit state via unique NamedTemporaryFile + os.replace."""
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.model_path.with_suffix(".pkl.tmp")
         state: dict[str, Any] = {
             "station_id": self.station_id,
             "tag_vocab": self.tag_vocab,
+            "feature_dim": self.feature_dim,
+            "alpha": self.exploration_rate,
             "exploration_rate": self.exploration_rate,
             "n_updates": self._n_updates,
             "mab": self._mab,
         }
-        with tmp_path.open("wb") as fh:
-            pickle.dump(state, fh)
-        os.replace(tmp_path, self.model_path)
+        tmp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=self.model_path.parent,
+                prefix=f".{self.model_path.stem}_",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                tmp_name = fh.name
+                pickle.dump(state, fh)
+                fh.flush()
+            os.replace(tmp_name, self.model_path)
+            tmp_name = None
+        finally:
+            if tmp_name and os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
     def _load_if_exists(self) -> None:
         if not self.model_path.exists():
             return
-        try:
-            with self.model_path.open("rb") as fh:
-                state = pickle.load(fh)
-            if (
-                isinstance(state, dict)
-                and state.get("tag_vocab") == self.tag_vocab
-                and isinstance(state.get("mab"), MAB)
-            ):
-                self._mab = state["mab"]
-                self._n_updates = int(state.get("n_updates", 0))
-            else:
-                logger.info(
-                    "Tag vocabulary changed for station %s; starting fresh bandit model",
-                    self.station_id,
-                )
-        except Exception as exc:
-            logger.warning("Failed to load bandit weights from %s (%s); starting fresh", self.model_path, exc)
+        with self._lock:
+            try:
+                with self.model_path.open("rb") as fh:
+                    state = pickle.load(fh)
+                saved_dim = state.get("feature_dim") if isinstance(state, dict) else None
+                dim_matches = saved_dim is None or int(saved_dim) == self.feature_dim
+                if (
+                    isinstance(state, dict)
+                    and state.get("tag_vocab") == self.tag_vocab
+                    and dim_matches
+                    and isinstance(state.get("mab"), MAB)
+                ):
+                    self._mab = state["mab"]
+                    self._n_updates = int(state.get("n_updates", 0))
+                    # [M8] Apply latest YAML exploration_rate even if persisted alpha differed
+                    self._apply_exploration_rate_locked()
+                else:
+                    backup_path = self.model_path.with_suffix(".pkl.bak")
+                    shutil.copy2(self.model_path, backup_path)
+                    logger.warning(
+                        "Bandit tag_vocab/feature_dim changed for station %s; backed up old weights to %s and starting fresh",
+                        self.station_id,
+                        backup_path,
+                    )
+            except (OSError, pickle.UnpicklingError, ValueError, TypeError, AttributeError, EOFError) as exc:
+                logger.warning("Failed to load bandit weights from %s (%s); starting fresh", self.model_path, exc)
