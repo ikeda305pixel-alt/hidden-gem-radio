@@ -220,10 +220,10 @@ class RadioDatabase:
         reward: float,
         listen_seconds: float | None = None,
         duration_seconds: float | None = None,
-    ) -> None:
-        """Persist user feedback event."""
+    ) -> int:
+        """Persist user feedback event and return its inserted feedback_id."""
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO feedback_events (
                     station_id, track_id, video_id, artist_norm, event_type,
@@ -242,6 +242,12 @@ class RadioDatabase:
                     time.time(),
                 ),
             )
+            return int(cur.lastrowid or 0)
+
+    def delete_feedback(self, feedback_id: int) -> None:
+        """Remove a feedback row by ID (compensating rollback when downstream model update fails)."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM feedback_events WHERE id = ?", (int(feedback_id),))
 
     def get_blocked_artists_30d(self, now: float | None = None) -> set[str]:
         """Return normalized artist names rated BAD within the last 30 days."""

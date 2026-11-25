@@ -310,6 +310,9 @@
       playerReady: false,
       consecutiveErrors: 0,
       prefetchPromise: null,
+      prefetchPromiseEpoch: -1,
+      prefetchEpoch: 0,
+      blockedArtists: new Set(),
       retryTimerId: null,
     };
 
@@ -336,6 +339,7 @@
 
     function normalizeArtistName(name) {
       return String(name || "")
+        .normalize("NFKC")
         .toLowerCase()
         .replace(/[^\p{L}\p{N}\s]+/gu, " ")
         .replace(/\s+/g, " ")
@@ -416,17 +420,19 @@
       return res.json();
     }
 
-    // [M2] Share in-flight prefetch Promise so concurrent callers await instead of returning early
+    // [M2 / Bug #5] Share in-flight prefetch Promise only when its prefetchEpoch is still current
     async function ensurePrefetchQueue(targetSize = 3) {
       if (!state.activeStationId) return;
-      if (state.prefetchPromise) {
+      if (state.prefetchPromise && state.prefetchPromiseEpoch === state.prefetchEpoch) {
         await state.prefetchPromise;
         if (state.queue.length >= targetSize) return;
       }
       if (state.queue.length >= targetSize) return;
 
       const stationId = state.activeStationId;
-      state.prefetchPromise = (async () => {
+      const requestEpoch = state.prefetchEpoch;
+      let currentPromise = null;
+      currentPromise = (async () => {
         try {
           const exclude = [
             ...(state.currentTrack ? [state.currentTrack.track_id] : []),
@@ -436,8 +442,12 @@
           const data = await fetchJson(
             `/queue/next?station_id=${encodeURIComponent(stationId)}&count=${need}&exclude=${encodeURIComponent(exclude)}`
           );
-          if (state.activeStationId !== stationId) return;
+          if (state.activeStationId !== stationId || state.prefetchEpoch !== requestEpoch) return;
           for (const item of data.items || []) {
+            const artistNorm = normalizeArtistName(item.artist);
+            if (artistNorm && state.blockedArtists.has(artistNorm)) {
+              continue;
+            }
             if (!state.queue.some((q) => q.track_id === item.track_id)) {
               state.queue.push(item);
             }
@@ -446,10 +456,15 @@
         } catch (err) {
           setStatus("キュー取得待機中");
         } finally {
-          state.prefetchPromise = null;
+          if (state.prefetchPromise === currentPromise) {
+            state.prefetchPromise = null;
+            state.prefetchPromiseEpoch = -1;
+          }
         }
       })();
-      await state.prefetchPromise;
+      state.prefetchPromise = currentPromise;
+      state.prefetchPromiseEpoch = requestEpoch;
+      await currentPromise;
     }
 
     function playTrack(track) {
@@ -509,6 +524,10 @@
       state.queue = [];
       state.currentTrack = null;
       state.consecutiveErrors = 0;
+      state.blockedArtists = new Set();
+      state.prefetchEpoch += 1;
+      state.prefetchPromise = null;
+      state.prefetchPromiseEpoch = -1;
       const st = state.stations.find((s) => s.station_id === stationId);
       el.stationLabel.textContent = st ? `ON AIR · ${st.name}` : "ON AIR";
       renderStations();
@@ -613,17 +632,20 @@
       } catch (_) {}
     });
 
-    // Control 4: BAD (0.0 reward + evict same artist from prefetched queue + instant skip)
+    // Control 4: BAD (0.0 reward + block artist + invalidate in-flight prefetch + evict from queue + instant skip)
     el.btnBad.addEventListener("click", async () => {
       if (!state.currentTrack) return;
       const badArtistNorm = normalizeArtistName(state.currentTrack.artist);
-      // [M5] Immediately purge prefetched tracks by the BAD-rated artist
       if (badArtistNorm) {
-        state.queue = state.queue.filter(
-          (item) => normalizeArtistName(item.artist) !== badArtistNorm
-        );
-        renderQueue();
+        state.blockedArtists.add(badArtistNorm);
       }
+      state.prefetchEpoch += 1;
+      state.prefetchPromise = null;
+      state.prefetchPromiseEpoch = -1;
+      state.queue = state.queue.filter(
+        (item) => !state.blockedArtists.has(normalizeArtistName(item.artist))
+      );
+      renderQueue();
       try {
         await sendFeedback("BAD");
       } catch (_) {}

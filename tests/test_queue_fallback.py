@@ -409,3 +409,127 @@ def test_concurrent_cold_pool_requests_execute_only_one_dig(tmp_path: Path) -> N
 
     assert counts == [3, 3]
     assert dig_calls == 1, f"Expected single deduplicated dig, got {dig_calls}"
+
+
+def test_digging_stations_flag_does_not_leak_when_exclude_triggers_background_dig(tmp_path: Path) -> None:
+    """[Bug #2] 6 tracks in DB + 3 excluded must not leak _digging_stations; subsequent 2-unheard state must auto-dig."""
+    import threading
+
+    db_path = tmp_path / "radio.db"
+    stations_path = tmp_path / "stations.yaml"
+    _write_station_yaml(stations_path)
+
+    db = RadioDatabase(db_path)
+    for i in range(6):
+        db.upsert_track(
+            "test_fm",
+            TrackEntity(
+                track_id=f"trk_leak_{i}",
+                canonical_key=f"leak{i}::song{i}",
+                artist=f"LeakArtist{i}",
+                title=f"Song{i}",
+                tags=["folktronica"],
+                view_count=10_000,
+                video_id=f"VID_LEAK_{i}",
+            ),
+        )
+
+    app = create_app(db_path=db_path, stations_path=stations_path, model_dir=tmp_path / "m", auto_dig=True)
+    dig_event = threading.Event()
+    dig_calls = 0
+
+    class TrackingFakeDigger:
+        def dig_station(self, station, target_pool_size=60):
+            nonlocal dig_calls
+            dig_calls += 1
+            db.upsert_track(
+                station.station_id,
+                TrackEntity(
+                    track_id=f"trk_replenished_{dig_calls}",
+                    canonical_key=f"rep{dig_calls}::song",
+                    artist=f"RepArtist{dig_calls}",
+                    title="Replenished Song",
+                    tags=["folktronica"],
+                    view_count=9_000,
+                    video_id=f"VID_REP_{dig_calls}",
+                ),
+            )
+            dig_event.set()
+            return {"station_id": station.station_id, "added": 1}
+
+    app.state.runtime._digger = TrackingFakeDigger()
+    client = TestClient(app)
+
+    # Step 1: 6 unheard in DB, but 3 excluded -> unheard after exclude is 3 (< 5) -> triggers background dig
+    res1 = client.get(
+        "/queue/next",
+        params={"station_id": "test_fm", "count": 3, "exclude": "trk_leak_0,trk_leak_1,trk_leak_2"},
+    )
+    assert res1.status_code == 200
+    assert dig_event.wait(timeout=2.0), "First background dig should complete"
+    # Wait briefly for finally block to clear _digging_stations
+    for _ in range(20):
+        if "test_fm" not in app.state.runtime._digging_stations:
+            break
+        threading.Event().wait(0.02)
+    assert "test_fm" not in app.state.runtime._digging_stations, "_digging_stations leaked 'test_fm'!"
+
+    # Step 2: Mark all but 2 tracks as heard, clear event, and verify a new background dig still launches
+    dig_event.clear()
+    before_calls = dig_calls
+    for i in range(5):
+        client.post(
+            "/feedback",
+            json={"station_id": "test_fm", "track_id": f"trk_leak_{i}", "event_type": "COMPLETE"},
+        )
+
+    res2 = client.get("/queue/next", params={"station_id": "test_fm", "count": 3})
+    assert res2.status_code == 200
+    assert dig_event.wait(timeout=2.0), "Subsequent background dig failed to launch due to leaked flag"
+    assert dig_calls > before_calls
+
+
+def test_feedback_endpoint_rolls_back_db_row_when_bandit_update_raises(tmp_path: Path, monkeypatch) -> None:
+    """[Bug #3] If bandit.update raises inside POST /feedback, the inserted feedback_events row must be deleted."""
+    import pytest
+
+    db_path = tmp_path / "radio.db"
+    stations_path = tmp_path / "stations.yaml"
+    _write_station_yaml(stations_path)
+
+    db = RadioDatabase(db_path)
+    db.upsert_track(
+        "test_fm",
+        TrackEntity(
+            track_id="trk_fb_rb",
+            canonical_key="artist::rb song",
+            artist="ArtistRB",
+            title="RB Song",
+            tags=["folktronica"],
+            view_count=10_000,
+            video_id="VID_RB_1",
+        ),
+    )
+
+    app = create_app(db_path=db_path, stations_path=stations_path, model_dir=tmp_path / "m", auto_dig=False)
+    bandit = app.state.runtime.bandits["test_fm"]
+
+    def _failing_update(*args, **kwargs):
+        raise OSError("Simulated bandit persistence failure")
+
+    monkeypatch.setattr(bandit, "update", _failing_update)
+    client = TestClient(app, raise_server_exceptions=True)
+
+    with pytest.raises(OSError, match="Simulated bandit persistence failure"):
+        client.post(
+            "/feedback",
+            json={
+                "station_id": "test_fm",
+                "track_id": "trk_fb_rb",
+                "video_id": "VID_RB_1",
+                "event_type": "GOOD",
+            },
+        )
+
+    assert db.count_feedback("test_fm") == 0, "Orphan feedback_events row remained after bandit.update failure"
+    assert db.get_recently_heard_track_ids("test_fm") == set()

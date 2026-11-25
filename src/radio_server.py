@@ -122,31 +122,32 @@ class RadioRuntime:
         target_pool_size: int = 60,
         skip_if_unheard_gte: int = 0,
     ) -> dict[str, Any] | None:
-        """Serialize digging per station so concurrent requests never launch duplicate digs."""
+        """Serialize digging per station and guarantee _digging_stations cleanup on every exit path."""
         lock = self._get_station_dig_lock(station.station_id)
-        with lock:
-            if skip_if_unheard_gte > 0:
-                existing = self.db.count_playable_candidates(
-                    station.station_id,
-                    station.max_popularity_views,
-                )
-                if existing >= skip_if_unheard_gte:
-                    return {
-                        "station_id": station.station_id,
-                        "added": 0,
-                        "total_playable": existing,
-                        "skipped_duplicate_dig": True,
-                    }
-            with self._dig_state_lock:
-                self._digging_stations.add(station.station_id)
-            try:
-                return self.digger.dig_station(station, target_pool_size=target_pool_size)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
-                return None
-            finally:
+        try:
+            with lock:
                 with self._dig_state_lock:
-                    self._digging_stations.discard(station.station_id)
+                    self._digging_stations.add(station.station_id)
+                if skip_if_unheard_gte > 0:
+                    existing = self.db.count_playable_candidates(
+                        station.station_id,
+                        station.max_popularity_views,
+                    )
+                    if existing >= skip_if_unheard_gte:
+                        return {
+                            "station_id": station.station_id,
+                            "added": 0,
+                            "total_playable": existing,
+                            "skipped_duplicate_dig": True,
+                        }
+                try:
+                    return self.digger.dig_station(station, target_pool_size=target_pool_size)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
+                    return None
+        finally:
+            with self._dig_state_lock:
+                self._digging_stations.discard(station.station_id)
 
     def _trigger_background_dig(
         self,
@@ -161,18 +162,27 @@ class RadioRuntime:
             self._digging_stations.add(station.station_id)
 
         def _worker() -> None:
-            self._run_station_dig(
-                station,
-                target_pool_size=target_pool_size,
-                skip_if_unheard_gte=min_unheard,
-            )
+            try:
+                self._run_station_dig(
+                    station,
+                    target_pool_size=target_pool_size,
+                    skip_if_unheard_gte=min_unheard,
+                )
+            finally:
+                with self._dig_state_lock:
+                    self._digging_stations.discard(station.station_id)
 
-        thread = threading.Thread(
-            target=_worker,
-            name=f"dig-{station.station_id}",
-            daemon=True,
-        )
-        thread.start()
+        try:
+            thread = threading.Thread(
+                target=_worker,
+                name=f"dig-{station.station_id}",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            with self._dig_state_lock:
+                self._digging_stations.discard(station.station_id)
+            raise
         return True
 
     def next_queue(
@@ -183,6 +193,7 @@ class RadioRuntime:
     ) -> list[dict[str, Any]]:
         station = self.get_station(station_id)
         min_unheard_threshold = max(count, 5)
+        required_db_unheard = min_unheard_threshold + len(exclude_ids or ())
 
         # [M4] Judge depletion strictly on UNHEARD candidates
         unheard = self.db.get_eligible_candidates(
@@ -194,18 +205,18 @@ class RadioRuntime:
 
         if self.auto_dig and len(unheard) < min_unheard_threshold:
             if unheard:
-                # [M1] Return immediately from existing unheard pool; replenish asynchronously
+                # [M1 / Bug #2] Return immediately from existing unheard pool; replenish asynchronously
                 self._trigger_background_dig(
                     station,
                     target_pool_size=60,
-                    min_unheard=min_unheard_threshold,
+                    min_unheard=required_db_unheard,
                 )
             else:
                 # Cold empty or fully heard pool: serialize a single dig across concurrent callers
                 self._run_station_dig(
                     station,
                     target_pool_size=60,
-                    skip_if_unheard_gte=min_unheard_threshold,
+                    skip_if_unheard_gte=required_db_unheard,
                 )
                 unheard = self.db.get_eligible_candidates(
                     station_id=station.station_id,
@@ -349,8 +360,8 @@ def create_app(
             duration_seconds=req.duration_seconds,
         )
 
-        # [C1] Record feedback in SQLite FIRST, then update bandit model to preserve DB/model consistency
-        runtime.db.record_feedback(
+        # [C1 / Bug #3] Record feedback in SQLite FIRST, and roll back row if bandit.update fails
+        feedback_id = runtime.db.record_feedback(
             station_id=station.station_id,
             track=track,
             event_type=event,
@@ -358,13 +369,17 @@ def create_app(
             listen_seconds=req.listen_seconds,
             duration_seconds=req.duration_seconds,
         )
-        bandit.update(
-            track,
-            event_type=event,
-            listen_seconds=req.listen_seconds,
-            duration_seconds=req.duration_seconds,
-            is_new_artist=is_new_artist,
-        )
+        try:
+            bandit.update(
+                track,
+                event_type=event,
+                listen_seconds=req.listen_seconds,
+                duration_seconds=req.duration_seconds,
+                is_new_artist=is_new_artist,
+            )
+        except Exception:
+            runtime.db.delete_feedback(feedback_id)
+            raise
 
         return {
             "status": "ok",

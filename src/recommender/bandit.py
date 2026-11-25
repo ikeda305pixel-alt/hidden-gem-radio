@@ -216,13 +216,20 @@ class ContextualBanditRecommender:
         context = self.featurize(track, is_new_artist=is_new_artist, hour=hour).reshape(1, -1)
 
         with self._lock:
-            if self._n_updates == 0:
-                self._mab.fit(decisions=["play"], rewards=[reward], contexts=context)
-            else:
-                self._mab.partial_fit(decisions=["play"], rewards=[reward], contexts=context)
+            prev_n_updates = self._n_updates
+            prev_mab_snapshot = pickle.dumps(self._mab)
+            try:
+                if self._n_updates == 0:
+                    self._mab.fit(decisions=["play"], rewards=[reward], contexts=context)
+                else:
+                    self._mab.partial_fit(decisions=["play"], rewards=[reward], contexts=context)
 
-            self._n_updates += 1
-            self._save_locked()
+                self._n_updates += 1
+                self._save_locked()
+            except Exception:
+                self._n_updates = prev_n_updates
+                self._mab = pickle.loads(prev_mab_snapshot)
+                raise
         return reward
 
     def rank_candidates(
@@ -356,15 +363,18 @@ class ContextualBanditRecommender:
             try:
                 with self.model_path.open("rb") as fh:
                     state = pickle.load(fh)
+                saved_mab = state.get("mab") if isinstance(state, dict) else None
                 saved_dim = state.get("feature_dim") if isinstance(state, dict) else None
-                dim_matches = saved_dim is None or int(saved_dim) == self.feature_dim
+                if saved_dim is None:
+                    saved_dim = getattr(getattr(saved_mab, "_imp", None), "num_features", None)
+                dim_matches = saved_dim is not None and int(saved_dim) == self.feature_dim
                 if (
                     isinstance(state, dict)
                     and state.get("tag_vocab") == self.tag_vocab
                     and dim_matches
-                    and isinstance(state.get("mab"), MAB)
+                    and isinstance(saved_mab, MAB)
                 ):
-                    self._mab = state["mab"]
+                    self._mab = saved_mab
                     self._n_updates = int(state.get("n_updates", 0))
                     # [M8] Apply latest YAML exploration_rate even if persisted alpha differed
                     self._apply_exploration_rate_locked()

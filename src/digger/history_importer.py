@@ -23,7 +23,7 @@ from typing import Any
 from ytmusicapi import YTMusic
 
 from src.digger.listenbrainz import ListenBrainzClient
-from src.models import StationConfig, save_stations_yaml
+from src.models import StationConfig, normalize_artist, save_stations_yaml
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +56,17 @@ _NON_MUSIC_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _MUSIC_SIGNAL_TITLE_RE = re.compile(
-    r"\b(?:official\s*(?:music\s*)?(?:video|audio|lyric|visualizer)|music\s*video|"
-    r"lyric\s*video|feat\.?|ft\.?|remix|acoustic|mv|full\s*song|topic)\b",
+    r"(?:\b(?:official\s*(?:(?:hd|4k|music|lyric|audio|visuali[sz]er)\s*)*(?:video|audio|mv|m/v|lyric|visuali[sz]er)|"
+    r"music\s*video|lyric\s*video|feat\.?|ft\.?|remix|acoustic|mv|full\s*song|topic|a\s+colors\s+show|boiler\s+room)\b|"
+    r"\bM/V\b|"
+    r"[\(\[\{]\s*(?:official\s*)?(?:audio|lyrics?|original\s+mix|remix|extended\s+mix|live\s+(?:on|at)\s+[^\)\]\}]*)\s*[\)\]\}])",
     re.IGNORECASE,
 )
 _MUSIC_CHANNEL_RE = re.compile(
-    r"(?:\s*-\s*(?:topic|トピック)$|vevo$|records?$|music$|official\s*(?:music|artist)|sounds?$|recordings?$)",
+    r"(?:\s*-\s*(?:topic|トピック)$|vevo$|records?$|music$|official\s*(?:music|artist)|"
+    r"sounds?$|recordings?$|^\s*(?:kexp|boiler\s*room|ninja\s*tune|colors|colorsxstudios|sub\s*pop|"
+    r"warp\s*records|xl\s*recordings|domino\s*recording\s*co\.?|4ad|matador\s*records|spinnin'\s*records|"
+    r"armada\s*music|anjunadeep|anjunabeats|ultra\s*records|monstercat|Ghostly\s*International)\s*$)",
     re.IGNORECASE,
 )
 _CHANNEL_CLEAN_RE = re.compile(
@@ -126,6 +131,17 @@ def _is_google_ad_entry(entry: dict[str, Any]) -> bool:
     return False
 
 
+def _channel_matches_title_artist(channel_name: str, title_artist: str) -> bool:
+    """Return True if channel name and 'Artist - Track' left-side artist match or contain each other."""
+    if not channel_name or not title_artist:
+        return False
+    ch_norm = normalize_artist(_clean_channel_artist(channel_name)).replace(" ", "")
+    ar_norm = normalize_artist(title_artist).replace(" ", "")
+    if len(ch_norm) < 2 or len(ar_norm) < 2:
+        return False
+    return ch_norm == ar_norm or ar_norm in ch_norm or ch_norm in ar_norm
+
+
 def parse_takeout_watch_history(
     takeout_path: Path | str,
     warnings: list[str] | None = None,
@@ -167,24 +183,31 @@ def parse_takeout_watch_history(
             channel_name = str(subtitles[0].get("name") or "").strip()
 
         is_yt_music = header.lower() == "youtube music" or "music.youtube.com" in url.lower()
-        if not is_yt_music and _NON_MUSIC_TITLE_RE.search(title):
+        if not is_yt_music and (_NON_MUSIC_TITLE_RE.search(title) or _NON_MUSIC_TITLE_RE.search(channel_name)):
             continue
+
+        dash_artist = ""
+        dash_track = ""
+        if " - " in title:
+            left, right = title.split(" - ", 1)
+            if 1 <= len(left.strip()) <= 45 and right.strip():
+                dash_artist = left.strip()
+                dash_track = _clean_takeout_title(right.strip())
 
         has_music_channel = bool(channel_name and _MUSIC_CHANNEL_RE.search(channel_name))
         has_music_title = bool(_MUSIC_SIGNAL_TITLE_RE.search(title))
+        has_artist_channel_match = bool(dash_artist and _channel_matches_title_artist(channel_name, dash_artist))
 
-        # [M6] Do NOT treat bare " - " as music without a music channel or music title signal
-        if not (is_yt_music or has_music_channel or has_music_title):
+        # [M6 / Bug #4] Require music channel, music title signal, or verified artist-channel match on "Artist - Track"
+        if not (is_yt_music or has_music_channel or has_music_title or has_artist_channel_match):
             continue
 
         # Extract artist and clean track title
         artist = ""
         track_title = title
-        if " - " in title and not is_yt_music:
-            left, right = title.split(" - ", 1)
-            if 1 <= len(left.strip()) <= 45:
-                artist = left.strip()
-                track_title = _clean_takeout_title(right.strip())
+        if dash_artist and not is_yt_music:
+            artist = dash_artist
+            track_title = dash_track
         if not artist and channel_name:
             artist = _clean_channel_artist(channel_name)
         if not artist:

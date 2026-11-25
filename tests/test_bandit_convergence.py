@@ -192,3 +192,86 @@ def test_reward_mapping_matches_specification() -> None:
     assert ContextualBanditRecommender.compute_reward("ENDED", listen_seconds=180, duration_seconds=200) == 0.7
     assert ContextualBanditRecommender.compute_reward("SKIP", listen_seconds=10, duration_seconds=200) == 0.0
     assert ContextualBanditRecommender.compute_reward("SKIP", listen_seconds=60, duration_seconds=200) == 0.3
+
+
+def test_legacy_pickle_without_feature_dim_and_d_minus_1_resets_cleanly(tmp_path: Path) -> None:
+    """[Bug #1] Legacy pickle lacking feature_dim with D-1 dimension must back up to .pkl.bak and not crash."""
+    import pickle
+
+    import numpy as np
+    from mabwiser.mab import MAB, LearningPolicy
+
+    model_path = tmp_path / "bandit_legacy.pkl"
+    seed_tags = ["folktronica", "indietronica"]
+
+    probe = ContextualBanditRecommender(
+        station_id="legacy_station",
+        seed_tags=seed_tags,
+        exploration_rate=1.0,
+        model_path=tmp_path / "probe.pkl",
+    )
+    legacy_dim = probe.feature_dim - 1
+    legacy_mab = MAB(arms=["play"], learning_policy=LearningPolicy.LinUCB(alpha=1.0), seed=42)
+    legacy_mab.fit(decisions=["play"], rewards=[1.0], contexts=np.ones((1, legacy_dim), dtype=np.float64))
+
+    # Write commit 87d3cc3 style state (no "feature_dim" key, D-1 fitted MAB)
+    with model_path.open("wb") as fh:
+        pickle.dump(
+            {
+                "station_id": "legacy_station",
+                "tag_vocab": seed_tags,
+                "exploration_rate": 1.0,
+                "n_updates": 5,
+                "mab": legacy_mab,
+            },
+            fh,
+        )
+
+    reloaded = ContextualBanditRecommender(
+        station_id="legacy_station",
+        seed_tags=seed_tags,
+        exploration_rate=1.0,
+        model_path=model_path,
+    )
+    assert reloaded.n_updates == 0
+    assert model_path.with_suffix(".pkl.bak").exists()
+
+    # Must not crash on rank_candidates or update
+    t1 = _make_track(1, tag="folktronica", artist="Artist1")
+    t2 = _make_track(2, tag="indietronica", artist="Artist2")
+    ranked = reloaded.rank_candidates([t1, t2], seen_artists=set(), limit=2)
+    assert len(ranked) == 2
+    reward = reloaded.update(t1, event_type="GOOD", hour=12)
+    assert reward == 1.0
+    assert reloaded.n_updates == 1
+
+
+def test_bandit_update_rolls_back_memory_state_when_save_fails(tmp_path: Path, monkeypatch) -> None:
+    """[Bug #3] If _save_locked raises OSError, in-memory _n_updates and _mab must roll back."""
+    import pytest
+
+    model_path = tmp_path / "bandit_rollback.pkl"
+    bandit = ContextualBanditRecommender(
+        station_id="rb_station",
+        seed_tags=["folktronica", "indietronica"],
+        exploration_rate=1.0,
+        model_path=model_path,
+    )
+    t1 = _make_track(1, tag="folktronica", artist="Artist1")
+    t2 = _make_track(2, tag="indietronica", artist="Artist2")
+
+    bandit.update(t1, event_type="GOOD", hour=12)
+    assert bandit.n_updates == 1
+    before_scores = [r.score for r in bandit.rank_candidates([t1, t2], seen_artists=set(), hour=12, limit=2)]
+
+    def _boom() -> None:
+        raise OSError("Simulated disk full during _save_locked")
+
+    monkeypatch.setattr(bandit, "_save_locked", _boom)
+
+    with pytest.raises(OSError, match="Simulated disk full"):
+        bandit.update(t2, event_type="BAD", hour=12)
+
+    assert bandit.n_updates == 1
+    after_scores = [r.score for r in bandit.rank_candidates([t1, t2], seen_artists=set(), hour=12, limit=2)]
+    assert after_scores == before_scores

@@ -228,3 +228,155 @@ def test_invalid_browser_auth_exposes_warnings_in_summary_and_api(tmp_path: Path
     )
     assert res.status_code == 200
     assert res.json()["warnings"], "API response must expose auth warnings"
+
+
+def test_takeout_recall_passes_at_least_15_of_17_real_music_samples_and_drops_all_non_music(
+    tmp_path: Path,
+) -> None:
+    """[Bug #4] At least 15/17 diverse real music entries must be imported while all 4 non-music entries drop."""
+    takeout_path = tmp_path / "watch-history.json"
+    music_entries = [
+        {
+            "header": "YouTube",
+            "title": "Watched Four Tet - Baby",
+            "titleUrl": "https://www.youtube.com/watch?v=m01",
+            "subtitles": [{"name": "Four Tet"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Bonobo - Kerala",
+            "titleUrl": "https://www.youtube.com/watch?v=m02",
+            "subtitles": [{"name": "Bonobo"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Oberhofer - Earplugs",
+            "titleUrl": "https://www.youtube.com/watch?v=m03",
+            "subtitles": [{"name": "Oberhofer"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Tame Impala - Let It Happen",
+            "titleUrl": "https://www.youtube.com/watch?v=m04",
+            "subtitles": [{"name": "Tame Impala"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Radiohead - Weird Fishes/Arpeggi",
+            "titleUrl": "https://www.youtube.com/watch?v=m05",
+            "subtitles": [{"name": "Radiohead"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Oasis - Wonderwall (Official HD Video)",
+            "titleUrl": "https://www.youtube.com/watch?v=m06",
+            "subtitles": [{"name": "Oasis"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Avicii - Levels (Original Mix)",
+            "titleUrl": "https://www.youtube.com/watch?v=m07",
+            "subtitles": [{"name": "AviciiOfficial"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Daft Punk - Instant Crush (Lyrics)",
+            "titleUrl": "https://www.youtube.com/watch?v=m08",
+            "subtitles": [{"name": "IndieVibes"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Caribou - Can't Do Without You (Audio)",
+            "titleUrl": "https://www.youtube.com/watch?v=m09",
+            "subtitles": [{"name": "City Slang"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Khruangbin - Maria También (Live on KEXP)",
+            "titleUrl": "https://www.youtube.com/watch?v=m10",
+            "subtitles": [{"name": "KEXP"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched BLACKPINK - 'Shut Down' M/V",
+            "titleUrl": "https://www.youtube.com/watch?v=m11",
+            "subtitles": [{"name": "BLACKPINK"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Bicep - Glue",
+            "titleUrl": "https://www.youtube.com/watch?v=m12",
+            "subtitles": [{"name": "Ninja Tune"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Fred again.. - Boiler Room: London",
+            "titleUrl": "https://www.youtube.com/watch?v=m13",
+            "subtitles": [{"name": "Boiler Room"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched FKJ - Ylang Ylang | A COLORS SHOW",
+            "titleUrl": "https://www.youtube.com/watch?v=m14",
+            "subtitles": [{"name": "COLORS"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Earplugs を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=m15",
+            "subtitles": [{"name": "Oberhofer - トピック"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "「Levels」を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=m16",
+            "subtitles": [{"name": "Avicii - Topic"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Disclosure - Latch feat. Sam Smith",
+            "titleUrl": "https://www.youtube.com/watch?v=m17",
+            "subtitles": [{"name": "Disclosure"}],
+        },
+    ]
+    non_music_entries = [
+        {
+            "header": "YouTube",
+            "title": "Python入門 - 第1回 変数とは を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=nm1",
+            "subtitles": [{"name": "プログラミング教室"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "【料理】簡単パスタ - 10分レシピ を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=nm2",
+            "subtitles": [{"name": "Cooking Channel"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Some Brand Spring Sale を視聴しました",
+            "titleUrl": "https://www.youtube.com/watch?v=nm3",
+            "subtitles": [{"name": "BrandOfficial"}],
+            "details": [{"name": "From Google Ads"}],
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Brand Announcement 2026",
+            "titleUrl": "https://www.youtube.com/watch?v=nm4",
+            "subtitles": [{"name": "BrandOfficial"}],
+        },
+    ]
+    takeout_path.write_text(json.dumps(music_entries + non_music_entries, ensure_ascii=False), encoding="utf-8")
+
+    records = parse_takeout_watch_history(takeout_path)
+    artists = {r["artist"] for r in records}
+    titles = {r["title"] for r in records}
+
+    # Non-music must all be dropped
+    for forbidden in ("プログラミング教室", "Python入門", "Cooking Channel", "【料理】簡単パスタ", "BrandOfficial", "Brand"):
+        assert forbidden not in artists
+    assert "Brand Announcement 2026" not in titles
+    assert "Some Brand Spring Sale" not in titles
+
+    # At least 15 of the 17 real music entries must be captured
+    assert len(records) >= 15, f"Expected >= 15 of 17 real music tracks, got {len(records)}: {records}"
