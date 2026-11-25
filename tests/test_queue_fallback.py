@@ -533,3 +533,93 @@ def test_feedback_endpoint_rolls_back_db_row_when_bandit_update_raises(tmp_path:
 
     assert db.count_feedback("test_fm") == 0, "Orphan feedback_events row remained after bandit.update failure"
     assert db.get_recently_heard_track_ids("test_fm") == set()
+
+
+def test_background_dig_finally_does_not_clear_active_sync_dig_token(tmp_path: Path) -> None:
+    """[Race #1] T1 (background dig) finally must NOT wipe T2 (sync dig) active token or allow T3 launch."""
+    import threading
+
+    db_path = tmp_path / "radio.db"
+    stations_path = tmp_path / "stations.yaml"
+    _write_station_yaml(stations_path)
+
+    app = create_app(db_path=db_path, stations_path=stations_path, model_dir=tmp_path / "m", auto_dig=True)
+    runtime = app.state.runtime
+    station = runtime.get_station("test_fm")
+
+    t1_in_dig = threading.Event()
+    release_t1_dig = threading.Event()
+    t2_in_dig = threading.Event()
+    release_t2_dig = threading.Event()
+    t1_exited_lock = threading.Event()
+
+    dig_calls = 0
+    call_lock = threading.Lock()
+
+    class CoordinatedDigger:
+        def dig_station(self, st, target_pool_size=60):
+            nonlocal dig_calls
+            with call_lock:
+                dig_calls += 1
+                call_no = dig_calls
+            if call_no == 1:
+                t1_in_dig.set()
+                assert release_t1_dig.wait(timeout=3.0)
+            elif call_no == 2:
+                t2_in_dig.set()
+                assert release_t2_dig.wait(timeout=3.0)
+            return {"station_id": st.station_id, "added": 0}
+
+    class RaceInjectingLock:
+        """Releases real lock on T1 exit, then pauses T1 before its finally runs until T2 enters dig_station."""
+
+        def __init__(self) -> None:
+            self._inner = threading.Lock()
+            self._exits = 0
+
+        def __enter__(self):
+            self._inner.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._exits += 1
+            exit_no = self._exits
+            self._inner.release()
+            if exit_no == 1:
+                assert t2_in_dig.wait(timeout=3.0), "T2 never entered dig_station after T1 released lock"
+                t1_exited_lock.set()
+            return False
+
+    runtime._digger = CoordinatedDigger()
+    with runtime._dig_state_lock:
+        runtime._dig_locks["test_fm"] = RaceInjectingLock()  # type: ignore[assignment]
+
+    # 1. Launch T1 as background dig
+    assert runtime._trigger_background_dig(station) is True
+    assert t1_in_dig.wait(timeout=2.0)
+
+    # 2. Launch T2 as synchronous dig; it blocks on station lock until T1 releases it
+    t2_thread = threading.Thread(target=runtime._run_station_dig, args=(station,))
+    t2_thread.start()
+
+    # 3. Allow T1 to finish dig_station and release lock; RaceInjectingLock holds T1 until T2 is inside dig_station
+    release_t1_dig.set()
+    assert t1_exited_lock.wait(timeout=3.0)
+
+    # Wait briefly for T1's worker thread (and its finally block) to fully terminate
+    for th in list(threading.enumerate()):
+        if th.name == "dig-test_fm":
+            th.join(timeout=2.0)
+
+    # 4. While T2 is STILL inside dig_station, its ownership token must still be present and block T3
+    try:
+        with runtime._dig_state_lock:
+            assert "test_fm" in runtime._digging_stations, "T1 finally wiped out T2's active digging flag!"
+        assert runtime._trigger_background_dig(station) is False, "T3 should be blocked while T2 is digging!"
+    finally:
+        release_t2_dig.set()
+        t2_thread.join(timeout=3.0)
+
+    with runtime._dig_state_lock:
+        assert "test_fm" not in runtime._digging_stations, "T2 failed to clean up its own digging token"
+    assert dig_calls == 2

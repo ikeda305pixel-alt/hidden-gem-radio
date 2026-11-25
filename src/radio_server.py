@@ -64,7 +64,7 @@ class RadioRuntime:
         self._digger_init_lock = threading.Lock()
         self._dig_state_lock = threading.Lock()
         self._dig_locks: dict[str, threading.Lock] = {}
-        self._digging_stations: set[str] = set()
+        self._digging_stations: dict[str, object] = {}
         self.stations: dict[str, StationConfig] = {}
         self.bandits: dict[str, ContextualBanditRecommender] = {}
         self.reload_stations()
@@ -116,18 +116,28 @@ class RadioRuntime:
                 self._dig_locks[station_id] = lock
             return lock
 
+    def _release_dig_token(self, station_id: str, token: object) -> None:
+        """Release the station's active digging entry only if owned by the matching token."""
+        with self._dig_state_lock:
+            if self._digging_stations.get(station_id) is token:
+                del self._digging_stations[station_id]
+
     def _run_station_dig(
         self,
         station: StationConfig,
         target_pool_size: int = 60,
         skip_if_unheard_gte: int = 0,
+        owner_token: object | None = None,
     ) -> dict[str, Any] | None:
-        """Serialize digging per station and guarantee _digging_stations cleanup on every exit path."""
-        lock = self._get_station_dig_lock(station.station_id)
+        """Serialize digging per station and guarantee ownership-scoped token cleanup."""
+        my_token = owner_token
         try:
+            lock = self._get_station_dig_lock(station.station_id)
             with lock:
+                if my_token is None:
+                    my_token = object()
                 with self._dig_state_lock:
-                    self._digging_stations.add(station.station_id)
+                    self._digging_stations[station.station_id] = my_token
                 if skip_if_unheard_gte > 0:
                     existing = self.db.count_playable_candidates(
                         station.station_id,
@@ -146,8 +156,8 @@ class RadioRuntime:
                     logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
                     return None
         finally:
-            with self._dig_state_lock:
-                self._digging_stations.discard(station.station_id)
+            if my_token is not None:
+                self._release_dig_token(station.station_id, my_token)
 
     def _trigger_background_dig(
         self,
@@ -159,18 +169,16 @@ class RadioRuntime:
         with self._dig_state_lock:
             if station.station_id in self._digging_stations:
                 return False
-            self._digging_stations.add(station.station_id)
+            token = object()
+            self._digging_stations[station.station_id] = token
 
         def _worker() -> None:
-            try:
-                self._run_station_dig(
-                    station,
-                    target_pool_size=target_pool_size,
-                    skip_if_unheard_gte=min_unheard,
-                )
-            finally:
-                with self._dig_state_lock:
-                    self._digging_stations.discard(station.station_id)
+            self._run_station_dig(
+                station,
+                target_pool_size=target_pool_size,
+                skip_if_unheard_gte=min_unheard,
+                owner_token=token,
+            )
 
         try:
             thread = threading.Thread(
@@ -180,8 +188,7 @@ class RadioRuntime:
             )
             thread.start()
         except Exception:
-            with self._dig_state_lock:
-                self._digging_stations.discard(station.station_id)
+            self._release_dig_token(station.station_id, token)
             raise
         return True
 

@@ -420,16 +420,18 @@
       return res.json();
     }
 
-    // [M2 / Bug #5] Share in-flight prefetch Promise only when its prefetchEpoch is still current
+    // [M2 / Bug #5] Share in-flight prefetch Promise across awaits and guard station switches
     async function ensurePrefetchQueue(targetSize = 3) {
-      if (!state.activeStationId) return;
-      if (state.prefetchPromise && state.prefetchPromiseEpoch === state.prefetchEpoch) {
+      const callerStationId = state.activeStationId;
+      if (!callerStationId) return;
+      while (state.prefetchPromise) {
         await state.prefetchPromise;
+        if (state.activeStationId !== callerStationId) return;
         if (state.queue.length >= targetSize) return;
       }
-      if (state.queue.length >= targetSize) return;
+      if (state.activeStationId !== callerStationId || state.queue.length >= targetSize) return;
 
-      const stationId = state.activeStationId;
+      const stationId = callerStationId;
       const requestEpoch = state.prefetchEpoch;
       let currentPromise = null;
       currentPromise = (async () => {
