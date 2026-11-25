@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hidden Gem Radio</title>
+  <style>
+    :root {
+      --bg: #0c0f16;
+      --panel: #151b28;
+      --panel-soft: #1d2536;
+      --border: #2a344a;
+      --text: #eef2ff;
+      --muted: #93a1be;
+      --accent: #38bdf8;
+      --good: #22c55e;
+      --bad: #ef4444;
+      --explore: #a78bfa;
+      --exploit: #34d399;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans", sans-serif;
+      background: radial-gradient(circle at top, #172033 0%, var(--bg) 62%);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+
+    .radio-shell {
+      width: 100%;
+      max-width: 780px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .live-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--good);
+      box-shadow: 0 0 10px var(--good);
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 1.25rem;
+      letter-spacing: 0.02em;
+    }
+
+    .status-pill {
+      font-size: 0.8rem;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 999px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+    }
+
+    /* 1. Station Switcher (Station-First UI) */
+    .station-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .station-btn {
+      background: var(--panel-soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 14px;
+      font-size: 0.88rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .station-btn:hover { border-color: var(--accent); }
+    .station-btn.active {
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+
+    /* Player + Now Playing */
+    .player-grid {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 18px;
+      align-items: center;
+    }
+
+    @media (max-width: 680px) {
+      .player-grid { grid-template-columns: 1fr; }
+    }
+
+    .video-box {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #06080d;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+
+    .now-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+
+    .track-title {
+      margin: 0 0 4px 0;
+      font-size: 1.35rem;
+      line-height: 1.3;
+    }
+
+    .track-artist {
+      margin: 0 0 12px 0;
+      color: var(--muted);
+      font-size: 0.98rem;
+    }
+
+    /* 1-line recommendation reason */
+    .reason-line {
+      font-size: 0.84rem;
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: var(--panel-soft);
+      border: 1px solid var(--border);
+      color: #dbeafe;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 14px;
+    }
+
+    /* Core 3 Playback/Feedback Controls (+ Station Switcher = 4 UI controls) */
+    .controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .ctrl-btn {
+      flex: 1;
+      min-width: 110px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel-soft);
+      color: var(--text);
+      font-size: 0.94rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .ctrl-btn:active { transform: scale(0.98); }
+    .ctrl-play { border-color: var(--accent); }
+    .ctrl-good {
+      background: rgba(34, 197, 94, 0.14);
+      border-color: rgba(34, 197, 94, 0.55);
+      color: #bbf7d0;
+    }
+    .ctrl-good:hover { background: rgba(34, 197, 94, 0.25); }
+    .ctrl-good.rated { background: var(--good); color: #052e16; }
+
+    .ctrl-bad {
+      background: rgba(239, 68, 68, 0.14);
+      border-color: rgba(239, 68, 68, 0.55);
+      color: #fecaca;
+    }
+    .ctrl-bad:hover { background: rgba(239, 68, 68, 0.26); }
+
+    /* Prefetch Queue N=3 */
+    .queue-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .queue-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .queue-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--panel-soft);
+      font-size: 0.86rem;
+    }
+
+    .queue-meta {
+      color: var(--muted);
+      font-size: 0.78rem;
+      white-space: nowrap;
+    }
+
+    .tiny-link {
+      background: none;
+      border: none;
+      color: var(--accent);
+      font-size: 0.8rem;
+      cursor: pointer;
+      padding: 0;
+    }
+  </style>
+</head>
+<body>
+  <main class="radio-shell">
+    <header class="header">
+      <div class="brand">
+        <span class="live-dot" aria-hidden="true"></span>
+        <h1>Hidden Gem Radio</h1>
+      </div>
+      <div class="status-pill" id="statusPill">局を読み込み中...</div>
+    </header>
+
+    <!-- Control 1: Station Switcher -->
+    <section class="card" aria-label="局切替">
+      <div class="station-row" id="stationRow"></div>
+    </section>
+
+    <!-- Now Playing + YouTube IFrame + Core Controls -->
+    <section class="card">
+      <div class="player-grid">
+        <div class="video-box">
+          <div id="ytPlayer"></div>
+        </div>
+        <div>
+          <div class="now-label" id="stationLabel">NOW TUNED</div>
+          <h2 class="track-title" id="trackTitle">局を選択して再生を開始</h2>
+          <p class="track-artist" id="trackArtist">—</p>
+          <div class="reason-line" id="reasonLine">推薦理由: 待機中</div>
+
+          <!-- Controls 2, 3, 4: Play/Mute, Good, BAD (Instant Next) -->
+          <div class="controls">
+            <button class="ctrl-btn ctrl-play" id="btnPlayMute" type="button">再生 / ミュート</button>
+            <button class="ctrl-btn ctrl-good" id="btnGood" type="button">👍 Good</button>
+            <button class="ctrl-btn ctrl-bad" id="btnBad" type="button">👎 BAD（即次曲）</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Rolling Prefetch Queue (N=3) -->
+    <section class="card">
+      <div class="queue-header">
+        <span>Rolling Prefetch Queue (N=3)</span>
+        <button class="tiny-link" id="btnDigMore" type="button">候補を追加ディグ</button>
+      </div>
+      <ul class="queue-list" id="queueList">
+        <li class="queue-item"><span>キュー準備中...</span></li>
+      </ul>
+    </section>
+  </main>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>
+    const state = {
+      stations: [],
+      activeStationId: null,
+      queue: [],
+      currentTrack: null,
+      currentRatedGood: false,
+      player: null,
+      playerReady: false,
+      consecutiveErrors: 0,
+      fetchingQueue: false,
+    };
+
+    const MAX_CONSECUTIVE_ERRORS = 8;
+
+    const el = {
+      statusPill: document.getElementById("statusPill"),
+      stationRow: document.getElementById("stationRow"),
+      stationLabel: document.getElementById("stationLabel"),
+      trackTitle: document.getElementById("trackTitle"),
+      trackArtist: document.getElementById("trackArtist"),
+      reasonLine: document.getElementById("reasonLine"),
+      queueList: document.getElementById("queueList"),
+      btnPlayMute: document.getElementById("btnPlayMute"),
+      btnGood: document.getElementById("btnGood"),
+      btnBad: document.getElementById("btnBad"),
+      btnDigMore: document.getElementById("btnDigMore"),
+    };
+
+    function setStatus(msg) {
+      el.statusPill.textContent = msg;
+    }
+
+    function escapeHtml(str) {
+      return String(str || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function renderStations() {
+      el.stationRow.innerHTML = "";
+      for (const st of state.stations) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "station-btn" + (st.station_id === state.activeStationId ? " active" : "");
+        btn.textContent = `${st.name} (${st.candidate_count})`;
+        btn.onclick = () => switchStation(st.station_id);
+        el.stationRow.appendChild(btn);
+      }
+    }
+
+    function renderQueue() {
+      if (!state.queue.length) {
+        el.queueList.innerHTML = '<li class="queue-item"><span>次曲を先読み中...</span></li>';
+        return;
+      }
+      el.queueList.innerHTML = state.queue
+        .slice(0, 3)
+        .map(
+          (item, i) => `
+          <li class="queue-item">
+            <span>#${i + 1} ${escapeHtml(item.artist)} — ${escapeHtml(item.title)}</span>
+            <span class="queue-meta">${escapeHtml(item.reason?.mode || "探索")} · ${escapeHtml(item.reason?.hidden_level || "")}</span>
+          </li>`
+        )
+        .join("");
+    }
+
+    function renderNowPlaying(track) {
+      if (!track) {
+        el.trackTitle.textContent = "再生可能な候補が見つかりません";
+        el.trackArtist.textContent = "「候補を追加ディグ」を押してください";
+        el.reasonLine.textContent = "推薦理由: 候補プールが空です";
+        return;
+      }
+      el.trackTitle.textContent = track.title;
+      el.trackArtist.textContent = track.artist;
+      el.reasonLine.textContent = track.reason?.summary || "探索 | 隠れ名曲候補";
+      el.btnGood.classList.toggle("rated", state.currentRatedGood);
+    }
+
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+
+    async function ensurePrefetchQueue(targetSize = 3) {
+      if (!state.activeStationId || state.fetchingQueue) return;
+      if (state.queue.length >= targetSize) return;
+      state.fetchingQueue = true;
+      try {
+        const exclude = [
+          ...(state.currentTrack ? [state.currentTrack.track_id] : []),
+          ...state.queue.map((t) => t.track_id),
+        ].join(",");
+        const need = Math.max(1, targetSize - state.queue.length);
+        const data = await fetchJson(
+          `/queue/next?station_id=${encodeURIComponent(state.activeStationId)}&count=${need}&exclude=${encodeURIComponent(exclude)}`
+        );
+        for (const item of data.items || []) {
+          if (!state.queue.some((q) => q.track_id === item.track_id)) {
+            state.queue.push(item);
+          }
+        }
+        renderQueue();
+      } catch (err) {
+        setStatus("キュー取得待機中");
+      } finally {
+        state.fetchingQueue = false;
+      }
+    }
+
+    function playTrack(track) {
+      state.currentTrack = track;
+      state.currentRatedGood = false;
+      renderNowPlaying(track);
+      renderQueue();
+
+      if (track && state.player && state.playerReady) {
+        state.player.loadVideoById(track.video_id);
+        setStatus("ON AIR");
+      }
+      ensurePrefetchQueue(3);
+    }
+
+    async function playNextFromQueue() {
+      if (!state.queue.length) {
+        await ensurePrefetchQueue(3);
+      }
+      const next = state.queue.shift() || null;
+      playTrack(next);
+    }
+
+    async function sendFeedback(eventType, extra = {}) {
+      if (!state.currentTrack || !state.activeStationId) return null;
+      let listenSeconds = null;
+      let durationSeconds = state.currentTrack.duration_seconds || null;
+      if (state.player && state.playerReady && typeof state.player.getCurrentTime === "function") {
+        listenSeconds = Number(state.player.getCurrentTime() || 0);
+        const ytDur = Number(state.player.getDuration() || 0);
+        if (ytDur > 0) durationSeconds = ytDur;
+      }
+      return fetchJson("/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          station_id: state.activeStationId,
+          track_id: state.currentTrack.track_id,
+          video_id: state.currentTrack.video_id,
+          event_type: eventType,
+          listen_seconds: listenSeconds,
+          duration_seconds: durationSeconds,
+          ...extra,
+        }),
+      });
+    }
+
+    async function switchStation(stationId) {
+      state.activeStationId = stationId;
+      state.queue = [];
+      state.consecutiveErrors = 0;
+      const st = state.stations.find((s) => s.station_id === stationId);
+      el.stationLabel.textContent = st ? `ON AIR · ${st.name}` : "ON AIR";
+      renderStations();
+      setStatus("チューニング中...");
+      await ensurePrefetchQueue(3);
+      await playNextFromQueue();
+    }
+
+    // YouTube IFrame Player API Hooks
+    window.onYouTubeIframeAPIReady = function () {
+      state.player = new YT.Player("ytPlayer", {
+        width: "100%",
+        height: "100%",
+        playerVars: {
+          autoplay: 1,
+          controls: 1,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+        },
+        events: {
+          onReady: () => {
+            state.playerReady = true;
+            if (state.currentTrack) {
+              state.player.loadVideoById(state.currentTrack.video_id);
+            }
+          },
+          onStateChange: async (event) => {
+            if (event.data === YT.PlayerState.PLAYING) {
+              state.consecutiveErrors = 0;
+              updatePlayMuteButton();
+            } else if (event.data === YT.PlayerState.PAUSED) {
+              updatePlayMuteButton();
+            } else if (event.data === YT.PlayerState.ENDED) {
+              if (!state.currentRatedGood) {
+                try {
+                  await sendFeedback("COMPLETE");
+                } catch (_) {}
+              }
+              await playNextFromQueue();
+            }
+          },
+          onError: async (event) => {
+            // Silent auto-fallback: never display an error popup; flag unplayable and advance
+            state.consecutiveErrors += 1;
+            const failed = state.currentTrack;
+            if (failed) {
+              try {
+                const res = await sendFeedback("UNPLAYABLE", { yt_error_code: event.data });
+                if (res?.replacement && !state.queue.some((q) => q.track_id === res.replacement.track_id)) {
+                  state.queue.unshift(res.replacement);
+                }
+              } catch (_) {}
+            }
+            if (state.consecutiveErrors <= MAX_CONSECUTIVE_ERRORS) {
+              setStatus("次曲へ自動切替...");
+              await playNextFromQueue();
+            } else {
+              setStatus("再生可能トラック待機中");
+            }
+          },
+        },
+      });
+    };
+
+    function updatePlayMuteButton() {
+      if (!state.player || !state.playerReady) return;
+      const pState = state.player.getPlayerState();
+      if (pState !== YT.PlayerState.PLAYING) {
+        el.btnPlayMute.textContent = "▶ 再生";
+      } else if (state.player.isMuted()) {
+        el.btnPlayMute.textContent = "🔊 ミュート解除";
+      } else {
+        el.btnPlayMute.textContent = "🔇 ミュート";
+      }
+    }
+
+    // Control 2: Play / Mute
+    el.btnPlayMute.addEventListener("click", () => {
+      if (!state.player || !state.playerReady) return;
+      const pState = state.player.getPlayerState();
+      if (pState !== YT.PlayerState.PLAYING) {
+        state.player.playVideo();
+      } else if (state.player.isMuted()) {
+        state.player.unMute();
+      } else {
+        state.player.mute();
+      }
+      setTimeout(updatePlayMuteButton, 150);
+    });
+
+    // Control 3: Good (+1.0 reward, keep playing)
+    el.btnGood.addEventListener("click", async () => {
+      if (!state.currentTrack || state.currentRatedGood) return;
+      state.currentRatedGood = true;
+      el.btnGood.classList.add("rated");
+      try {
+        const res = await sendFeedback("GOOD");
+        setStatus(`👍 学習反映 (更新 #${res?.model_updates ?? ""})`);
+      } catch (_) {}
+    });
+
+    // Control 4: BAD (0.0 reward + instant skip to next prefetched track)
+    el.btnBad.addEventListener("click", async () => {
+      if (!state.currentTrack) return;
+      try {
+        await sendFeedback("BAD");
+      } catch (_) {}
+      setStatus("👎 学習反映 · 次曲へ");
+      await playNextFromQueue();
+    });
+
+    el.btnDigMore.addEventListener("click", async () => {
+      if (!state.activeStationId) return;
+      setStatus("新規候補をディグ中...");
+      try {
+        const res = await fetchJson(`/stations/${encodeURIComponent(state.activeStationId)}/dig`, { method: "POST" });
+        setStatus(`+${res.added}曲 追加 (計${res.total_playable}曲)`);
+        await loadStations(false);
+        await ensurePrefetchQueue(3);
+      } catch (_) {
+        setStatus("ディグ待機中");
+      }
+    });
+
+    async function loadStations(autoTune = true) {
+      const data = await fetchJson("/stations");
+      state.stations = data.stations || [];
+      renderStations();
+      if (autoTune && state.stations.length && !state.activeStationId) {
+        await switchStation(state.stations[0].station_id);
+      }
+    }
+
+    loadStations(true).catch(() => setStatus("サーバー接続待ち"));
+  </script>
+</body>
+</html>

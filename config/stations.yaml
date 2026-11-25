@@ -1,0 +1,40 @@
+meta:
+  generated_at: '2026-11-25T13:21:35.226940+00:00'
+  sources_used:
+  - default_seed_fallback
+  records_imported: 0
+  fallback_used: true
+stations:
+- station_id: melodic_folktronica_gems
+  name: Melodic House & Folktronica Gems
+  seed_tags:
+  - melodic progressive house
+  - folktronica
+  - indietronica
+  seed_artists:
+  - Avicii
+  - Oberhofer
+  max_popularity_views: 500000
+  exploration_rate: 1.0
+- station_id: indietronica_dream_cuts
+  name: Indietronica & Dream Pop Deep Cuts
+  seed_tags:
+  - indietronica
+  - dream pop
+  - downtempo
+  seed_artists:
+  - Oberhofer
+  - Four Tet
+  max_popularity_views: 350000
+  exploration_rate: 1.2
+- station_id: progressive_organic_house
+  name: Melodic Progressive & Organic Electronic
+  seed_tags:
+  - melodic progressive house
+  - organic house
+  - deep house
+  seed_artists:
+  - Avicii
+  - Bonobo
+  max_popularity_views: 500000
+  exploration_rate: 0.9
