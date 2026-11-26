@@ -227,7 +227,8 @@ def test_watch_playlist_tracks_do_not_inherit_station_seed_tags() -> None:
             {
                 "videoId": "WP_VID_001",
                 "title": "Atomic Blue - You're Right",
-                "artists": [{"name": "Atomic Blue"}],
+                "artists": [{"name": "Atomic Blue", "id": "UC_ATOMIC_BLUE"}],
+                "album": {"name": "Atomic Blue"},
                 "views": "15K",
                 "length": "4:16",
             }

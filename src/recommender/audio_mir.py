@@ -9,7 +9,7 @@ Layer B (Harmony & Tonality):
   4: b1_major_minor_score     - 12-bin chroma correlation diff vs Krumhansl-Schmuckler major/minor profiles
   5: b2_harmonic_entropy      - Normalized Shannon entropy of mean 12-bin chroma distribution
   6: b3_chord_change_rate     - Mean cosine distance between consecutive smoothed chroma frames
-  7: b4_harmonic_percussive_ratio - Lightweight HPSS harmonic vs percussive spectral energy ratio
+  7: b4_harmonic_percussive_ratio - Fast decimated float32 HPSS harmonic vs percussive energy ratio
 Layer C (Timbre, Loudness & Structure):
   8: c1_spectral_centroid     - Normalized spectral centroid (brightness)
   9: c2_spectral_flatness     - Spectral flatness / Wiener entropy (acoustic vs electronic/noise)
@@ -18,7 +18,7 @@ Layer C (Timbre, Loudness & Structure):
 Layer D (Scene, Popularity Sweetspot & Curation):
  12: d1_cooccurrence_score    - Stage 1 collaborative graph multi-seed co-occurrence score
  13: d2_deezer_rank_sweetspot - Log bell-curve on Deezer rank (avoids slop, peaks at semi-classic/gem tier)
- 14: d3_yt_views_sweetspot    - Log bell-curve on YouTube views (peaks 300k-50M, penalizes <100k, decays >500M)
+ 14: d3_yt_views_sweetspot    - Log bell-curve on YouTube views (300k-50M peak; falls back to Deezer rank if None)
  15: d4_cult_chic_similarity  - Cosine similarity of track A1-C4 vs calibrated PES 2011 / Emily in Paris centroid
 """
 
@@ -33,8 +33,9 @@ import wave
 from typing import Any
 
 import numpy as np
+from scipy.fft import rfft
 from scipy.ndimage import median_filter
-from scipy.signal import resample_poly, stft
+from scipy.signal import resample_poly
 
 from src.adapters.deezer import DeezerClient, DeezerTrackMeta
 from src.db import RadioDatabase
@@ -70,18 +71,14 @@ _KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69
 _KS_MAJOR_NORM = (_KS_MAJOR - _KS_MAJOR.mean()) / (np.linalg.norm(_KS_MAJOR - _KS_MAJOR.mean()) + 1e-12)
 _KS_MINOR_NORM = (_KS_MINOR - _KS_MINOR.mean()) / (np.linalg.norm(_KS_MINOR - _KS_MINOR.mean()) + 1e-12)
 
-# Precompute all 12 rotations of KS templates for fast vectorized key correlation
 _KS_MAJOR_ROT = np.vstack([np.roll(_KS_MAJOR_NORM, k) for k in range(12)])
 _KS_MINOR_ROT = np.vstack([np.roll(_KS_MINOR_NORM, k) for k in range(12)])
 
-# Default acoustic prior for PES 2011 / Emily in Paris cult-chic anchor (12-dim A1..C4)
-# Replaced automatically once calibrated from real tracks in SQLite station_profiles["__cult_chic_anchor__"]
 DEFAULT_CULT_CHIC_A1_C4 = np.array(
     [0.50, 0.68, 0.54, 0.36, 0.56, 0.68, 0.52, 0.66, 0.42, 0.24, 0.64, 0.58],
     dtype=np.float64,
 )
 
-# Precomputed chroma projection matrix cache keyed by (n_fft, sr)
 _CHROMA_MATRIX_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 
@@ -90,26 +87,25 @@ def _clip01(value: float) -> float:
 
 
 def _get_chroma_matrix(n_fft: int = 2048, sr: int = TARGET_SR) -> np.ndarray:
-    """Build a (12, n_fft//2 + 1) frequency-to-pitch-class projection matrix."""
+    """Build a (12, n_fft//2 + 1) float32 frequency-to-pitch-class projection matrix."""
     key = (n_fft, sr)
     cached = _CHROMA_MATRIX_CACHE.get(key)
     if cached is not None:
         return cached
 
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
-    mat = np.zeros((12, len(freqs)), dtype=np.float64)
+    mat = np.zeros((12, len(freqs)), dtype=np.float32)
     for idx, f in enumerate(freqs):
         if f < 65.0 or f > 4200.0:
             continue
         midi = 69.0 + 12.0 * math.log2(f / 440.0)
         pc_float = midi % 12.0
-        # Soft Gaussian weight across nearest pitch classes for smooth tuning tolerance
         for pc in range(12):
             dist = min(abs(pc_float - pc), 12.0 - abs(pc_float - pc))
             if dist <= 1.0:
                 mat[pc, idx] += math.exp(-0.5 * (dist / 0.35) ** 2)
     row_sums = mat.sum(axis=1, keepdims=True)
-    mat = np.divide(mat, np.maximum(1e-9, row_sums))
+    mat = np.divide(mat, np.maximum(np.float32(1e-9), row_sums))
     _CHROMA_MATRIX_CACHE[key] = mat
     return mat
 
@@ -139,32 +135,37 @@ def compute_deezer_rank_sweetspot(rank: int | None) -> float:
     if rank is None or rank <= 0:
         return 0.40
     log_r = math.log10(float(rank) + 1.0)
-    # Peak around log10(350_000) ~= 5.54
     if log_r < 4.0:
-        # Steep drop for ultra-low / unverified slop
         return _clip01(0.15 + 0.35 * math.exp(-((4.0 - log_r) / 0.8) ** 2))
     if log_r <= 5.85:
         return _clip01(math.exp(-((log_r - 5.50) / 1.15) ** 2))
-    # Gentle decay for mega-mainstream >700k rank
     return _clip01(0.85 + 0.15 * math.exp(-((log_r - 5.85) / 0.6) ** 2))
 
 
-def compute_yt_views_sweetspot(view_count: int | None) -> float:
-    """Log bell-curve on YouTube views: peak 1.0 across 300k-50M, strong penalty <100k, gentle decay >500M."""
+def compute_yt_views_sweetspot(
+    view_count: int | None,
+    *,
+    deezer_rank: int | None = None,
+) -> float:
+    """Log bell-curve on YouTube views: peak 1.0 across 300k-50M, strong penalty <100k, gentle decay >500M.
+
+    When view_count is None (typical for official Watch Playlist ATV songs), supplements with Deezer rank
+    sweetspot if available, or neutral 0.60 to avoid unfairly penalizing official ATV tracks.
+    """
     if view_count is None or view_count < 0:
-        return 0.45
+        if deezer_rank is not None and deezer_rank > 0:
+            return compute_deezer_rank_sweetspot(deezer_rank)
+        return 0.60
     log_v = math.log10(float(view_count) + 1.0)
     low_peak = math.log10(300_000.0)      # ~5.477
     high_peak = math.log10(50_000_000.0)  # ~7.699
     if low_peak <= log_v <= high_peak:
         return 1.0
     if log_v < low_peak:
-        # Steep penalty below 100k (log10=5.0) to suppress amateur/AI slop
         if log_v < 5.0:
             return _clip01(0.35 * math.exp(-((5.0 - log_v) / 0.9) ** 2))
         frac = (log_v - 5.0) / (low_peak - 5.0)
         return _clip01(0.35 + 0.65 * frac)
-    # Gentle decay above 50M (at 500M log10=8.70 -> ~0.78, at 2B -> ~0.55)
     return _clip01(math.exp(-((log_v - high_peak) / 2.0) ** 2))
 
 
@@ -220,10 +221,11 @@ def decode_audio_to_mono_pcm(
     audio_url: str | None = None,
     target_sr: int = TARGET_SR,
     ffmpeg_bin: str | None = None,
+    timeout_sec: float = 12.0,
 ) -> np.ndarray | None:
-    """Decode WAV natively or MP3/URL via in-memory ffmpeg pipe (zero temp files).
+    """Decode WAV natively or MP3/URL via in-memory ffmpeg Popen pipe (zero temp files).
 
-    Gracefully returns None when ffmpeg is unavailable or decoding fails.
+    Uses explicit Popen + communicate + kill/wait on timeout and -rw_timeout 8000000 for URLs.
     """
     if audio_bytes is not None and len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF":
         pcm = decode_wav_bytes_to_mono_pcm(audio_bytes, target_sr=target_sr)
@@ -234,6 +236,7 @@ def decode_audio_to_mono_pcm(
     if not ffmpeg_path:
         return None
 
+    is_url = audio_bytes is None and bool(audio_url)
     source_arg = "pipe:0" if audio_bytes is not None else audio_url
     if not source_arg:
         return None
@@ -244,37 +247,57 @@ def decode_audio_to_mono_pcm(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        source_arg,
-        "-t",
-        "30",
-        "-ac",
-        "1",
-        "-ar",
-        str(int(target_sr)),
-        "-f",
-        "f32le",
-        "-acodec",
-        "pcm_f32le",
-        "pipe:1",
     ]
+    if is_url:
+        cmd.extend(["-rw_timeout", "8000000"])
+    cmd.extend(
+        [
+            "-i",
+            source_arg,
+            "-t",
+            "30",
+            "-ac",
+            "1",
+            "-ar",
+            str(int(target_sr)),
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "pipe:1",
+        ]
+    )
+
+    proc: subprocess.Popen[bytes] | None = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=audio_bytes if audio_bytes is not None else None,
-            capture_output=True,
-            timeout=12,
-            check=False,
+            stdin=subprocess.PIPE if audio_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        stdout, _stderr = proc.communicate(
+            input=audio_bytes if audio_bytes is not None else None,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+        logger.warning("ffmpeg pipe timed out after %.1fs and was terminated cleanly", timeout_sec)
+        return None
     except (OSError, subprocess.SubprocessError) as exc:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
         logger.warning("ffmpeg pipe decode failed cleanly: %s", exc)
         return None
 
-    if proc.returncode != 0 or len(proc.stdout) < 2048:
+    if proc.returncode != 0 or not stdout or len(stdout) < 2048:
         return None
 
-    usable = (len(proc.stdout) // 4) * 4
-    pcm = np.frombuffer(proc.stdout[:usable], dtype=np.float32)
+    usable = (len(stdout) // 4) * 4
+    pcm = np.frombuffer(stdout[:usable], dtype=np.float32)
     return pcm.copy()
 
 
@@ -284,39 +307,47 @@ def analyze_pcm_a1_c4(
     sr: int = TARGET_SR,
     deezer_bpm: float | None = None,
     deezer_gain: float | None = None,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float | None]:
     """Compute real 12-dimensional acoustic MIR features (A1..C4) from mono float32 PCM.
 
-    Returns (vec12, estimated_bpm). Designed to execute in <0.1s per 30s clip on ARM64.
+    Optimized with float32 STFT and decimated HPSS median filtering (<80ms per 30s clip).
+    Returns (vec12, measured_bpm).
     """
-    y = np.asarray(samples, dtype=np.float64).ravel()
+    y = np.asarray(samples, dtype=np.float32).ravel()
     if len(y) < 1024:
-        return np.full(12, 0.5, dtype=np.float64), float(deezer_bpm or 118.0)
+        fallback_bpm = round(float(deezer_bpm), 1) if (deezer_bpm is not None and deezer_bpm > 0.0) else None
+        return np.full(12, 0.5, dtype=np.float64), fallback_bpm
 
-    # Trim silence/normalize amplitude
     peak = float(np.max(np.abs(y)))
     if peak > 1e-8:
-        y = y / peak
+        y = y / np.float32(peak)
 
     nperseg = 2048
-    noverlap = 1536  # hop = 512 (~23.2ms @ 22050Hz, ~43.07 frames/sec)
-    hop = nperseg - noverlap
-    freqs, _times, Zxx = stft(y, fs=sr, nperseg=nperseg, noverlap=noverlap, boundary=None)
-    mag = np.abs(Zxx)
+    hop = 512  # ~23.2ms @ 22050Hz, ~43.07 frames/sec
+    if len(y) < nperseg:
+        fallback_bpm = round(float(deezer_bpm), 1) if (deezer_bpm is not None and deezer_bpm > 0.0) else None
+        return np.full(12, 0.5, dtype=np.float64), fallback_bpm
+
+    win = np.hanning(nperseg).astype(np.float32)
+    win = win / np.float32(win.sum())
+    frames = np.lib.stride_tricks.sliding_window_view(y, nperseg)[::hop]
+    Zxx = rfft(frames * win, axis=1).T
+    freqs = np.fft.rfftfreq(nperseg, d=1.0 / sr)
+    mag = np.abs(Zxx).astype(np.float32, copy=False)
     power = mag * mag
     frame_rate = float(sr) / float(hop)
 
     if mag.shape[1] < 8:
-        return np.full(12, 0.5, dtype=np.float64), float(deezer_bpm or 118.0)
+        fallback_bpm = round(float(deezer_bpm), 1) if (deezer_bpm is not None and deezer_bpm > 0.0) else None
+        return np.full(12, 0.5, dtype=np.float64), fallback_bpm
 
     # ---------------- Layer A: Rhythm & Groove ----------------
-    # Positive spectral flux onset envelope
-    log_mag = np.log1p(10.0 * mag)
-    flux = np.maximum(0.0, np.diff(log_mag, axis=1)).mean(axis=0)
+    log_mag = np.log1p(np.float32(10.0) * mag)
+    flux = np.maximum(np.float32(0.0), np.diff(log_mag, axis=1)).mean(axis=0, dtype=np.float64)
     flux_centered = flux - flux.mean()
     flux_energy = float(np.dot(flux_centered, flux_centered))
 
-    est_bpm = float(deezer_bpm) if (deezer_bpm is not None and deezer_bpm > 0.0) else 0.0
+    est_bpm: float | None = float(deezer_bpm) if (deezer_bpm is not None and deezer_bpm > 0.0) else None
     beat_clarity = 0.25
     syncopation_index = 0.35
 
@@ -331,13 +362,19 @@ def analyze_pcm_a1_c4(
             best_rel = int(np.argmax(search_ac))
             best_lag = min_lag + best_rel
             peak_val = float(search_ac[best_rel])
-            # Clarify periodic beat strength in [0, 1]
+            # Prefer fundamental beat lag over 2x subharmonic (handles fractional-frame quantization, e.g. 20.5 frames @ 126 BPM)
+            half_lag = best_lag // 2
+            if half_lag >= min_lag:
+                lo = max(min_lag, half_lag - 1)
+                hi = min(max_lag, half_lag + 1)
+                sub_rel = int(np.argmax(ac[lo : hi + 1]))
+                if float(ac[lo + sub_rel]) >= 0.55 * peak_val:
+                    best_lag = lo + sub_rel
+                    peak_val = float(ac[best_lag])
             beat_clarity = _clip01(peak_val * 1.15)
-            if est_bpm <= 0.0:
+            if est_bpm is None:
                 est_bpm = 60.0 * frame_rate / float(best_lag)
 
-            # Syncopation / tresillo (3-3-2) ratio: compare energy at off-beat/tresillo lags
-            # (3/8, 1/2, 5/8, 3/4 of a 2-beat/1-bar span) against the primary beat lag
             bar_lag = min(len(ac) - 1, best_lag * 2)
             off_positions = [
                 round(best_lag * 0.5),
@@ -349,19 +386,16 @@ def analyze_pcm_a1_c4(
                 off_mean = float(np.mean(valid_offs))
                 syncopation_index = _clip01(off_mean / (abs(peak_val) + 0.25))
 
-    if est_bpm <= 0.0:
-        est_bpm = 118.0
-    a1_bpm = bpm_to_norm(est_bpm)
+    a1_bpm = bpm_to_norm(est_bpm if est_bpm is not None else 118.0)
 
-    # Sub-bass drive (20-120 Hz energy ratio)
-    total_power = float(power.sum()) + 1e-12
+    total_power = float(power.sum(dtype=np.float64)) + 1e-12
     sub_mask = (freqs >= 20.0) & (freqs <= 120.0)
-    sub_ratio = float(power[sub_mask].sum()) / total_power
+    sub_ratio = float(power[sub_mask].sum(dtype=np.float64)) / total_power
     a4_sub_bass = _clip01(math.pow(max(0.0, sub_ratio), 0.45))
 
     # ---------------- Layer B: Harmony & Tonality ----------------
     chroma_mat = _get_chroma_matrix(nperseg, sr)
-    chroma_frames = chroma_mat @ mag  # shape: (12, T)
+    chroma_frames = (chroma_mat @ mag).astype(np.float64, copy=False)  # shape: (12, T)
     chroma_mean = chroma_frames.mean(axis=1)
     c_sum = float(chroma_mean.sum())
     if c_sum > 1e-12:
@@ -375,7 +409,6 @@ def analyze_pcm_a1_c4(
             b1_major_minor = _clip01(0.5 + 0.5 * math.tanh((max_maj - max_min) * 3.0))
         else:
             b1_major_minor = 0.5
-        # Normalized Shannon entropy in [0, 1]
         p_pos = chroma_prob[chroma_prob > 1e-12]
         entropy = float(-np.sum(p_pos * np.log(p_pos))) / math.log(12.0)
         b2_harmonic_entropy = _clip01(entropy)
@@ -383,7 +416,6 @@ def analyze_pcm_a1_c4(
         b1_major_minor = 0.5
         b2_harmonic_entropy = 0.5
 
-    # Chord change rate: cosine distance between consecutive ~0.5s averaged chroma windows
     win_frames = max(2, round(0.5 * frame_rate))
     n_wins = chroma_frames.shape[1] // win_frames
     if n_wins >= 2:
@@ -396,41 +428,40 @@ def analyze_pcm_a1_c4(
     else:
         b3_chord_change = 0.35
 
-    # Lightweight HPSS via 1D median filters along time (harmonic) vs frequency (percussive)
-    h_spec = median_filter(mag, size=(1, 13))
-    p_spec = median_filter(mag, size=(13, 1))
-    h_energy = float(np.sum(h_spec * h_spec))
-    p_energy = float(np.sum(p_spec * p_spec))
+    # Fast decimated float32 HPSS (~15-30x faster than full-resolution float64 median_filter)
+    f_step = 4 if mag.shape[0] >= 256 else 2
+    t_step = 4 if mag.shape[1] >= 128 else 2
+    mag_small = np.ascontiguousarray(mag[::f_step, ::t_step], dtype=np.float32)
+    h_spec = median_filter(mag_small, size=(1, 9))
+    p_spec = median_filter(mag_small, size=(9, 1))
+    h_energy = float(np.sum(h_spec * h_spec, dtype=np.float64))
+    p_energy = float(np.sum(p_spec * p_spec, dtype=np.float64))
     b4_hpr = _clip01(h_energy / (h_energy + p_energy + 1e-12))
 
     # ---------------- Layer C: Timbre, Loudness & Structure ----------------
-    frame_mag_sum = np.sum(mag, axis=0) + 1e-12
-    centroid_hz = float(np.mean((freqs[:, None] * mag).sum(axis=0) / frame_mag_sum))
-    # Musical brightness spans roughly 400Hz-4500Hz
+    freqs32 = freqs.astype(np.float32, copy=False)
+    frame_mag_sum = np.sum(mag, axis=0, dtype=np.float64) + 1e-12
+    centroid_hz = float(np.mean((freqs32[:, None] * mag).sum(axis=0, dtype=np.float64) / frame_mag_sum))
     c1_centroid = _clip01((centroid_hz - 300.0) / 4200.0)
 
-    # Spectral flatness (geometric mean / arithmetic mean of power spectrum)
-    eps = 1e-10
-    geo_mean = np.exp(np.mean(np.log(power + eps), axis=0))
-    arith_mean = np.mean(power + eps, axis=0)
+    eps = np.float32(1e-10)
+    geo_mean = np.exp(np.mean(np.log(power + eps), axis=0, dtype=np.float64))
+    arith_mean = np.mean(power + eps, axis=0, dtype=np.float64)
     flatness = float(np.mean(geo_mean / arith_mean))
     c2_flatness = _clip01(math.pow(max(0.0, flatness), 0.35))
 
-    # Loudness & dynamic punch: Deezer gain (-15..-3 dB) + frame RMS contrast
-    frame_rms = np.sqrt(np.mean(power, axis=0))
+    frame_rms = np.sqrt(np.mean(power, axis=0, dtype=np.float64))
     rms_mean = float(np.mean(frame_rms)) + 1e-9
-    rms_cv = float(np.std(frame_rms)) / rms_mean  # dynamic contrast
+    rms_cv = float(np.std(frame_rms)) / rms_mean
     dyn_score = _clip01(rms_cv / 0.85)
     if deezer_gain is not None:
-        # Deezer gain is replay-gain attenuation (more negative = louder mastered track, e.g. -11dB loud, -4dB quiet)
         loud_score = _clip01((-float(deezer_gain) - 3.0) / 10.0)
         c3_loudness_punch = _clip01(0.55 * loud_score + 0.45 * dyn_score)
     else:
         c3_loudness_punch = _clip01(0.35 + 0.65 * dyn_score)
 
-    # Vocal / melody band presence (300-3400 Hz)
     vocal_mask = (freqs >= 300.0) & (freqs <= 3400.0)
-    vocal_ratio = float(power[vocal_mask].sum()) / total_power
+    vocal_ratio = float(power[vocal_mask].sum(dtype=np.float64)) / total_power
     c4_vocal_presence = _clip01(math.pow(max(0.0, vocal_ratio), 0.55))
 
     vec12 = np.array(
@@ -450,14 +481,17 @@ def analyze_pcm_a1_c4(
         ],
         dtype=np.float64,
     )
-    return vec12, round(float(est_bpm), 1)
+    return vec12, (round(float(est_bpm), 1) if est_bpm is not None else None)
 
 
 def estimate_a1_c4_from_metadata(
     deezer_meta: DeezerTrackMeta | None = None,
     track: TrackEntity | None = None,
-) -> tuple[np.ndarray, float]:
-    """Graceful fallback when ffmpeg/preview PCM is unavailable: uses Deezer BPM/gain/rank + track duration."""
+) -> tuple[np.ndarray, float | None]:
+    """Graceful fallback when ffmpeg/preview PCM is unavailable.
+
+    Returns measured_bpm=None (never fake 118.0) when no real BPM is known.
+    """
     bpm = 0.0
     gain: float | None = None
     dur = 195
@@ -474,9 +508,9 @@ def estimate_a1_c4_from_metadata(
         if track.duration_seconds:
             dur = int(track.duration_seconds)
 
+    measured_bpm: float | None = round(bpm, 1) if bpm > 0.0 else None
     eff_bpm = bpm if bpm > 0.0 else 118.0
     a1 = bpm_to_norm(eff_bpm)
-    # Higher BPM & loud mastering correlate gently with tighter beat clarity & sub-bass drive
     loud_score = _clip01((-gain - 3.0) / 10.0) if gain is not None else 0.55
     dur_focus = _clip01(math.exp(-((float(dur) - 195.0) / 100.0) ** 2))
     a2 = _clip01(0.45 + 0.25 * loud_score + 0.12 * dur_focus)
@@ -493,7 +527,7 @@ def estimate_a1_c4_from_metadata(
     c3 = _clip01(0.25 + 0.70 * loud_score)
     c4 = _clip01(0.52 + 0.10 * dur_focus)
 
-    return np.array([a1, a2, a3, a4, b1, b2, b3, b4, c1, c2, c3, c4], dtype=np.float64), round(eff_bpm, 1)
+    return np.array([a1, a2, a3, a4, b1, b2, b3, b4, c1, c2, c3, c4], dtype=np.float64), measured_bpm
 
 
 def summarize_4_layers(
@@ -557,6 +591,11 @@ class AudioMIRExtractor:
         if len(arr) == 12:
             self._cult_chic_anchor = arr.copy()
 
+    def _has_ffmpeg(self) -> str | None:
+        if self.ffmpeg_bin is not None:
+            return self.ffmpeg_bin or None
+        return shutil.which("ffmpeg")
+
     def extract_a1_c4_for_track(
         self,
         artist: str,
@@ -567,9 +606,10 @@ class AudioMIRExtractor:
         deezer_meta: DeezerTrackMeta | None = None,
         track: TrackEntity | None = None,
         allow_network: bool = True,
-    ) -> tuple[np.ndarray, float, DeezerTrackMeta | None, str]:
-        """Compute or load cached 12-dim A1..C4 acoustic features + measured BPM + source tag."""
+    ) -> tuple[np.ndarray, float | None, DeezerTrackMeta | None, str]:
+        """Compute or load cached 12-dim A1..C4 acoustic features + measured BPM (or None) + source tag."""
         canonical_key = normalize_track_key(artist, title)
+        ffmpeg_avail = self._has_ffmpeg()
 
         # 1. Fast path: explicit audio bytes passed directly (e.g. WAV test or pre-fetched MP3)
         if audio_bytes is not None:
@@ -585,11 +625,17 @@ class AudioMIRExtractor:
             return vec12, est_bpm, deezer_meta, "deezer_metadata" if deezer_meta else "fallback"
 
         # 2. SQLite cache lookup
+        cached_meta: DeezerTrackMeta | None = None
+        came_from_cache = False
         if self.db is not None and deezer_meta is None:
             cached = self.db.get_audio_feature_cache(canonical_key=canonical_key, video_id=video_id)
-            if cached is not None and cached.get("mir_a1_c4") and len(cached["mir_a1_c4"]) == 12:
-                meta = (
-                    DeezerTrackMeta(
+            if cached is not None:
+                src_cached = str(cached.get("analysis_source") or "deezer_metadata")
+                if src_cached == "not_found":
+                    vec12, est_bpm = estimate_a1_c4_from_metadata(None, track)
+                    return vec12, est_bpm, None, "not_found"
+                if cached.get("deezer_id") is not None:
+                    cached_meta = DeezerTrackMeta(
                         deezer_id=int(cached["deezer_id"]),
                         artist=str(cached.get("artist") or artist),
                         title=str(cached.get("title") or title),
@@ -598,48 +644,64 @@ class AudioMIRExtractor:
                         rank=int(cached.get("rank") or 0),
                         duration=int(cached.get("duration") or 0),
                         preview_url=cached.get("preview_url"),
-                        mir_a1_c4=list(cached["mir_a1_c4"]),
-                        analysis_source=str(cached.get("analysis_source") or "deezer_metadata"),
+                        mir_a1_c4=list(cached["mir_a1_c4"]) if cached.get("mir_a1_c4") else None,
+                        analysis_source=src_cached,
                     )
-                    if cached.get("deezer_id") is not None
-                    else None
-                )
-                est_bpm = float(cached.get("bpm") or 118.0)
-                return (
-                    np.asarray(cached["mir_a1_c4"], dtype=np.float64),
-                    est_bpm,
-                    meta,
-                    str(cached.get("analysis_source") or "cache"),
-                )
+                    came_from_cache = True
 
-        # 3. Resolve Deezer metadata if online allowed
-        meta = deezer_meta
+                # Return immediately if we already have real PCM analysis, OR if we cannot upgrade right now
+                if cached.get("mir_a1_c4") and len(cached["mir_a1_c4"]) == 12:
+                    can_upgrade_to_pcm = bool(
+                        src_cached != "mir_pcm" and allow_network and ffmpeg_avail and self.deezer is not None
+                    )
+                    if not can_upgrade_to_pcm:
+                        cached_bpm_raw = float(cached.get("bpm") or 0.0)
+                        cached_bpm: float | None = round(cached_bpm_raw, 1) if cached_bpm_raw > 0.0 else None
+                        return (
+                            np.asarray(cached["mir_a1_c4"], dtype=np.float64),
+                            cached_bpm,
+                            cached_meta,
+                            src_cached,
+                        )
+
+        # 3. Resolve Deezer metadata if online allowed and not yet resolved
+        meta = deezer_meta or cached_meta
         if meta is None and allow_network and self.deezer is not None:
             meta = self.deezer.resolve_track(artist, title, video_id=video_id, use_cache=True)
 
-        # 4. Attempt 30s preview PCM analysis via ffmpeg pipe (no temp files)
+        # 4. Attempt 30s preview PCM analysis via ffmpeg pipe (with 1x expired preview_url refresh retry!)
         source_tag = "deezer_metadata" if meta is not None else "fallback"
         vec12: np.ndarray | None = None
-        est_bpm = float(meta.bpm) if (meta is not None and meta.bpm > 0.0) else 0.0
+        est_bpm: float | None = round(float(meta.bpm), 1) if (meta is not None and meta.bpm > 0.0) else None
 
-        if meta is not None and meta.preview_url and allow_network and self.deezer is not None:
-            ffmpeg_avail = self.ffmpeg_bin if self.ffmpeg_bin is not None else shutil.which("ffmpeg")
-            if ffmpeg_avail:
-                preview_bytes = self.deezer.fetch_preview_bytes(meta.preview_url)
-                if preview_bytes:
-                    pcm = decode_audio_to_mono_pcm(preview_bytes, ffmpeg_bin=ffmpeg_avail)
-                    if pcm is not None:
-                        vec12, est_bpm = analyze_pcm_a1_c4(
-                            pcm,
-                            deezer_bpm=meta.bpm if meta.bpm > 0.0 else None,
-                            deezer_gain=meta.gain,
-                        )
-                        source_tag = "mir_pcm"
+        if meta is not None and allow_network and ffmpeg_avail and self.deezer is not None:
+            preview_bytes = self.deezer.fetch_preview_bytes(meta.preview_url) if meta.preview_url else None
+            # If cached preview_url expired (HTTP 403 -> None), refresh metadata once with use_cache=False
+            if preview_bytes is None and (came_from_cache or not meta.preview_url):
+                refreshed = self.deezer.resolve_track(artist, title, video_id=video_id, use_cache=False)
+                if refreshed is not None:
+                    meta = refreshed
+                    if meta.bpm > 0.0:
+                        est_bpm = round(float(meta.bpm), 1)
+                    if meta.preview_url:
+                        preview_bytes = self.deezer.fetch_preview_bytes(meta.preview_url)
+
+            if preview_bytes:
+                pcm = decode_audio_to_mono_pcm(preview_bytes, ffmpeg_bin=ffmpeg_avail)
+                if pcm is not None:
+                    vec12, est_bpm = analyze_pcm_a1_c4(
+                        pcm,
+                        deezer_bpm=meta.bpm if meta.bpm > 0.0 else None,
+                        deezer_gain=meta.gain,
+                    )
+                    source_tag = "mir_pcm"
 
         if vec12 is None:
             vec12, est_bpm = estimate_a1_c4_from_metadata(meta, track)
 
-        # 5. Persist computed A1..C4 into SQLite cache so the same song is never re-analyzed
+        # 5. Persist cache: only lock mir_a1_c4 in cache when genuinely measured via mir_pcm!
+        #    When ffmpeg is absent or preview failed, cache Deezer metadata with mir_a1_c4=None so
+        #    future runs with ffmpeg can seamlessly upgrade to real PCM MIR.
         if self.db is not None and (meta is not None or source_tag == "mir_pcm"):
             self.db.upsert_audio_feature_cache(
                 canonical_key=canonical_key,
@@ -652,7 +714,7 @@ class AudioMIRExtractor:
                 rank=meta.rank if meta else 0,
                 duration=meta.duration if meta else (track.duration_seconds or 0 if track else 0),
                 preview_url=meta.preview_url if meta else None,
-                mir_a1_c4=[round(float(x), 5) for x in vec12],
+                mir_a1_c4=[round(float(x), 5) for x in vec12] if source_tag == "mir_pcm" else None,
                 analysis_source=source_tag,
             )
 
@@ -665,19 +727,16 @@ class AudioMIRExtractor:
         audio_bytes: bytes | None = None,
         deezer_meta: DeezerTrackMeta | None = None,
         allow_network: bool = False,
-    ) -> tuple[np.ndarray, float, str]:
-        """Return full 16-dimensional MIR + Graph + Sweetspot + Cult-Chic vector and measured BPM."""
-        # Use precomputed 16-dim vector cached on TrackEntity when no override is supplied
+    ) -> tuple[np.ndarray, float | None, str]:
+        """Return full 16-dimensional MIR + Graph + Sweetspot + Cult-Chic vector and measured BPM (or None)."""
         if audio_bytes is None and deezer_meta is None and track.mir_vector and len(track.mir_vector) == MIR_DIM:
             vec = np.asarray(track.mir_vector, dtype=np.float64).copy()
-            # Recompute dynamic Layer D fields in case co-occurrence or cult-chic anchor updated
             vec[12] = compute_cooccurrence_score(track.cooccurrence_count)
             if track.deezer_rank is not None:
                 vec[13] = compute_deezer_rank_sweetspot(track.deezer_rank)
-            if track.view_count is not None:
-                vec[14] = compute_yt_views_sweetspot(track.view_count)
+            vec[14] = compute_yt_views_sweetspot(track.view_count, deezer_rank=track.deezer_rank)
             vec[15] = compute_cosine_similarity(vec[:12], self._cult_chic_anchor)
-            bpm = float(track.deezer_bpm) if track.deezer_bpm else round(60.0 + 120.0 * float(vec[0]), 1)
+            bpm: float | None = round(float(track.deezer_bpm), 1) if (track.deezer_bpm and track.deezer_bpm > 0) else None
             return vec, bpm, "track_cache"
 
         vec12, est_bpm, meta, source_tag = self.extract_a1_c4_for_track(
@@ -690,9 +749,10 @@ class AudioMIRExtractor:
             allow_network=allow_network,
         )
 
+        eff_rank = meta.rank if (meta is not None and meta.rank > 0) else track.deezer_rank
         d1 = compute_cooccurrence_score(track.cooccurrence_count)
-        d2 = compute_deezer_rank_sweetspot(meta.rank if meta else track.deezer_rank)
-        d3 = compute_yt_views_sweetspot(track.view_count)
+        d2 = compute_deezer_rank_sweetspot(eff_rank)
+        d3 = compute_yt_views_sweetspot(track.view_count, deezer_rank=eff_rank)
         d4 = compute_cosine_similarity(vec12, self._cult_chic_anchor)
 
         vec16 = np.concatenate([vec12, np.array([d1, d2, d3, d4], dtype=np.float64)])

@@ -171,8 +171,8 @@ def calibrate_all_stations(
     takeout_records: list[dict[str, Any]] | None = None,
     mir_extractor: AudioMIRExtractor | None = None,
     allow_network: bool = True,
-    max_youtube_per_station: int = 30,
-    max_spotify_per_station: int = 40,
+    max_youtube_per_station: int = 15,
+    max_spotify_per_station: int = 20,
     reference_time: datetime | None = None,
 ) -> dict[str, Any]:
     """Calibrate 16-dim centroids & axis_weights from YouTube (45%) + Spotify (35%) + PES/Emily (20%)."""
@@ -212,6 +212,17 @@ def calibrate_all_stations(
     else:
         extractor = mir_extractor
 
+    effective_allow_network = bool(allow_network)
+
+    def _check_network_circuit() -> bool:
+        nonlocal effective_allow_network
+        if effective_allow_network and extractor.deezer is not None and extractor.deezer.is_circuit_open:
+            logger.warning(
+                "Deezer consecutive network failures reached threshold; switching calibration to offline fallback."
+            )
+            effective_allow_network = False
+        return effective_allow_network
+
     try:
         # 1. Calibrate shared PES 2011 / Emily in Paris 12-dim acoustic centroid (__cult_chic_anchor__)
         all_cult_seeds: list[str] = []
@@ -220,6 +231,7 @@ def calibrate_all_stations(
             all_cult_seeds.extend(st.emily_anchors)
         all_cult_seeds = list(dict.fromkeys(all_cult_seeds))
 
+        logger.info("Calibrating PES/Emily cult-chic anchor (%d seeds, online=%s)", len(all_cult_seeds), effective_allow_network)
         cult_a1_c4_vecs: list[np.ndarray] = []
         for seed in all_cult_seeds:
             artist, title = _parse_seed_pair(seed)
@@ -228,9 +240,9 @@ def calibrate_all_stations(
             vec12, _bpm, _meta, src = extractor.extract_a1_c4_for_track(
                 artist,
                 title,
-                allow_network=allow_network,
+                allow_network=_check_network_circuit(),
             )
-            if src in {"mir_pcm", "deezer_metadata", "cache"} or not allow_network:
+            if src in {"mir_pcm", "deezer_metadata", "cache"} or not effective_allow_network:
                 cult_a1_c4_vecs.append(vec12)
 
         if cult_a1_c4_vecs:
@@ -247,7 +259,7 @@ def calibrate_all_stations(
             sample_counts={"cult_chic_tracks": len(cult_a1_c4_vecs)},
         )
 
-        # 2. Load YouTube watch history records (up to 30 top-weighted tracks per station)
+        # 2. Load YouTube watch history records (up to max_youtube_per_station top-weighted tracks per station)
         records = list(takeout_records) if takeout_records is not None else []
         if not records and takeout_path and Path(takeout_path).exists():
             records = parse_takeout_watch_history(takeout_path)
@@ -278,7 +290,7 @@ def calibrate_all_stations(
                 )
                 vec16, _bpm, _src = extractor.extract_16d_vector(
                     dummy,
-                    allow_network=allow_network,
+                    allow_network=_check_network_circuit(),
                 )
                 group_vecs.append(vec16)
                 group_raw_w.append(max(1e-4, float(item_w)))
@@ -293,12 +305,13 @@ def calibrate_all_stations(
 
         # 3. Calibrate each station independently
         summary_stations: dict[str, Any] = {}
-        for st in stations:
+        for st_idx, st in enumerate(stations, start=1):
+            logger.info("[%d/%d] Calibrating station: %s", st_idx, len(stations), st.station_id)
             source_vecs: list[np.ndarray] = []
             source_weights: list[float] = []
             counts = {"youtube": 0, "spotify": 0, "cult_anchors": 0}
 
-            # Source 1: YouTube history top 30 (45%)
+            # Source 1: YouTube history top tracks (45%)
             yt_items = yt_by_station.get(st.station_id, [])
             if yt_items:
                 _extract_group(yt_items, WEIGHT_YOUTUBE, "youtube", counts, source_vecs, source_weights)

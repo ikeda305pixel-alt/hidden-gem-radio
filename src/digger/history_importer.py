@@ -379,59 +379,72 @@ def _channel_matches_title_artist(channel_name: str, title_artist: str) -> bool:
 
 
 def _iter_json_array_objects(path: Path, chunk_size: int = 131_072) -> Iterator[Any]:
-    """Stream items from a top-level JSON array in fixed chunks without loading the full file."""
+    """Stream items from a top-level JSON array in fixed chunks using index-based raw_decode."""
     decoder = json.JSONDecoder()
     buf = ""
+    pos = 0
     eof = False
     started = False
+
+    def _skip_ws() -> None:
+        nonlocal pos
+        n = len(buf)
+        while pos < n and buf[pos] in " \t\r\n":
+            pos += 1
+
+    def _read_more(fh: Any) -> bool:
+        nonlocal buf, pos, eof
+        if pos > 0:
+            buf = buf[pos:]
+            pos = 0
+        chunk = fh.read(chunk_size)
+        if not chunk:
+            eof = True
+            return False
+        buf += chunk
+        return True
 
     with path.open("r", encoding="utf-8-sig") as fh:
         while True:
             while not started:
-                buf = buf.lstrip()
-                if buf:
-                    if buf[0] != "[":
+                _skip_ws()
+                if pos < len(buf):
+                    if buf[pos] != "[":
                         raise ValueError("Expected top-level JSON array")
-                    buf = buf[1:]
+                    pos += 1
                     started = True
                     break
-                chunk = fh.read(chunk_size)
-                if not chunk:
+                if not _read_more(fh):
                     raise ValueError("Empty JSON file")
-                buf += chunk
 
-            buf = buf.lstrip()
-            while not buf and not eof:
-                chunk = fh.read(chunk_size)
-                if not chunk:
-                    eof = True
-                else:
-                    buf += chunk
-                buf = buf.lstrip()
+            _skip_ws()
+            while pos >= len(buf) and not eof:
+                _read_more(fh)
+                _skip_ws()
 
-            if not buf:
+            if pos >= len(buf):
                 raise ValueError("Unterminated JSON array")
 
-            if buf[0] == "]":
+            ch = buf[pos]
+            if ch == "]":
                 return
-            if buf[0] == ",":
-                buf = buf[1:]
+            if ch == ",":
+                pos += 1
                 continue
 
             while True:
                 try:
-                    obj, end_idx = decoder.raw_decode(buf)
-                    buf = buf[end_idx:]
+                    obj, end_idx = decoder.raw_decode(buf, pos)
+                    pos = end_idx
+                    if pos >= chunk_size:
+                        buf = buf[pos:]
+                        pos = 0
                     yield obj
                     break
                 except json.JSONDecodeError as exc:
                     if eof:
                         raise ValueError(f"Malformed JSON stream: {exc}") from exc
-                    chunk = fh.read(chunk_size)
-                    if not chunk:
-                        eof = True
-                    else:
-                        buf += chunk
+                    _read_more(fh)
 
 
 def parse_takeout_watch_history(

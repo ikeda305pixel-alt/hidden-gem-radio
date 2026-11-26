@@ -43,13 +43,20 @@ def _parse_anchor(anchor: str) -> tuple[str, str]:
 
 
 def _format_discovery_route(sources: list[str], cooccurrence_count: int) -> str:
-    clean = list(dict.fromkeys(s.strip() for s in sources if s and s.strip()))
-    if cooccurrence_count >= 2:
-        short_names = [s.replace(" 関連アーティスト", "").replace(" 関連", "").strip() for s in clean[:3]]
-        joined = " × ".join(short_names)
+    short_names: list[str] = []
+    seen_norm: set[str] = set()
+    for raw in sources:
+        cleaned = raw.replace(" 関連アーティスト", "").replace(" 関連", "").strip()
+        norm = normalize_artist(cleaned) or cleaned.lower()
+        if cleaned and norm not in seen_norm:
+            seen_norm.add(norm)
+            short_names.append(cleaned)
+
+    if cooccurrence_count >= 2 and len(short_names) >= 2:
+        joined = " × ".join(short_names[:3])
         return f"共起{cooccurrence_count}シード: {joined} 関連"
-    if clean:
-        return clean[0]
+    if short_names:
+        return f"{short_names[0]} 関連"
     return "協調グラフ発掘"
 
 
@@ -64,6 +71,7 @@ class CandidatePoolDigger:
         deezer_client: DeezerClient | None = None,
         mir_extractor: AudioMIRExtractor | None = None,
         enable_mir_enrichment: bool = False,
+        max_mir_tracks_per_dig: int = 15,
     ) -> None:
         self.db = db
         self.yt = yt_adapter or YouTubeMusicAdapter()
@@ -72,6 +80,7 @@ class CandidatePoolDigger:
         self.deezer = deezer_client
         self.mir_extractor = mir_extractor
         self.enable_mir_enrichment = enable_mir_enrichment
+        self.max_mir_tracks_per_dig = max(0, int(max_mir_tracks_per_dig))
 
     def _build_station_seed_plan(
         self,
@@ -156,16 +165,17 @@ class CandidatePoolDigger:
             seen_seed_vids.add(res.platform_track_id)
             resolved_seeds.append((res.platform_track_id, seed_label, res.artist_browse_id, q_arch))
 
-        # Aggregate candidates across all seeds to measure multi-seed co-occurrence!
+        # Aggregate candidates across distinct seed artists (prevents same-artist self-co-occurrence)
         graph_candidates: dict[str, TrackEntity] = {}
         seed_hit_sets: dict[str, set[str]] = {}
         source_labels: dict[str, list[str]] = {}
+        seen_artist_browse_ids: set[str] = set()
 
         skipped_popular = 0
         skipped_blocked = 0
         skipped_known = 0
 
-        def _ingest(tracks: list[TrackEntity], seed_key: str, label: str) -> None:
+        def _ingest(tracks: list[TrackEntity], seed_artist_key: str, label: str) -> None:
             nonlocal skipped_popular, skipped_blocked, skipped_known
             for tr in tracks:
                 if not tr.video_id:
@@ -183,13 +193,12 @@ class CandidatePoolDigger:
                 dedup_key = tr.video_id
                 if dedup_key not in graph_candidates:
                     graph_candidates[dedup_key] = tr
-                    seed_hit_sets[dedup_key] = {seed_key}
+                    seed_hit_sets[dedup_key] = {seed_artist_key}
                     source_labels[dedup_key] = [label]
                 else:
-                    seed_hit_sets[dedup_key].add(seed_key)
+                    seed_hit_sets[dedup_key].add(seed_artist_key)
                     if label not in source_labels[dedup_key]:
                         source_labels[dedup_key].append(label)
-                    # Keep richest metadata if one source had view_count/duration
                     existing = graph_candidates[dedup_key]
                     if existing.view_count is None and tr.view_count is not None:
                         existing.view_count = tr.view_count
@@ -197,7 +206,9 @@ class CandidatePoolDigger:
                         existing.duration_seconds = tr.duration_seconds
 
         for seed_vid, seed_label, artist_browse_id, seed_arch in resolved_seeds:
-            seed_key = f"seed:{seed_label.lower()}:{seed_vid}"
+            # Unify co-occurrence key by normalized seed artist so 2 songs by the same artist never self-co-occur
+            artist_key = f"artist:{normalize_artist(seed_label) or seed_label.lower()}"
+
             # 1. Watch Playlist Radio neighborhood (official songs only, slop filtered in adapter)
             related = self.yt.get_related_tracks(
                 seed_vid,
@@ -205,17 +216,18 @@ class CandidatePoolDigger:
                 seed_artist=seed_label,
                 seed_archetype=seed_arch,
             )
-            _ingest(related, seed_key, f"{seed_label} 関連")
+            _ingest(related, artist_key, f"{seed_label} 関連")
 
-            # 2. Related real artists -> deep cuts (songs #3..#15)
-            if artist_browse_id:
+            # 2. Related real artists -> deep cuts (songs #3..#15), deduplicated per artist_browse_id
+            if artist_browse_id and artist_browse_id not in seen_artist_browse_ids:
+                seen_artist_browse_ids.add(artist_browse_id)
                 deep_cuts = self.yt.get_artist_related_deep_cuts(
                     artist_browse_id,
                     seed_label=seed_label,
                     seed_archetype=seed_arch,
                     max_related_artists=3,
                 )
-                _ingest(deep_cuts, f"artist:{seed_label.lower()}", f"{seed_label} 関連アーティスト")
+                _ingest(deep_cuts, artist_key, f"{seed_label} 関連アーティスト")
 
         # Prioritize multi-seed co-occurring gems first, then persist up to target_pool_size
         ranked_graph = sorted(
@@ -226,6 +238,7 @@ class CandidatePoolDigger:
 
         added = 0
         cooccurring_count = 0
+        mir_enriched_count = 0
         for vid_key, track in ranked_graph[:target_pool_size]:
             cooc = max(1, len(seed_hit_sets[vid_key]))
             sources = source_labels[vid_key]
@@ -235,11 +248,26 @@ class CandidatePoolDigger:
             if cooc >= 2:
                 cooccurring_count += 1
 
-            # Optional Stage 2 MIR enrichment during digging when enabled
-            if self.enable_mir_enrichment and self.mir_extractor is not None:
+            # Bounded Stage 2 MIR enrichment (top co-occurring tracks first, capped at max_mir_tracks_per_dig)
+            if (
+                self.enable_mir_enrichment
+                and self.mir_extractor is not None
+                and mir_enriched_count < self.max_mir_tracks_per_dig
+            ):
                 vec16, est_bpm, _src = self.mir_extractor.extract_16d_vector(track, allow_network=True)
                 track.mir_vector = [round(float(x), 5) for x in vec16]
-                track.deezer_bpm = est_bpm
+                track.deezer_bpm = est_bpm  # None if unmeasured; never fake 118.0
+                cached_meta = self.db.get_audio_feature_cache(
+                    canonical_key=track.canonical_key,
+                    video_id=track.video_id,
+                )
+                if cached_meta is not None and cached_meta.get("deezer_id") is not None:
+                    track.deezer_id = int(cached_meta["deezer_id"])
+                    if cached_meta.get("gain") is not None:
+                        track.deezer_gain = float(cached_meta["gain"])
+                    if cached_meta.get("rank") is not None:
+                        track.deezer_rank = int(cached_meta["rank"])
+                mir_enriched_count += 1
 
             self.db.upsert_track(station.station_id, track)
             added += 1
@@ -252,6 +280,7 @@ class CandidatePoolDigger:
             "station_id": station.station_id,
             "added": added,
             "cooccurring_added": cooccurring_count,
+            "mir_enriched": mir_enriched_count,
             "skipped_popular": skipped_popular,
             "skipped_blocked_30d": skipped_blocked,
             "skipped_known_history": skipped_known,

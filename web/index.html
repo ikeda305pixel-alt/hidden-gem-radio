@@ -558,6 +558,7 @@
       currentTrack: null,
       currentRatedGood: false,
       implicitFeedbackSentVideoId: null,
+      skippingInProgress: false,
       player: null,
       playerReady: false,
       consecutiveErrors: 0,
@@ -987,13 +988,18 @@
       }
     }
 
-    async function sendImplicitPlaybackFeedback(isManualSkip) {
-      if (!state.currentTrack || state.currentRatedGood) return;
-      const vid = state.currentTrack.video_id;
-      if (vid && state.implicitFeedbackSentVideoId === vid) return;
+    async function sendImplicitPlaybackFeedback(isManualSkip, targetTrack = null, targetStationId = null) {
+      const track = targetTrack || state.currentTrack;
+      const stationId = targetStationId || state.activeStationId;
+      if (!track || !stationId || state.currentRatedGood) return;
+      const vid = track.video_id;
+      if (!vid) return;
+      // Require confirmed real playback (>0.3s) before emitting any implicit learning signal
+      if (state.trackConfirmedPlayingVideoId !== vid) return;
+      if (state.implicitFeedbackSentVideoId === vid) return;
 
       let listenSeconds = 0;
-      let durationSeconds = Number(state.currentTrack.duration_seconds || 0);
+      let durationSeconds = Number(track.duration_seconds || 0);
       if (state.player && state.playerReady && typeof state.player.getCurrentTime === "function") {
         listenSeconds = Number(state.player.getCurrentTime() || 0);
         const ytDur = Number(state.player.getDuration() || 0);
@@ -1002,28 +1008,57 @@
 
       let eventType = null;
       if (!isManualSkip) {
-        eventType = "COMPLETE";
+        // ENDED: verify genuine completion (>=70% or within 2s of duration, or >=15s when duration unknown)
+        const isGenuineComplete =
+          durationSeconds > 0
+            ? listenSeconds / durationSeconds >= IMPLICIT_COMPLETE_RATIO || listenSeconds >= durationSeconds - 2.0
+            : listenSeconds >= IMPLICIT_EARLY_SKIP_SEC;
+        if (isGenuineComplete) {
+          eventType = "COMPLETE";
+        }
       } else if (durationSeconds > 0 && listenSeconds / durationSeconds >= IMPLICIT_COMPLETE_RATIO) {
         eventType = "COMPLETE";
-      } else if (listenSeconds > 0 && listenSeconds < IMPLICIT_EARLY_SKIP_SEC) {
+      } else if (listenSeconds >= 1.5 && listenSeconds < IMPLICIT_EARLY_SKIP_SEC) {
         eventType = "EARLY_SKIP";
       }
 
       if (!eventType) return;
-      if (vid) state.implicitFeedbackSentVideoId = vid;
+      state.implicitFeedbackSentVideoId = vid;
       try {
-        await sendFeedback(eventType, {
-          listen_seconds: listenSeconds,
-          duration_seconds: durationSeconds || null,
+        await fetchJson("/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            station_id: stationId,
+            track_id: track.track_id,
+            video_id: vid,
+            event_type: eventType,
+            listen_seconds: listenSeconds,
+            duration_seconds: durationSeconds || null,
+          }),
         });
-        refreshTheoryProfile();
+        if (state.activeStationId === stationId) {
+          refreshTheoryProfile();
+        }
       } catch (_) {}
     }
 
     async function handleManualSkip() {
-      clearPlaybackWatchdog();
-      await sendImplicitPlaybackFeedback(true);
-      await playNextFromQueue();
+      if (state.skippingInProgress) return;
+      state.skippingInProgress = true;
+      const stationAtSkip = state.activeStationId;
+      const epochAtSkip = state.prefetchEpoch;
+      const trackAtSkip = state.currentTrack;
+      try {
+        clearPlaybackWatchdog();
+        await sendImplicitPlaybackFeedback(true, trackAtSkip, stationAtSkip);
+        if (state.activeStationId !== stationAtSkip || state.prefetchEpoch !== epochAtSkip) {
+          return;
+        }
+        await playNextFromQueue();
+      } finally {
+        state.skippingInProgress = false;
+      }
     }
 
     async function playNextFromQueue() {

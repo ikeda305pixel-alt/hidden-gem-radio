@@ -17,7 +17,13 @@ logger = logging.getLogger(__name__)
 _VIEW_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*([KMB])?", re.IGNORECASE)
 _MIN_SONG_SECONDS = 60
 _MAX_SONG_SECONDS = 660  # Reject full album mixes / hour-long DJ sets & podcasts
-_ALLOWED_OFFICIAL_VIDEO_TYPES = frozenset({"MUSIC_VIDEO_TYPE_ATV", "MUSIC_VIDEO_TYPE_OMV"})
+_ALLOWED_OFFICIAL_VIDEO_TYPES = frozenset(
+    {
+        "MUSIC_VIDEO_TYPE_ATV",
+        "MUSIC_VIDEO_TYPE_OMV",
+        "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC",
+    }
+)
 _SLOP_TITLE_RE = re.compile(
     r"(?:\b(?:ai\s*generated|suno|udio|type\s*beat|free\s*beat|1\s*hour|slowed|reverb|"
     r"nightcore|sped\s*up|karaoke|cover|full\s*album|loop\s*1h|8d\s*audio)\b)",
@@ -26,13 +32,23 @@ _SLOP_TITLE_RE = re.compile(
 
 
 def is_slop_or_unofficial(item: dict[str, Any]) -> bool:
-    """Reject UGC/non-official video types and AI slop / slowed / nightcore / type beat / cover titles."""
-    video_type = item.get("videoType")
-    if video_type and str(video_type) not in _ALLOWED_OFFICIAL_VIDEO_TYPES:
+    """Reject unavailable, UGC/unverified, and AI slop / slowed / nightcore / type beat / cover items."""
+    if item.get("isAvailable") is False:
         return True
     result_type = item.get("resultType")
     if result_type and str(result_type).lower() not in {"song"}:
         return True
+    video_type = item.get("videoType")
+    if video_type:
+        if str(video_type) not in _ALLOWED_OFFICIAL_VIDEO_TYPES:
+            return True
+    else:
+        # When videoType is absent, require official song metadata (album or verified artist browse ID)
+        has_album = bool(item.get("album"))
+        artists = item.get("artists") or []
+        has_artist_id = any(isinstance(a, dict) and bool(a.get("id")) for a in artists)
+        if not (has_album or has_artist_id):
+            return True
     raw_title = str(item.get("title") or "")
     artist = _extract_artist_name(item, raw_title)
     return bool(_SLOP_TITLE_RE.search(raw_title) or _SLOP_TITLE_RE.search(artist))

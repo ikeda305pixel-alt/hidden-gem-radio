@@ -54,6 +54,17 @@ def make_track_id(
     return f"trk_{digest}"
 
 
+LEGACY_STATION_ID_MAP: dict[str, str] = {
+    "indie_groove_hooks": "indie_groove_cult",
+}
+
+
+def normalize_station_id(station_id: str) -> str:
+    """Map deprecated station IDs (e.g. indie_groove_hooks) to their canonical successor."""
+    clean = str(station_id or "").strip()
+    return LEGACY_STATION_ID_MAP.get(clean, clean)
+
+
 @dataclass(slots=True)
 class StationConfig:
     """Configuration for a single radio station."""
@@ -104,18 +115,24 @@ class StationConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> StationConfig:
+        raw_id = str(data["station_id"]).strip()
+        station_id = normalize_station_id(raw_id)
+        is_legacy = raw_id in LEGACY_STATION_ID_MAP
         raw_target = data.get("target_theory_vector") or {}
         target_vec = (
             {str(k).upper(): float(v) for k, v in raw_target.items()}
             if isinstance(raw_target, dict)
             else {}
         )
+        max_views = int(data.get("max_popularity_views", 500_000_000))
+        if is_legacy and max_views == 500_000:
+            max_views = 500_000_000
         return cls(
-            station_id=str(data["station_id"]).strip(),
+            station_id=station_id,
             name=str(data["name"]).strip(),
             seed_tags=[str(t).strip().lower() for t in data.get("seed_tags", []) if str(t).strip()],
             seed_artists=[str(a).strip() for a in data.get("seed_artists", []) if str(a).strip()],
-            max_popularity_views=int(data.get("max_popularity_views", 500_000_000)),
+            max_popularity_views=max_views,
             exploration_rate=float(data.get("exploration_rate", 1.0)),
             target_theory_vector=target_vec,
             bpm_zones=[str(z).strip() for z in data.get("bpm_zones", []) if str(z).strip()],

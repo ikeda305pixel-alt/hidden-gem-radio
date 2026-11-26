@@ -159,6 +159,8 @@ class RadioRuntime:
                         yt_adapter=self._yt_adapter,
                         deezer_client=self._deezer_client,
                         mir_extractor=self.mir_extractor,
+                        enable_mir_enrichment=True,
+                        max_mir_tracks_per_dig=15,
                     )
         return self._digger
 

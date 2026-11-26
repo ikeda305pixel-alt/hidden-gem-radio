@@ -1,4 +1,4 @@
-"""Deezer Public API adapter (no auth required) with rate limiting and SQLite caching."""
+"""Deezer Public API adapter (no auth required) with rate limiting, backoff, negative cache, and 4MB stream cap."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from src.models import normalize_artist, normalize_text, normalize_track_key
 logger = logging.getLogger(__name__)
 
 DEEZER_API_BASE = "https://api.deezer.com"
+NEGATIVE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_PREVIEW_BYTES = 4 * 1024 * 1024  # 4 MB safety cap for 30s MP3 preview stream
 
 
 @dataclass(slots=True)
@@ -90,6 +92,7 @@ class DeezerClient:
         min_interval_sec: float = 0.25,
         timeout: float = 8.0,
         http_client: httpx.Client | None = None,
+        max_consecutive_errors: int = 5,
     ) -> None:
         self.db = db
         self.min_interval_sec = max(0.0, float(min_interval_sec))
@@ -97,11 +100,22 @@ class DeezerClient:
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(
             timeout=self.timeout,
-            headers={"User-Agent": "HiddenGemRadio/0.3 (MIR Audio Analyzer)"},
+            headers={"User-Agent": "HiddenGemRadio/0.4 (MIR Audio Analyzer)"},
             follow_redirects=True,
         )
         self._rate_lock = threading.Lock()
         self._last_request_ts = 0.0
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = max(1, int(max_consecutive_errors))
+        self.last_request_failed = False
+
+    @property
+    def is_circuit_open(self) -> bool:
+        return self._consecutive_errors >= self._max_consecutive_errors
+
+    def reset_circuit(self) -> None:
+        self._consecutive_errors = 0
+        self.last_request_failed = False
 
     def close(self) -> None:
         if self._owns_client:
@@ -118,21 +132,64 @@ class DeezerClient:
             self._last_request_ts = time.monotonic()
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        self._throttle()
-        url = f"{DEEZER_API_BASE}{path}"
-        try:
-            resp = self._client.get(url, params=params)
-            if resp.status_code != 200:
-                logger.warning("Deezer API %s returned HTTP %s", path, resp.status_code)
-                return None
-            payload = resp.json()
-            if isinstance(payload, dict) and payload.get("error"):
-                logger.warning("Deezer API error on %s: %s", path, payload.get("error"))
-                return None
-            return payload if isinstance(payload, dict) else None
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("Deezer API request failed (%s): %s", path, exc)
+        if self.is_circuit_open:
+            self.last_request_failed = True
             return None
+
+        self.last_request_failed = False
+        url = f"{DEEZER_API_BASE}{path}"
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            self._throttle()
+            try:
+                resp = self._client.get(url, params=params)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    logger.warning("Deezer API %s returned HTTP %s (attempt %d)", path, resp.status_code, attempt + 1)
+                    if attempt + 1 < max_attempts:
+                        backoff = (0.5 * (2**attempt)) if self.min_interval_sec > 0 else 0.0
+                        if backoff > 0:
+                            time.sleep(backoff)
+                        continue
+                    self._consecutive_errors += 1
+                    self.last_request_failed = True
+                    return None
+                if resp.status_code != 200:
+                    logger.warning("Deezer API %s returned HTTP %s", path, resp.status_code)
+                    self.last_request_failed = True
+                    return None
+
+                payload = resp.json()
+                if isinstance(payload, dict) and payload.get("error"):
+                    err = payload["error"]
+                    err_code = err.get("code") if isinstance(err, dict) else None
+                    # Deezer quota limit error.code == 4 -> exponential backoff
+                    if err_code == 4 and attempt + 1 < max_attempts:
+                        logger.warning("Deezer API quota limit (code 4) on %s (attempt %d)", path, attempt + 1)
+                        backoff = (0.75 * (2**attempt)) if self.min_interval_sec > 0 else 0.0
+                        if backoff > 0:
+                            time.sleep(backoff)
+                        continue
+                    logger.warning("Deezer API error on %s: %s", path, err)
+                    if err_code == 4:
+                        self._consecutive_errors += 1
+                    self.last_request_failed = True
+                    return None
+
+                self._consecutive_errors = 0
+                return payload if isinstance(payload, dict) else None
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("Deezer API request failed (%s, attempt %d): %s", path, attempt + 1, exc)
+                if attempt + 1 < max_attempts:
+                    backoff = (0.4 * (2**attempt)) if self.min_interval_sec > 0 else 0.0
+                    if backoff > 0:
+                        time.sleep(backoff)
+                    continue
+                self._consecutive_errors += 1
+                self.last_request_failed = True
+                return None
+
+        return None
 
     def resolve_track(
         self,
@@ -143,34 +200,44 @@ class DeezerClient:
         use_cache: bool = True,
         fetch_detail_if_missing_bpm: bool = True,
     ) -> DeezerTrackMeta | None:
-        """Resolve (artist, title) via SQLite cache first, then Deezer /search (+ /track/{id} for BPM/gain)."""
+        """Resolve (artist, title) via SQLite cache (incl. 7-day negative cache), then Deezer /search."""
         canonical_key = normalize_track_key(artist, title)
         if use_cache and self.db is not None:
             cached = self.db.get_audio_feature_cache(canonical_key=canonical_key, video_id=video_id)
-            if cached is not None and cached.get("deezer_id") is not None:
-                return DeezerTrackMeta(
-                    deezer_id=int(cached["deezer_id"]),
-                    artist=str(cached.get("artist") or artist),
-                    title=str(cached.get("title") or title),
-                    bpm=float(cached.get("bpm") or 0.0),
-                    gain=float(cached.get("gain") if cached.get("gain") is not None else -8.0),
-                    rank=int(cached.get("rank") or 0),
-                    duration=int(cached.get("duration") or 0),
-                    preview_url=cached.get("preview_url"),
-                    mir_a1_c4=cached.get("mir_a1_c4"),
-                    analysis_source=str(cached.get("analysis_source") or "deezer_metadata"),
-                )
+            if cached is not None:
+                if cached.get("analysis_source") == "not_found":
+                    age = time.time() - float(cached.get("updated_at") or 0.0)
+                    if age < NEGATIVE_CACHE_TTL_SECONDS:
+                        return None
+                elif cached.get("deezer_id") is not None:
+                    return DeezerTrackMeta(
+                        deezer_id=int(cached["deezer_id"]),
+                        artist=str(cached.get("artist") or artist),
+                        title=str(cached.get("title") or title),
+                        bpm=float(cached.get("bpm") or 0.0),
+                        gain=float(cached.get("gain") if cached.get("gain") is not None else -8.0),
+                        rank=int(cached.get("rank") or 0),
+                        duration=int(cached.get("duration") or 0),
+                        preview_url=cached.get("preview_url"),
+                        mir_a1_c4=cached.get("mir_a1_c4"),
+                        analysis_source=str(cached.get("analysis_source") or "deezer_metadata"),
+                    )
+
+        if self.is_circuit_open:
+            return None
 
         query = f'artist:"{artist}" track:"{title}"' if artist and title else f"{artist} {title}".strip()
         data = self._get_json("/search", params={"q": query, "limit": 8})
+        if self.last_request_failed:
+            # Abort immediately on network/429 error instead of wasting a second /search call
+            return None
+
         items = (data or {}).get("data") or []
         if not items and artist and title:
-            # Fallback to looser unquoted search when strict field quotes yield 0 matches
             data = self._get_json("/search", params={"q": f"{artist} {title}", "limit": 8})
+            if self.last_request_failed:
+                return None
             items = (data or {}).get("data") or []
-
-        if not items:
-            return None
 
         best_item: dict[str, Any] | None = None
         best_score = -1.0
@@ -187,6 +254,22 @@ class DeezerClient:
                 best_item = item
 
         if best_item is None or best_score < 2.0:
+            # Persist 7-day negative cache so unindexed tracks are not searched repeatedly
+            if self.db is not None and not self.last_request_failed:
+                self.db.upsert_audio_feature_cache(
+                    canonical_key=canonical_key,
+                    video_id=video_id,
+                    deezer_id=None,
+                    artist=artist,
+                    title=title,
+                    bpm=None,
+                    gain=None,
+                    rank=None,
+                    duration=None,
+                    preview_url=None,
+                    mir_a1_c4=None,
+                    analysis_source="not_found",
+                )
             return None
 
         deezer_id = int(best_item["id"])
@@ -242,15 +325,22 @@ class DeezerClient:
         return meta
 
     def fetch_preview_bytes(self, preview_url: str | None) -> bytes | None:
-        """Download 30-second MP3 preview bytes directly into memory (no temp files)."""
-        if not preview_url:
+        """Stream 30-second MP3 preview bytes into memory with a strict 4MB cap (no temp files)."""
+        if not preview_url or self.is_circuit_open:
             return None
         self._throttle()
         try:
-            resp = self._client.get(preview_url)
-            if resp.status_code != 200 or not resp.content:
-                return None
-            return bytes(resp.content)
+            with self._client.stream("GET", preview_url) as resp:
+                if resp.status_code != 200:
+                    logger.warning("Deezer preview returned HTTP %s for %s", resp.status_code, preview_url)
+                    return None
+                buf = bytearray()
+                for chunk in resp.iter_bytes(chunk_size=32_768):
+                    buf.extend(chunk)
+                    if len(buf) > MAX_PREVIEW_BYTES:
+                        logger.warning("Deezer preview exceeded %d bytes; aborting stream", MAX_PREVIEW_BYTES)
+                        return None
+                return bytes(buf) if buf else None
         except httpx.HTTPError as exc:
             logger.warning("Failed to download Deezer preview %s: %s", preview_url, exc)
             return None

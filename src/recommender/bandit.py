@@ -30,7 +30,13 @@ import numpy as np
 from mabwiser.mab import MAB, LearningPolicy
 
 from src.db import RadioDatabase
-from src.models import RankedCandidate, StationConfig, TrackEntity, normalize_artist
+from src.models import (
+    LEGACY_STATION_ID_MAP,
+    RankedCandidate,
+    StationConfig,
+    TrackEntity,
+    normalize_artist,
+)
 from src.recommender.audio_mir import (
     MIR_DIM,
     AudioMIRExtractor,
@@ -122,6 +128,7 @@ class ContextualBanditRecommender:
         self._w_slow = default_centroid.copy()
         self._w_session = default_centroid.copy()
         self._calibrated_from_db = False
+        self._profile_updated_at = 0.0
         self._sample_counts: dict[str, int] = {}
         self._load_calibrated_profile_locked()
 
@@ -141,7 +148,7 @@ class ContextualBanditRecommender:
         self._theory_n_updates = 0
         self._load_if_exists()
 
-    def _load_calibrated_profile_locked(self) -> None:
+    def _load_calibrated_profile_locked(self, *, preserve_slow_if_loaded: bool = False) -> None:
         if self.db is None:
             return
         prof = self.db.get_station_profile(self.station_id)
@@ -150,17 +157,32 @@ class ContextualBanditRecommender:
         centroid = prof.get("centroid") or []
         axis_w = prof.get("axis_weights") or []
         slow_w = prof.get("slow_weights") or []
+        updated_at = float(prof.get("updated_at") or 0.0)
         if len(centroid) == MIR_DIM and len(axis_w) == MIR_DIM:
             self._w_anchor = np.asarray(centroid, dtype=np.float64)
             self._axis_weights = np.asarray(axis_w, dtype=np.float64)
-            self._w_slow = (
-                np.asarray(slow_w, dtype=np.float64)
-                if len(slow_w) == MIR_DIM
-                else self._w_anchor.copy()
-            )
-            self._w_session = self._w_anchor.copy()
+            if not preserve_slow_if_loaded:
+                self._w_slow = (
+                    np.asarray(slow_w, dtype=np.float64)
+                    if len(slow_w) == MIR_DIM
+                    else self._w_anchor.copy()
+                )
+                self._w_session = self._w_anchor.copy()
             self._calibrated_from_db = True
+            self._profile_updated_at = updated_at
             self._sample_counts = dict(prof.get("sample_counts") or {})
+
+    def _sync_external_profile_locked(self) -> None:
+        """Detect external CLI calibrate_profile updates via updated_at and reload anchor/axis_weights."""
+        if self.db is None:
+            return
+        prof = self.db.get_station_profile(self.station_id)
+        if not prof:
+            return
+        updated_at = float(prof.get("updated_at") or 0.0)
+        if updated_at > self._profile_updated_at + 1e-6:
+            # Reload calibrated anchor & consistency weights while preserving online-learned slow_weights
+            self._load_calibrated_profile_locked(preserve_slow_if_loaded=self._calibrated_from_db)
 
     def reload_calibrated_profile(self) -> None:
         """Reload calibrated anchor & consistency axis weights from SQLite without losing slow state."""
@@ -377,7 +399,7 @@ class ContextualBanditRecommender:
         track: TrackEntity,
         *,
         allow_network: bool = False,
-    ) -> tuple[np.ndarray, float]:
+    ) -> tuple[np.ndarray, float | None]:
         """Extract 16-dimensional real MIR + co-occurrence + sweetspot + cult-chic vector."""
         vec16, est_bpm, _src = self.mir_extractor.extract_16d_vector(track, allow_network=allow_network)
         return vec16, est_bpm
@@ -401,12 +423,17 @@ class ContextualBanditRecommender:
         mir_vec, _bpm = self.featurize_mir(track, allow_network=False)
 
         with self._lock:
+            # Reload externally calibrated centroid/axis_weights if CLI calibrate_profile updated SQLite
+            self._sync_external_profile_locked()
+
             prev_n_updates = self._n_updates
             prev_theory_n_updates = self._theory_n_updates
             prev_mab_snapshot = pickle.dumps(self._mab)
             prev_theory_snapshot = pickle.dumps(self._theory_mab)
             prev_slow = self._w_slow.copy()
             prev_session = self._w_session.copy()
+            prev_disk_bytes = self.model_path.read_bytes() if self.model_path.exists() else None
+            saved_to_disk = False
             try:
                 if self._n_updates == 0:
                     self._mab.fit(decisions=["play"], rewards=[reward], contexts=context)
@@ -437,15 +464,16 @@ class ContextualBanditRecommender:
                 self._n_updates += 1
                 self._theory_n_updates += 1
                 self._save_locked()
+                saved_to_disk = True
 
-                # Persist updated slow_weights to SQLite station_profiles for this station ONLY
-                if self.db is not None and self._calibrated_from_db:
-                    self.db.upsert_station_profile(
+                # Always persist slow_weights to SQLite (even before calibration) using a partial update
+                # so externally calibrated centroid & axis_weights are NEVER overwritten!
+                if self.db is not None:
+                    self.db.update_station_slow_weights(
                         station_id=self.station_id,
-                        centroid=[round(float(x), 5) for x in self._w_anchor],
-                        axis_weights=[round(float(x), 5) for x in self._axis_weights],
                         slow_weights=[round(float(x), 5) for x in self._w_slow],
-                        sample_counts=self._sample_counts,
+                        default_centroid=[round(float(x), 5) for x in self._w_anchor],
+                        default_axis_weights=[round(float(x), 5) for x in self._axis_weights],
                     )
             except Exception:
                 self._n_updates = prev_n_updates
@@ -454,6 +482,14 @@ class ContextualBanditRecommender:
                 self._theory_mab = pickle.loads(prev_theory_snapshot)
                 self._w_slow = prev_slow
                 self._w_session = prev_session
+                if saved_to_disk:
+                    try:
+                        if prev_disk_bytes is not None:
+                            self.model_path.write_bytes(prev_disk_bytes)
+                        elif self.model_path.exists():
+                            self.model_path.unlink()
+                    except OSError:
+                        pass
                 raise
         return reward
 
@@ -597,6 +633,7 @@ class ContextualBanditRecommender:
         target_vec5 = np.array([target_prior[ax] for ax in THEORY_AXIS_KEYS], dtype=np.float64)
 
         with self._lock:
+            self._sync_external_profile_locked()
             n_updates = self._n_updates
             theory_updates = self._theory_n_updates
             w_eff = (
@@ -787,7 +824,19 @@ class ContextualBanditRecommender:
 
     def _load_if_exists(self) -> None:
         if not self.model_path.exists():
-            return
+            # Auto-migrate legacy pickle filename (e.g. bandit_indie_groove_hooks.pkl -> bandit_indie_groove_cult.pkl)
+            for old_id, new_id in LEGACY_STATION_ID_MAP.items():
+                if new_id == self.station_id:
+                    legacy_path = self.model_path.parent / f"bandit_{old_id}.pkl"
+                    if legacy_path.exists():
+                        try:
+                            shutil.copy2(legacy_path, self.model_path)
+                            logger.info("Migrated legacy bandit pickle %s -> %s", legacy_path, self.model_path)
+                            break
+                        except OSError as exc:
+                            logger.warning("Failed to migrate legacy pickle %s: %s", legacy_path, exc)
+            if not self.model_path.exists():
+                return
         with self._lock:
             try:
                 with self.model_path.open("rb") as fh:

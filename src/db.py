@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from src.models import TrackEntity, normalize_artist
+from src.models import LEGACY_STATION_ID_MAP, TrackEntity, normalize_artist
 
 THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60
 VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
@@ -230,6 +230,36 @@ class RadioDatabase:
                     """,
                     (pl_id, pl_name, now),
                 )
+
+            # Safe idempotent migration for deprecated station IDs (e.g. indie_groove_hooks -> indie_groove_cult)
+            for old_id, new_id in LEGACY_STATION_ID_MAP.items():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO station_candidates (station_id, track_id, added_at)
+                    SELECT ?, track_id, added_at FROM station_candidates WHERE station_id = ?
+                    """,
+                    (new_id, old_id),
+                )
+                conn.execute("DELETE FROM station_candidates WHERE station_id = ?", (old_id,))
+                conn.execute(
+                    "UPDATE feedback_events SET station_id = ? WHERE station_id = ?",
+                    (new_id, old_id),
+                )
+                conn.execute(
+                    "UPDATE playlist_tracks SET station_id = ? WHERE station_id = ?",
+                    (new_id, old_id),
+                )
+                has_new_prof = conn.execute(
+                    "SELECT 1 FROM station_profiles WHERE station_id = ? LIMIT 1",
+                    (new_id,),
+                ).fetchone()
+                if has_new_prof is None:
+                    conn.execute(
+                        "UPDATE station_profiles SET station_id = ? WHERE station_id = ?",
+                        (new_id, old_id),
+                    )
+                else:
+                    conn.execute("DELETE FROM station_profiles WHERE station_id = ?", (old_id,))
 
     def upsert_track(self, station_id: str, track: TrackEntity) -> str:
         """Insert or merge a platform-agnostic track and associate it with station_id."""
@@ -894,16 +924,50 @@ class RadioDatabase:
                 ),
             )
 
+    def update_station_slow_weights(
+        self,
+        *,
+        station_id: str,
+        slow_weights: list[float],
+        default_centroid: list[float],
+        default_axis_weights: list[float],
+    ) -> None:
+        """Persist only slow_weights for station_id without overwriting externally calibrated centroid/axis_weights."""
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO station_profiles (
+                    station_id, centroid_json, axis_weights_json, slow_weights_json,
+                    sample_counts_json, updated_at
+                ) VALUES (?, ?, ?, ?, '{}', ?)
+                ON CONFLICT(station_id) DO UPDATE SET
+                    slow_weights_json = excluded.slow_weights_json
+                """,
+                (
+                    station_id,
+                    json.dumps([float(x) for x in default_centroid]),
+                    json.dumps([float(x) for x in default_axis_weights]),
+                    json.dumps([float(x) for x in slow_weights]),
+                    now,
+                ),
+            )
+
     def reset_unrated_tracks(self) -> dict[str, int]:
         """Purge unrated legacy candidate tracks while preserving playlists, Good/BAD feedback, and rated tracks."""
         with self._connect() as conn:
             before_tracks = int(conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0])
-            # Delete station_candidates & tracks that have NO feedback_events and are NOT in playlist_tracks
+            # Protect tracks referenced by feedback_events OR playlist_tracks (by track_id OR video_id)
             cur_links = conn.execute(
                 """
                 DELETE FROM station_candidates
                 WHERE track_id NOT IN (SELECT DISTINCT track_id FROM feedback_events WHERE track_id IS NOT NULL)
                   AND track_id NOT IN (SELECT DISTINCT track_id FROM playlist_tracks WHERE track_id IS NOT NULL)
+                  AND track_id NOT IN (
+                      SELECT t.track_id FROM tracks t
+                      WHERE t.video_id IS NOT NULL
+                        AND t.video_id IN (SELECT DISTINCT video_id FROM playlist_tracks WHERE video_id IS NOT NULL)
+                  )
                 """
             )
             cur_tracks = conn.execute(
