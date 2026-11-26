@@ -1,11 +1,15 @@
 """Auto-generate config/stations.yaml from YouTube / YouTube Music watch history & likes.
 
 Supported sources:
-1. ytmusicapi browser auth (`config/browser.json`) -> get_history() & get_liked_songs()
-2. Google Takeout `watch-history.json` (`data/watch-history.json`) -> music video extractor
+1. ytmusicapi browser/oauth auth (`data/browser.json`, `data/oauth.json`, `config/browser.json`)
+   -> get_history() & get_liked_songs()
+2. Google Takeout `watch-history.json` (`data/watch-history.json`)
+   -> music video extractor with recency x frequency weighting:
+      weight = math.log1p(play_count) * math.exp(-days_ago / 120.0)
 
-When neither source exists or yields music records, cleanly falls back to the
-default specification seed stations so MVP testing works immediately.
+Routes history entries into the 5 Deep Music Theory DNA stations, attaches normalized
+`weighted_seeds` (0.0-1.0) per station, and records `known_video_ids` / `known_track_keys`
+so heavy-rotation tracks themselves are skipped while their hidden-gem neighborhoods are dug first.
 """
 
 from __future__ import annotations
@@ -13,17 +17,29 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from ytmusicapi import YTMusic
 
+from src.adapters.youtube import resolve_youtube_auth_file
 from src.digger.listenbrainz import ListenBrainzClient
-from src.models import StationConfig, normalize_artist, save_stations_yaml
+from src.models import (
+    StationConfig,
+    normalize_artist,
+    normalize_track_key,
+    save_stations_yaml,
+)
+from src.recommender.theory_features import (
+    DEFAULT_THEORY_PROFILE_PATH,
+    load_music_theory_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +82,7 @@ _MUSIC_CHANNEL_RE = re.compile(
     r"(?:\s*-\s*(?:topic|トピック)$|vevo$|records?$|music$|official\s*(?:music|artist)|"
     r"sounds?$|recordings?$|^\s*(?:kexp|boiler\s*room|ninja\s*tune|colors|colorsxstudios|sub\s*pop|"
     r"warp\s*records|xl\s*recordings|domino\s*recording\s*co\.?|4ad|matador\s*records|spinnin'\s*records|"
-    r"armada\s*music|anjunadeep|anjunabeats|ultra\s*records|monstercat|Ghostly\s*International)\s*$)",
+    r"armada\s*music|anjunadeep|anjunabeats|ultra\s*records|monstercat|ghostly\s*international)\s*$)",
     re.IGNORECASE,
 )
 _CHANNEL_CLEAN_RE = re.compile(
@@ -75,36 +91,189 @@ _CHANNEL_CLEAN_RE = re.compile(
 )
 _JP_BRACKET_TITLE_RE = re.compile(r"^[「『](.+?)[」』]$")
 _AD_DETAIL_RE = re.compile(r"(?:google\s*ads|広告)", re.IGNORECASE)
+_JP_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
+
+# 5-station classification lexicons
+_JP_HIPHOP_ARTISTS = {
+    "bad hop", "yzerr", "t pablow", "ak 69", "zorn", "creepy nuts", "awich",
+    "jp the wavy", "lex", "ralph", "jjj", "kid fresino", "bim", "kzm", "tohji",
+    "watson", "lana", "chanmina", "ちゃんみな", "梅田サイファー", "舐達麻", "般若",
+    "kohh", "千葉雄喜", "yellow bucks", "eyden", "bonbero", "c o s a", "5lack",
+    "punpee", "stuts", "仙人掌", "kandytown", "keiju", "io", "ozworld", "red eye",
+    "jin dogg", "guca owl", "rykeydaddydirty", "anarchy", "norikiyo",
+    "salu", "kohjiya", "dahlia", "mari", "百足", "韻マン", "mcニガリ", "r指定",
+}
+_JP_HIPHOP_KW_RE = re.compile(
+    r"(?:ラップ|ヒップホップ|フリースタイル|サイファー|ストリート|ビーフ|ラップスタア|"
+    r"\b(?:j-?rap|japanese\s*hip\s*hop|cypher|freestyle|hood|drill|trap|mc\s*battle|03-?\s*performance)\b)",
+    re.IGNORECASE,
+)
+_US_HIPHOP_ARTISTS = {
+    "bbno", "migos", "j cole", "lil durk", "kyle", "macklemore", "lupe fiasco",
+    "drake", "eminem", "kendrick lamar", "travis scott", "future", "21 savage",
+    "metro boomin", "tyler the creator", "jid", "denzel curry", "a ap rocky",
+    "asap rocky", "playboi carti", "gunna", "lil baby", "baby keem", "amine",
+    "yung gravy", "snoop dogg", "kanye west", "pusha t", "joey bada", "jack harlow",
+    "da baby", "dababy", "kodak black", "roddy ricch", "lil wayne", "50 cent",
+    "outkast", "anderson paak", "mac miller", "wiz khalifa", "logic", "big sean",
+}
+_US_HIPHOP_KW_RE = re.compile(
+    r"\b(?:hip\s*hop|rap|trap|drill|808|bouncy\s*rap|boom\s*bap|freestyle|cypher|gangsta)\b",
+    re.IGNORECASE,
+)
+_EDM_ARTISTS = {
+    "avicii", "david guetta", "calvin harris", "chrystal", "notion", "saint jhn",
+    "imanbek", "tiesto", "tiësto", "major lazer", "jax jones", "black eyed peas",
+    "madism", "katy perry", "kygo", "zedd", "martin garrix", "alesso", "fred again",
+    "bicep", "disclosure", "four tet", "skrillex", "daft punk", "swedish house mafia",
+    "marshmello", "fisher", "peggy gou", "kaytranada", "sub focus", "chase status",
+    "bonobo", "caribou", "flume", "odesza", "illenium", "porter robinson", "madeon",
+    "galantis", "alan walker", "david guetta avicii", "diplo", "dom dolla", "john summit",
+    "barry can t swim", "sammy virji", "interplanetary criminal",
+}
+_EDM_KW_RE = re.compile(
+    r"\b(?:remix|edm|house|ukg|uk\s*garage|2-?step|techno|trance|dnb|drum\s*and\s*bass|"
+    r"dubstep|club\s*mix|original\s*mix|extended\s*mix|boiler\s*room|dj\s*set|dance\s*pop|progressive\s*house)\b",
+    re.IGNORECASE,
+)
+_MELODIC_RAP_ALT_ARTISTS = {
+    "lil peep", "juice wrld", "post malone", "the kid laroi", "24kgoldn", "blackbear",
+    "iann dior", "mgk", "machine gun kelly", "jeremy zucker", "lil uzi vert",
+    "xxxtentacion", "trippie redd", "nf", "lauv", "bazzi", "joji", "oliver tree",
+    "d4vd", "powfu", "yungblud", "glaive", "brakence", "lil tecca", "polo g",
+    "kid cudi", "chase atlantic", "billie eilish", "conan gray", "chelsea cutler",
+    "alec benjamin", "tate mcrae", "jvke", "g eazy",
+}
+_MELODIC_RAP_ALT_KW_RE = re.compile(
+    r"\b(?:emo\s*rap|melodic\s*rap|alt-?pop|pop\s*punk|sad\s*trap|emo|heartbreak|soundcloud\s*rap)\b",
+    re.IGNORECASE,
+)
+_INDIE_GROOVE_ARTISTS = {
+    "royel otis", "oberhofer", "foster the people", "fitz and the tantrums", "hozier",
+    "imase", "earth wind fire", "surfaces", "dominic fike", "dope lemon", "phoenix",
+    "bastille", "walk the moon", "tame impala", "parcels", "vulfpeck", "khruangbin",
+    "two door cinema club", "vampire weekend", "mgmt", "jungle", "l imperatrice",
+    "fujii kaze", "藤井風", "vaundy", "official髭男dism", "星野源", "suchmos",
+    "nulbarich", "kroi", "lucky kilimanjaro", "sirup", "bruno mars", "silk sonic",
+    "mac demarco", "men i trust", "clairo", "rex orange county", "still woozy",
+    "glass animals", "metronomy", "the 1975", "arctic monkeys", "cage the elephant",
+    "the strokes", "the shins", "phoebe bridgers",
+}
+
+
+def compute_recency_frequency_weight(play_count: int, days_ago: float) -> float:
+    """Compute YouTube history seed weight: log1p(play_count) * exp(-days_ago / 120.0)."""
+    count = max(0, int(play_count))
+    age_days = max(0.0, float(days_ago))
+    return float(math.log1p(count) * math.exp(-age_days / 120.0))
+
+
+def default_theory_stations(
+    profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
+) -> list[StationConfig]:
+    """Load the 5 Deep Music Theory DNA stations from config/music_theory_profile.yaml."""
+    profile = load_music_theory_profile(profile_path)
+    raw_stations = profile.get("stations") or []
+    stations = [StationConfig.from_dict(item) for item in raw_stations if isinstance(item, dict)]
+    if stations:
+        return stations
+    return default_fallback_stations()
 
 
 def default_fallback_stations() -> list[StationConfig]:
-    """Specification example fallback stations when no personal history files are present."""
+    """Fallback stations prioritizing the 5 Deep Music Theory DNA stations."""
+    profile_stations = load_music_theory_profile(DEFAULT_THEORY_PROFILE_PATH).get("stations") or []
+    if profile_stations:
+        return [StationConfig.from_dict(item) for item in profile_stations if isinstance(item, dict)]
     return [
         StationConfig(
-            station_id="melodic_folktronica_gems",
-            name="Melodic House & Folktronica Gems",
-            seed_tags=["melodic progressive house", "folktronica", "indietronica"],
-            seed_artists=["Avicii", "Oberhofer"],
+            station_id="edm_dance_party",
+            name="EDM & Dance Party",
+            seed_tags=["melodic progressive house", "uk garage", "dance pop"],
+            seed_artists=["Avicii", "Calvin Harris"],
+            max_popularity_views=500_000,
+            exploration_rate=0.9,
+        ),
+        StationConfig(
+            station_id="indie_groove_hooks",
+            name="Indie Groove & Feel-Good",
+            seed_tags=["indie pop", "folktronica", "indietronica"],
+            seed_artists=["Oberhofer", "Royel Otis"],
             max_popularity_views=500_000,
             exploration_rate=1.0,
         ),
         StationConfig(
-            station_id="indietronica_dream_cuts",
-            name="Indietronica & Dream Pop Deep Cuts",
-            seed_tags=["indietronica", "dream pop", "downtempo"],
-            seed_artists=["Oberhofer", "Four Tet"],
-            max_popularity_views=350_000,
-            exploration_rate=1.2,
-        ),
-        StationConfig(
-            station_id="progressive_organic_house",
-            name="Melodic Progressive & Organic Electronic",
-            seed_tags=["melodic progressive house", "organic house", "deep house"],
-            seed_artists=["Avicii", "Bonobo"],
+            station_id="us_hiphop_bouncy",
+            name="US Hip-Hop & Bouncy Rap",
+            seed_tags=["hip hop", "bouncy rap", "trap"],
+            seed_artists=["bbno$", "Migos"],
             max_popularity_views=500_000,
-            exploration_rate=0.9,
+            exploration_rate=0.95,
         ),
     ]
+
+
+def classify_entry_to_station(
+    artist: str,
+    title: str,
+    tags: list[str] | None = None,
+) -> str:
+    """Route a YouTube/YTMusic watch entry into one of the 5 Deep Music Theory DNA stations."""
+    a_norm = normalize_artist(artist)
+    combined = " ".join([artist or "", title or "", *(tags or [])])
+
+    # 1. Japan Hip-Hop & Street (check explicit JP rap artists or JP script + hip-hop signal)
+    if a_norm in _JP_HIPHOP_ARTISTS or any(k in a_norm for k in ("bad hop", "yzerr", "zorn", "awich", "creepy nuts", "舐達麻")):
+        return "japan_hiphop_street"
+    if _JP_SCRIPT_RE.search(combined) and _JP_HIPHOP_KW_RE.search(combined):
+        return "japan_hiphop_street"
+
+    # 2. Melodic Rap & Alt-Pop (check before general US hip-hop so Juice WRLD / Peep / Post Malone route accurately)
+    if a_norm in _MELODIC_RAP_ALT_ARTISTS or _MELODIC_RAP_ALT_KW_RE.search(combined):
+        return "melodic_rap_alt"
+
+    # 3. EDM & Dance Party (remix/UKG/house/DJ signals)
+    if a_norm in _EDM_ARTISTS or _EDM_KW_RE.search(combined):
+        return "edm_dance_party"
+
+    # 4. US Hip-Hop & Bouncy Rap
+    if a_norm in _US_HIPHOP_ARTISTS or _US_HIPHOP_KW_RE.search(combined):
+        return "us_hiphop_bouncy"
+
+    # 5. Indie Groove & Feel-Good (explicit indie/funk/pop artists or default)
+    if a_norm in _INDIE_GROOVE_ARTISTS:
+        return "indie_groove_hooks"
+    return "indie_groove_hooks"
+
+
+def _extract_video_id(url: str) -> str | None:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if qs.get("v"):
+            return str(qs["v"][0]).strip()
+        if "youtu.be" in parsed.netloc and parsed.path.strip("/"):
+            return parsed.path.strip("/").split("/")[0]
+    except ValueError:
+        return None
+    return None
+
+
+def _parse_iso_timestamp(raw_time: Any) -> datetime | None:
+    if not raw_time:
+        return None
+    text = str(raw_time).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+    except ValueError:
+        return None
 
 
 def _clean_channel_artist(channel_name: str) -> str:
@@ -146,7 +315,7 @@ def parse_takeout_watch_history(
     takeout_path: Path | str,
     warnings: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Extract music video watch entries from Google Takeout `watch-history.json`."""
+    """Extract music video watch entries (with video_id and played_at timestamp) from Google Takeout JSON."""
     path = Path(takeout_path)
     if not path.exists():
         return []
@@ -217,6 +386,8 @@ def parse_takeout_watch_history(
             {
                 "artist": artist,
                 "title": track_title,
+                "video_id": _extract_video_id(url),
+                "played_at": str(entry.get("time") or ""),
                 "weight": 1.5 if is_yt_music else 1.0,
                 "source": "takeout_ytmusic" if is_yt_music else "takeout_youtube",
             }
@@ -232,6 +403,7 @@ def parse_ytmusic_history_and_likes(
 ) -> list[dict[str, Any]]:
     """Fetch history & liked songs via authenticated ytmusicapi client."""
     records: list[dict[str, Any]] = []
+    now_iso = datetime.now(UTC).isoformat()
 
     try:
         history = yt_client.get_history() or []
@@ -244,6 +416,8 @@ def parse_ytmusic_history_and_likes(
                     {
                         "artist": artist,
                         "title": title,
+                        "video_id": item.get("videoId"),
+                        "played_at": now_iso,
                         "weight": 1.5,
                         "source": "ytmusic_history",
                     }
@@ -265,6 +439,8 @@ def parse_ytmusic_history_and_likes(
                     {
                         "artist": artist,
                         "title": title,
+                        "video_id": item.get("videoId"),
+                        "played_at": now_iso,
                         "weight": 3.0,  # Liked songs carry higher preference weight
                         "source": "ytmusic_liked",
                     }
@@ -276,6 +452,120 @@ def parse_ytmusic_history_and_likes(
             warnings.append(msg)
 
     return records
+
+
+def build_weighted_theory_stations(
+    records: list[dict[str, Any]],
+    *,
+    profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
+    reference_time: datetime | None = None,
+    max_weighted_seeds_per_station: int = 12,
+    max_known_items: int = 1000,
+) -> tuple[list[StationConfig], dict[str, list[str]]]:
+    """Classify weighted YouTube history into the 5 DNA stations and build known_video_ids/track_keys."""
+    now = reference_time or datetime.now(UTC)
+    stations = default_theory_stations(profile_path=profile_path)
+    station_by_id = {s.station_id: s for s in stations}
+
+    # Aggregate artist play counts, most recent play age (days_ago), and top track per artist per station
+    artist_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    artist_min_days: dict[str, dict[str, float]] = defaultdict(dict)
+    artist_display_name: dict[str, str] = {}
+    artist_top_track: dict[str, Counter[str]] = defaultdict(Counter)
+    artist_liked_bonus: Counter[str] = Counter()
+
+    known_video_ids: list[str] = []
+    seen_vids: set[str] = set()
+    known_track_keys: list[str] = []
+    seen_keys: set[str] = set()
+
+    for rec in records:
+        artist = str(rec.get("artist") or "").strip()
+        title = str(rec.get("title") or "").strip()
+        if not artist:
+            continue
+        a_norm = normalize_artist(artist)
+        if not a_norm:
+            continue
+        artist_display_name.setdefault(a_norm, artist)
+
+        vid = str(rec.get("video_id") or "").strip()
+        if vid and vid not in seen_vids:
+            seen_vids.add(vid)
+            known_video_ids.append(vid)
+        if title:
+            t_key = normalize_track_key(artist, title)
+            if t_key not in seen_keys:
+                seen_keys.add(t_key)
+                known_track_keys.append(t_key)
+            artist_top_track[a_norm][title] += 1
+
+        dt = _parse_iso_timestamp(rec.get("played_at") or rec.get("time"))
+        days_ago = max(0.0, (now - dt).total_seconds() / 86400.0) if dt is not None else 30.0
+
+        st_id = classify_entry_to_station(artist, title)
+        if st_id not in station_by_id:
+            st_id = stations[0].station_id
+
+        # Liked tracks count as stronger play signal while preserving frequency x recency formula
+        increment = 3 if rec.get("source") == "ytmusic_liked" else 1
+        artist_counts[st_id][a_norm] += increment
+        if rec.get("source") == "ytmusic_liked":
+            artist_liked_bonus[a_norm] += 1
+
+        prev_days = artist_min_days[st_id].get(a_norm)
+        if prev_days is None or days_ago < prev_days:
+            artist_min_days[st_id][a_norm] = days_ago
+
+    # Compute raw weights via log1p(play_count) * exp(-days_ago / 120.0) and normalize 0.0-1.0 per station
+    for st in stations:
+        counts = artist_counts.get(st.station_id)
+        if not counts:
+            continue
+
+        scored_entries: list[dict[str, Any]] = []
+        for a_norm, play_count in counts.items():
+            days_ago = artist_min_days[st.station_id].get(a_norm, 30.0)
+            raw_w = compute_recency_frequency_weight(play_count, days_ago)
+            top_title = artist_top_track[a_norm].most_common(1)[0][0] if artist_top_track[a_norm] else ""
+            scored_entries.append(
+                {
+                    "artist": artist_display_name[a_norm],
+                    "top_title": top_title,
+                    "play_count": int(play_count),
+                    "days_ago": round(float(days_ago), 1),
+                    "raw_weight": round(raw_w, 4),
+                }
+            )
+
+        scored_entries.sort(key=lambda item: item["raw_weight"], reverse=True)
+        top_entries = scored_entries[:max_weighted_seeds_per_station]
+        max_raw = max((e["raw_weight"] for e in top_entries), default=1.0) or 1.0
+
+        normalized_seeds: list[dict[str, Any]] = []
+        for entry in top_entries:
+            norm_w = round(float(entry["raw_weight"] / max_raw), 4)
+            normalized_seeds.append(
+                {
+                    "artist": entry["artist"],
+                    "top_title": entry["top_title"],
+                    "play_count": entry["play_count"],
+                    "days_ago": entry["days_ago"],
+                    "weight": norm_w,
+                }
+            )
+
+        st.weighted_seeds = normalized_seeds
+        # Prepend high-weight history artists to seed_artists (deduplicated) so digging prioritizes them
+        history_artists = [item["artist"] for item in normalized_seeds[:6]]
+        merged_artists = list(dict.fromkeys([*history_artists, *st.seed_artists]))
+        st.seed_artists = merged_artists[:14]
+
+    history_index = {
+        "known_video_ids": known_video_ids[:max_known_items],
+        "known_track_keys": known_track_keys[:max_known_items],
+    }
+    return stations, history_index
 
 
 def _slugify(text: str) -> str:
@@ -301,7 +591,7 @@ def build_stations_from_history(
     tag_resolver: Callable[[str], list[str]] | None = None,
     max_artists_to_resolve: int = 18,
 ) -> list[StationConfig]:
-    """Cluster top artists and frequent tags from history into 2-4 coherent radio stations."""
+    """Cluster top artists and frequent tags from history into 2-4 coherent radio stations (legacy helper)."""
     target_stations = max(2, min(4, int(num_stations)))
     artist_scores: Counter[str] = Counter()
     for rec in records:
@@ -331,12 +621,10 @@ def build_stations_from_history(
             clean_tags = _heuristic_tags_for_artist(artist)
         artist_tags[artist] = clean_tags[:5]
         for rank_idx, tag in enumerate(artist_tags[artist]):
-            # Prefer specific subgenres over rank-0 broad tags slightly
             tag_scores[tag] += artist_scores[artist] / (1.0 + 0.25 * rank_idx)
             if artist not in tag_to_artists[tag]:
                 tag_to_artists[tag].append(artist)
 
-    # Greedily select diverse anchor tags to build 2..4 distinct stations
     stations: list[StationConfig] = []
     used_anchors: set[str] = set()
     used_artist_sets: list[set[str]] = []
@@ -355,12 +643,10 @@ def build_stations_from_history(
         if not candidate_artists:
             continue
 
-        # Avoid creating duplicate stations with identical artist membership
         artist_set = set(candidate_artists)
         if any(artist_set == prev for prev in used_artist_sets):
             continue
 
-        # Gather co-occurring tags among the station's seed artists
         co_tags: Counter[str] = Counter({anchor_tag: 10.0})
         for artist in candidate_artists:
             for t in artist_tags.get(artist, []):
@@ -384,7 +670,6 @@ def build_stations_from_history(
             )
         )
 
-    # Guarantee at least 2 stations (per specification: 2-4 stations)
     if len(stations) < 2:
         for fallback in default_fallback_stations():
             if len(stations) >= max(2, target_stations):
@@ -395,32 +680,60 @@ def build_stations_from_history(
     return stations[:4]
 
 
+def _select_stations_for_count(all_five: list[StationConfig], num_stations: int) -> list[StationConfig]:
+    """Return all 5 canonical stations when num_stations>=5, or a balanced subset including EDM & Indie."""
+    n = max(2, min(5, int(num_stations)))
+    if n >= len(all_five):
+        return list(all_five)
+    # Prioritize edm_dance_party & indie_groove_hooks when slicing to <5 so fallback seeds stay covered
+    priority_order = [
+        "edm_dance_party",
+        "indie_groove_hooks",
+        "us_hiphop_bouncy",
+        "melodic_rap_alt",
+        "japan_hiphop_street",
+    ]
+    by_id = {s.station_id: s for s in all_five}
+    ordered = [by_id[sid] for sid in priority_order if sid in by_id]
+    for st in all_five:
+        if st not in ordered:
+            ordered.append(st)
+    return ordered[:n]
+
+
 def generate_stations_yaml(
     output_path: Path | str = Path("config/stations.yaml"),
     browser_auth_path: Path | str = Path("config/browser.json"),
     takeout_path: Path | str = Path("data/watch-history.json"),
-    num_stations: int = 3,
+    num_stations: int = 5,
     offline: bool = False,
+    profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
+    reference_time: datetime | None = None,
 ) -> dict[str, Any]:
-    """Read available history sources, generate 2-4 stations, and write config/stations.yaml."""
+    """Read available history sources, build weighted 5-station DNA config, and write stations.yaml."""
     records: list[dict[str, Any]] = []
     sources_used: list[str] = []
     warnings: list[str] = []
 
     browser_path = Path(browser_auth_path)
-    if browser_path.exists():
+    # Also auto-check data/browser.json and data/oauth.json if default config/browser.json is absent
+    effective_auth: Path | None = browser_path if browser_path.exists() else None
+    if effective_auth is None and str(browser_auth_path) == "config/browser.json":
+        effective_auth = resolve_youtube_auth_file()
+
+    if effective_auth is not None and effective_auth.exists():
         try:
-            yt = YTMusic(str(browser_path))
+            yt = YTMusic(str(effective_auth))
             yt_records = parse_ytmusic_history_and_likes(yt, warnings=warnings)
             if yt_records:
                 records.extend(yt_records)
-                sources_used.append(f"ytmusicapi:{browser_path}")
+                sources_used.append(f"ytmusicapi:{effective_auth}")
             elif not warnings:
                 warnings.append(
-                    f"ytmusicapi auth {browser_path} loaded but returned 0 history/liked tracks."
+                    f"ytmusicapi auth {effective_auth} loaded but returned 0 history/liked tracks."
                 )
         except Exception as exc:  # noqa: BLE001
-            msg = f"Failed to load ytmusicapi browser auth {browser_path} (expired or invalid): {exc}"
+            msg = f"Failed to load ytmusicapi browser auth {effective_auth} (expired or invalid): {exc}"
             logger.warning(msg)
             warnings.append(msg)
 
@@ -431,45 +744,49 @@ def generate_stations_yaml(
             records.extend(takeout_records)
             sources_used.append(f"takeout:{takeout_file}")
 
-    fallback_used = False
-    if not records:
-        fallback_used = True
-        stations = default_fallback_stations()[: max(2, min(4, int(num_stations)))]
-    else:
-        lb_client: ListenBrainzClient | None = None
-        if not offline:
-            lb_client = ListenBrainzClient(timeout=8.0)
+    fallback_used = not bool(records)
+    all_stations, history_index = build_weighted_theory_stations(
+        records,
+        profile_path=profile_path,
+        reference_time=reference_time,
+    )
 
-        def _resolve_tags(artist: str) -> list[str]:
-            if lb_client is not None:
-                _, mb_tags = lb_client.lookup_artist(artist)
-                if mb_tags:
-                    return mb_tags
-            return _heuristic_tags_for_artist(artist)
-
+    # Optionally enrich unknown artists' tags via MusicBrainz when online and history is present
+    if records and not offline:
+        lb_client = ListenBrainzClient(timeout=6.0)
         try:
-            stations = build_stations_from_history(
-                records,
-                num_stations=num_stations,
-                tag_resolver=_resolve_tags,
-            )
+            for st in all_stations:
+                for seed_item in st.weighted_seeds[:2]:
+                    _, mb_tags = lb_client.lookup_artist(str(seed_item["artist"]))
+                    for t in mb_tags[:2]:
+                        if t not in _GENERIC_TAGS and t not in st.seed_tags:
+                            st.seed_tags.append(t)
         finally:
-            if lb_client is not None:
-                lb_client.close()
+            lb_client.close()
+
+    stations = _select_stations_for_count(all_stations, num_stations)
 
     meta = {
         "generated_at": datetime.now(UTC).isoformat(),
         "sources_used": sources_used if sources_used else ["default_seed_fallback"],
         "records_imported": len(records),
         "fallback_used": fallback_used,
+        "theory_profile": str(profile_path),
     }
     out = Path(output_path)
-    save_stations_yaml(out, stations, meta=meta)
+    save_stations_yaml(
+        out,
+        stations,
+        meta=meta,
+        history_index=history_index if (history_index["known_video_ids"] or history_index["known_track_keys"]) else None,
+    )
     return {
         "output_path": str(out),
         "station_count": len(stations),
         "station_ids": [s.station_id for s in stations],
         "records_imported": len(records),
+        "known_video_ids_count": len(history_index["known_video_ids"]),
+        "known_track_keys_count": len(history_index["known_track_keys"]),
         "sources_used": meta["sources_used"],
         "fallback_used": fallback_used,
         "warnings": warnings,
@@ -478,7 +795,7 @@ def generate_stations_yaml(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Auto-generate config/stations.yaml from YouTube / YouTube Music history."
+        description="Auto-generate config/stations.yaml from YouTube / YouTube Music history (5-station Theory DNA)."
     )
     parser.add_argument(
         "--output",
@@ -488,7 +805,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--browser-auth",
         default="config/browser.json",
-        help="Path to ytmusicapi browser auth JSON (default: config/browser.json)",
+        help="Path to ytmusicapi browser/oauth auth JSON (default: config/browser.json; also checks data/browser.json & data/oauth.json)",
     )
     parser.add_argument(
         "--takeout",
@@ -498,9 +815,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stations",
         type=int,
-        default=3,
-        choices=[2, 3, 4],
-        help="Number of stations to generate (2-4, default: 3)",
+        default=5,
+        choices=[2, 3, 4, 5],
+        help="Number of stations to generate (2-5, default: 5)",
     )
     parser.add_argument(
         "--offline",

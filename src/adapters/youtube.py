@@ -70,29 +70,164 @@ def _clean_video_title(title: str, artist: str) -> str:
     return title.strip()
 
 
+def resolve_youtube_auth_file(
+    explicit_path: Path | str | None = None,
+    project_root: Path | None = None,
+) -> Path | None:
+    """Locate an existing ytmusicapi auth file (data/browser.json, data/oauth.json, config/browser.json)."""
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    root = project_root or Path(__file__).resolve().parent.parent.parent
+    candidates.extend(
+        [
+            root / "data" / "browser.json",
+            root / "data" / "oauth.json",
+            root / "config" / "browser.json",
+        ]
+    )
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
 class YouTubeMusicAdapter(MusicPlatformAdapter):
-    """Resolves tracks to YouTube videoIds and expands pools via Watch Playlists."""
+    """Resolves tracks to YouTube videoIds, expands pools via Watch Playlists, and syncs user playlists."""
 
     platform_name = "youtube_music"
 
-    def __init__(self, browser_auth_path: Path | str | None = None, client: YTMusic | None = None) -> None:
+    def __init__(
+        self,
+        browser_auth_path: Path | str | None = None,
+        client: YTMusic | None = None,
+        project_root: Path | None = None,
+    ) -> None:
         self._songs_filter_enabled = False
+        self._authenticated = False
+        self._auth_source: str | None = None
+        self._auth_error: str | None = None
+
         if client is not None:
             self._yt = client
             self._songs_filter_enabled = True
-        elif browser_auth_path and Path(browser_auth_path).exists():
-            try:
-                self._yt = YTMusic(str(browser_auth_path))
-                self._songs_filter_enabled = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to load ytmusicapi auth %s (%s); falling back to anonymous mode", browser_auth_path, exc)
-                self._yt = YTMusic()
+            self._authenticated = True
+            self._auth_source = "injected_client"
         else:
-            self._yt = YTMusic()
+            auth_file = resolve_youtube_auth_file(browser_auth_path, project_root=project_root)
+            if auth_file is not None:
+                try:
+                    self._yt = YTMusic(str(auth_file))
+                    self._songs_filter_enabled = True
+                    self._authenticated = True
+                    self._auth_source = str(auth_file)
+                except Exception as exc:  # noqa: BLE001
+                    self._auth_error = str(exc)
+                    logger.warning(
+                        "Failed to load ytmusicapi auth %s (%s); falling back to anonymous mode",
+                        auth_file,
+                        exc,
+                    )
+                    self._yt = YTMusic()
+            else:
+                self._yt = YTMusic()
 
     @property
     def client(self) -> YTMusic:
         return self._yt
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._authenticated
+
+    @property
+    def auth_source(self) -> str | None:
+        return self._auth_source
+
+    @property
+    def auth_error(self) -> str | None:
+        return self._auth_error
+
+    def list_user_playlists(self, limit: int = 50) -> dict[str, Any]:
+        """List authenticated YouTube Music library playlists, or safely return unauthenticated fallback."""
+        if not self._authenticated:
+            return {
+                "authenticated": False,
+                "auth_source": None,
+                "playlists": [],
+                "reason": self._auth_error or "No data/browser.json or data/oauth.json configured",
+            }
+        try:
+            raw = self._yt.get_library_playlists(limit=limit) or []
+            playlists = [
+                {
+                    "playlist_id": str(item.get("playlistId") or ""),
+                    "title": str(item.get("title") or "Untitled"),
+                    "count": item.get("count"),
+                }
+                for item in raw
+                if isinstance(item, dict) and item.get("playlistId")
+            ]
+            return {
+                "authenticated": True,
+                "auth_source": self._auth_source,
+                "playlists": playlists,
+                "reason": None,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ytmusicapi get_library_playlists failed: %s", exc)
+            return {
+                "authenticated": False,
+                "auth_source": self._auth_source,
+                "playlists": [],
+                "reason": str(exc),
+            }
+
+    def sync_liked_track(
+        self,
+        video_id: str,
+        *,
+        youtube_playlist_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Sync a Good-rated track to YouTube Music (LIKE + optional add_playlist_items)."""
+        if not self._authenticated:
+            return {
+                "authenticated": False,
+                "liked": False,
+                "playlist_added": False,
+                "reason": self._auth_error or "No data/browser.json or data/oauth.json configured",
+            }
+        liked = False
+        playlist_added = False
+        errors: list[str] = []
+
+        try:
+            self._yt.rate_song(video_id, "LIKE")
+            liked = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ytmusicapi rate_song(%s, LIKE) failed: %s", video_id, exc)
+            errors.append(f"rate_song: {exc}")
+
+        if youtube_playlist_id:
+            try:
+                self._yt.add_playlist_items(youtube_playlist_id, [video_id], duplicates=False)
+                playlist_added = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ytmusicapi add_playlist_items(%s, %s) failed: %s",
+                    youtube_playlist_id,
+                    video_id,
+                    exc,
+                )
+                errors.append(f"add_playlist_items: {exc}")
+
+        return {
+            "authenticated": True,
+            "liked": liked,
+            "playlist_added": playlist_added,
+            "youtube_playlist_id": youtube_playlist_id,
+            "errors": errors,
+        }
 
     def search_playable(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
         """Search YouTube Music with graceful fallback when anonymous 'songs' filter returns empty."""
@@ -187,6 +322,8 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         platform_track_id: str,
         seed_tags: list[str] | None = None,
         limit: int = 25,
+        seed_artist: str | None = None,
+        seed_archetype: str | None = None,
     ) -> list[TrackEntity]:
         """Collect related candidate tracks via YouTube Music Watch Playlist without fabricating seed tags."""
         _ = seed_tags  # Intentionally unused: Watch Playlist tracks carry no verified genre tags
@@ -221,6 +358,8 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                     duration_seconds=duration,
                     video_id=str(vid),
                     source="watch_playlist",
+                    seed_artist=seed_artist,
+                    seed_archetype=seed_archetype,
                 )
             )
         return entities

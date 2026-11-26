@@ -1,4 +1,4 @@
-"""FastAPI local radio server connecting Candidate Pool, MABWiser Bandit, and Web UI."""
+"""FastAPI local radio server connecting Candidate Pool, 10-dim Theory DNA Bandit, Playlists, and Web UI."""
 
 from __future__ import annotations
 
@@ -15,8 +15,14 @@ from src.adapters.youtube import YouTubeMusicAdapter
 from src.db import RadioDatabase
 from src.digger.history_importer import generate_stations_yaml
 from src.digger.pool import CandidatePoolDigger
-from src.models import StationConfig, load_stations_yaml, normalize_artist
+from src.models import (
+    StationConfig,
+    load_history_index,
+    load_stations_yaml,
+    normalize_artist,
+)
 from src.recommender.bandit import ContextualBanditRecommender
+from src.recommender.theory_features import THEORY_AXIS_KEYS, TheoryFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +38,47 @@ class FeedbackRequest(BaseModel):
     listen_seconds: float | None = None
     duration_seconds: float | None = None
     yt_error_code: int | None = None
+    playlist_id: str | None = None
+    youtube_playlist_id: str | None = None
 
 
 class ImportHistoryRequest(BaseModel):
     browser_auth_path: str = "config/browser.json"
     takeout_path: str = "data/watch-history.json"
-    num_stations: int = Field(default=3, ge=2, le=4)
+    num_stations: int = Field(default=5, ge=2, le=5)
     offline: bool = False
 
 
+class UnplayableRequest(BaseModel):
+    station_id: str | None = None
+    track_id: str | None = None
+    reason: str = "playback_stall_or_error"
+    yt_error_code: int | None = None
+    ttl_days: int = Field(default=30, ge=1, le=365)
+
+
+class CreatePlaylistRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    youtube_playlist_id: str | None = None
+
+
+class AddPlaylistTrackRequest(BaseModel):
+    video_id: str = Field(..., min_length=1)
+    track_id: str | None = None
+    artist: str = "Unknown Artist"
+    title: str = "Untitled"
+    station_id: str | None = None
+    sync_youtube: bool = False
+    youtube_playlist_id: str | None = None
+
+
+class YouTubeSyncRequest(BaseModel):
+    video_id: str = Field(..., min_length=1)
+    youtube_playlist_id: str | None = None
+
+
 class RadioRuntime:
-    """Holds stations, SQLite DB, digger, per-station dig locks, and Contextual Bandit instances."""
+    """Holds stations, SQLite DB, digger, per-station ownership-token locks, and Theory DNA Bandits."""
 
     def __init__(
         self,
@@ -60,6 +96,8 @@ class RadioRuntime:
         self.auto_dig = auto_dig
 
         self.db = RadioDatabase(db_path)
+        self.theory_extractor = TheoryFeatureExtractor()
+        self._yt_adapter: YouTubeMusicAdapter | None = None
         self._digger: CandidatePoolDigger | None = None
         self._digger_init_lock = threading.Lock()
         self._dig_state_lock = threading.Lock()
@@ -67,15 +105,32 @@ class RadioRuntime:
         self._digging_stations: dict[str, object] = {}
         self.stations: dict[str, StationConfig] = {}
         self.bandits: dict[str, ContextualBanditRecommender] = {}
+        self.known_video_ids: set[str] = set()
+        self.known_track_keys: set[str] = set()
         self.reload_stations()
+
+    @property
+    def yt_adapter(self) -> YouTubeMusicAdapter:
+        if self._yt_adapter is None:
+            with self._digger_init_lock:
+                if self._yt_adapter is None:
+                    self._yt_adapter = YouTubeMusicAdapter(
+                        browser_auth_path=self.browser_auth_path,
+                        project_root=PROJECT_ROOT,
+                    )
+        return self._yt_adapter
 
     @property
     def digger(self) -> CandidatePoolDigger:
         if self._digger is None:
             with self._digger_init_lock:
                 if self._digger is None:
-                    yt = YouTubeMusicAdapter(browser_auth_path=self.browser_auth_path)
-                    self._digger = CandidatePoolDigger(self.db, yt_adapter=yt)
+                    if self._yt_adapter is None:
+                        self._yt_adapter = YouTubeMusicAdapter(
+                            browser_auth_path=self.browser_auth_path,
+                            project_root=PROJECT_ROOT,
+                        )
+                    self._digger = CandidatePoolDigger(self.db, yt_adapter=self._yt_adapter)
         return self._digger
 
     def reload_stations(self) -> None:
@@ -84,10 +139,11 @@ class RadioRuntime:
                 output_path=self.stations_path,
                 browser_auth_path=self.browser_auth_path,
                 takeout_path=PROJECT_ROOT / "data/watch-history.json",
-                num_stations=3,
+                num_stations=5,
                 offline=True,
             )
         station_list = load_stations_yaml(self.stations_path)
+        self.known_video_ids, self.known_track_keys = load_history_index(self.stations_path)
         self.stations = {s.station_id: s for s in station_list}
         self.bandits = {
             s.station_id: ContextualBanditRecommender(
@@ -95,6 +151,8 @@ class RadioRuntime:
                 seed_tags=s.seed_tags,
                 exploration_rate=s.exploration_rate,
                 model_path=self.model_dir / f"bandit_{s.station_id}.pkl",
+                station_config=s,
+                theory_extractor=self.theory_extractor,
             )
             for s in station_list
         }
@@ -151,7 +209,16 @@ class RadioRuntime:
                             "skipped_duplicate_dig": True,
                         }
                 try:
-                    return self.digger.dig_station(station, target_pool_size=target_pool_size)
+                    # Pass known history sets when digger supports them (keeps test mock compatibility)
+                    try:
+                        return self.digger.dig_station(
+                            station,
+                            target_pool_size=target_pool_size,
+                            known_video_ids=self.known_video_ids,
+                            known_track_keys=self.known_track_keys,
+                        )
+                    except TypeError:
+                        return self.digger.dig_station(station, target_pool_size=target_pool_size)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
                     return None
@@ -200,14 +267,16 @@ class RadioRuntime:
     ) -> list[dict[str, Any]]:
         station = self.get_station(station_id)
         min_unheard_threshold = max(count, 5)
+        effective_exclude_ids = set(exclude_ids or set()) | self.known_video_ids
         required_db_unheard = min_unheard_threshold + len(exclude_ids or ())
 
         # [M4] Judge depletion strictly on UNHEARD candidates
         unheard = self.db.get_eligible_candidates(
             station_id=station.station_id,
             max_popularity_views=station.max_popularity_views,
-            exclude_track_ids=exclude_ids,
+            exclude_track_ids=effective_exclude_ids,
             include_heard_fallback=False,
+            exclude_canonical_keys=self.known_track_keys,
         )
 
         if self.auto_dig and len(unheard) < min_unheard_threshold:
@@ -228,8 +297,9 @@ class RadioRuntime:
                 unheard = self.db.get_eligible_candidates(
                     station_id=station.station_id,
                     max_popularity_views=station.max_popularity_views,
-                    exclude_track_ids=exclude_ids,
+                    exclude_track_ids=effective_exclude_ids,
                     include_heard_fallback=False,
+                    exclude_canonical_keys=self.known_track_keys,
                 )
 
         # [M4] Fall back to previously liked/completed tracks ONLY if unheard is still empty
@@ -251,6 +321,49 @@ class RadioRuntime:
         )
         return [item.to_queue_dict() for item in ranked]
 
+    def get_theory_profile(self, station_id: str | None = None) -> dict[str, Any]:
+        """Return learned 5-axis Deep Music Theory DNA profile for one station or aggregated globally."""
+        if station_id:
+            self.get_station(station_id)
+            return self.bandits[station_id].get_learned_theory_profile()
+
+        per_station = {sid: b.get_learned_theory_profile() for sid, b in self.bandits.items()}
+        if not per_station:
+            return {"station_id": None, "updates": 0, "scores": {}, "axes": [], "stations": {}}
+
+        total_updates = sum(int(p["updates"]) for p in per_station.values())
+        axes_agg: list[dict[str, Any]] = []
+        scores_agg: dict[str, float] = {}
+
+        for ax in THEORY_AXIS_KEYS:
+            meta = self.theory_extractor.axes_meta.get(ax, {})
+            # Weight stations by (1 + updates) so actively rated stations shape the global profile
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for prof in per_station.values():
+                w = 1.0 + float(prof["updates"])
+                weighted_sum += w * float(prof["scores"].get(ax, 0.65))
+                weight_total += w
+            avg_score = round(weighted_sum / max(1.0, weight_total), 3)
+            scores_agg[ax] = avg_score
+            axes_agg.append(
+                {
+                    "axis": ax,
+                    "key": meta.get("key", ax.lower()),
+                    "label_ja": meta.get("label_ja", ax),
+                    "label_en": meta.get("label_en", ax),
+                    "score": avg_score,
+                }
+            )
+
+        return {
+            "station_id": None,
+            "updates": total_updates,
+            "scores": scores_agg,
+            "axes": axes_agg,
+            "stations": per_station,
+        }
+
 
 def create_app(
     *,
@@ -271,7 +384,7 @@ def create_app(
         auto_dig=auto_dig,
     )
 
-    app = FastAPI(title="Hidden Gem Radio", version="0.1.0")
+    app = FastAPI(title="Hidden Gem Radio", version="0.2.0")
     app.state.runtime = runtime
 
     @app.get("/", response_class=HTMLResponse)
@@ -329,6 +442,118 @@ def create_app(
         exclude_set = {item.strip() for item in exclude.split(",") if item.strip()}
         items = runtime.next_queue(station_id=station_id, count=count, exclude_ids=exclude_set)
         return {"station_id": station_id, "count": len(items), "items": items}
+
+    @app.get("/api/stations/{station_id}/next")
+    def api_station_next(
+        station_id: str,
+        exclude: str = Query(default="", description="Comma-separated track_ids or video_ids to omit"),
+    ) -> dict[str, Any]:
+        exclude_set = {item.strip() for item in exclude.split(",") if item.strip()}
+        items = runtime.next_queue(station_id=station_id, count=1, exclude_ids=exclude_set)
+        return {
+            "station_id": station_id,
+            "track": items[0] if items else None,
+        }
+
+    @app.get("/api/stations/{station_id}/batch")
+    def api_station_batch(
+        station_id: str,
+        count: int = Query(default=3, ge=1, le=10),
+        exclude: str = Query(default="", description="Comma-separated track_ids or video_ids to omit"),
+    ) -> dict[str, Any]:
+        exclude_set = {item.strip() for item in exclude.split(",") if item.strip()}
+        items = runtime.next_queue(station_id=station_id, count=count, exclude_ids=exclude_set)
+        return {"station_id": station_id, "count": len(items), "items": items}
+
+    @app.get("/api/profile/theory")
+    def api_theory_profile(station_id: str | None = Query(default=None)) -> dict[str, Any]:
+        return runtime.get_theory_profile(station_id=station_id)
+
+    @app.post("/api/tracks/{video_id}/unplayable")
+    def api_mark_track_unplayable(
+        video_id: str,
+        req: UnplayableRequest | None = None,
+    ) -> dict[str, Any]:
+        """Blacklist an unplayable/stalled video_id for 30 days WITHOUT polluting BAD bandit learning."""
+        body = req or UnplayableRequest()
+        expires_at = runtime.db.blacklist_unplayable(
+            video_id,
+            reason=body.reason,
+            yt_error_code=body.yt_error_code,
+            ttl_days=body.ttl_days,
+        )
+        replacement = None
+        if body.station_id and body.station_id in runtime.stations:
+            exclude = {x for x in (video_id, body.track_id) if x}
+            reps = runtime.next_queue(body.station_id, count=1, exclude_ids=exclude)
+            replacement = reps[0] if reps else None
+
+        return {
+            "status": "ok",
+            "video_id": video_id,
+            "blacklisted_days": body.ttl_days,
+            "expires_at": expires_at,
+            "bad_learning_polluted": False,
+            "replacement": replacement,
+        }
+
+    # --- Playlists & Hybrid YouTube Integration ---
+    @app.get("/api/playlists")
+    def api_list_playlists() -> dict[str, Any]:
+        return {"playlists": runtime.db.list_playlists()}
+
+    @app.post("/api/playlists")
+    def api_create_playlist(req: CreatePlaylistRequest) -> dict[str, Any]:
+        try:
+            created = runtime.db.create_playlist(req.name, youtube_playlist_id=req.youtube_playlist_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"status": "ok", "playlist": created}
+
+    @app.get("/api/playlists/{playlist_id}/tracks")
+    def api_get_playlist_tracks(playlist_id: str) -> dict[str, Any]:
+        data = runtime.db.get_playlist_tracks(playlist_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"Unknown playlist_id: {playlist_id}")
+        return data
+
+    @app.post("/api/playlists/{playlist_id}/tracks")
+    def api_add_playlist_track(playlist_id: str, req: AddPlaylistTrackRequest) -> dict[str, Any]:
+        if not runtime.db.playlist_exists(playlist_id):
+            raise HTTPException(status_code=404, detail=f"Unknown playlist_id: {playlist_id}")
+        saved = runtime.db.add_track_to_playlist(
+            playlist_id,
+            video_id=req.video_id,
+            track_id=req.track_id,
+            artist=req.artist,
+            title=req.title,
+            station_id=req.station_id,
+        )
+        yt_sync: dict[str, Any] | None = None
+        if req.sync_youtube:
+            yt_sync = runtime.yt_adapter.sync_liked_track(
+                req.video_id,
+                youtube_playlist_id=req.youtube_playlist_id,
+            )
+        return {"status": "ok", "entry": saved, "youtube_sync": yt_sync}
+
+    @app.delete("/api/playlists/{playlist_id}/tracks/{video_id}")
+    def api_remove_playlist_track(playlist_id: str, video_id: str) -> dict[str, Any]:
+        if not runtime.db.playlist_exists(playlist_id):
+            raise HTTPException(status_code=404, detail=f"Unknown playlist_id: {playlist_id}")
+        removed = runtime.db.remove_track_from_playlist(playlist_id, video_id)
+        return {"status": "ok", "removed": removed > 0}
+
+    @app.get("/api/youtube/playlists")
+    def api_youtube_playlists() -> dict[str, Any]:
+        return runtime.yt_adapter.list_user_playlists()
+
+    @app.post("/api/youtube/sync")
+    def api_youtube_sync(req: YouTubeSyncRequest) -> dict[str, Any]:
+        return runtime.yt_adapter.sync_liked_track(
+            req.video_id,
+            youtube_playlist_id=req.youtube_playlist_id,
+        )
 
     @app.post("/feedback")
     def post_feedback(req: FeedbackRequest) -> dict[str, Any]:
@@ -388,13 +613,38 @@ def create_app(
             runtime.db.delete_feedback(feedback_id)
             raise
 
+        playlist_saved: dict[str, Any] | None = None
+        yt_sync: dict[str, Any] | None = None
+        if event == "GOOD" and track.video_id:
+            if req.playlist_id and runtime.db.playlist_exists(req.playlist_id):
+                playlist_saved = runtime.db.add_track_to_playlist(
+                    req.playlist_id,
+                    video_id=track.video_id,
+                    track_id=track.track_id,
+                    artist=track.artist,
+                    title=track.title,
+                    station_id=station.station_id,
+                )
+            if req.youtube_playlist_id and runtime.yt_adapter.is_authenticated:
+                yt_sync = runtime.yt_adapter.sync_liked_track(
+                    track.video_id,
+                    youtube_playlist_id=req.youtube_playlist_id,
+                )
+
         return {
             "status": "ok",
             "station_id": station.station_id,
             "track_id": track.track_id,
             "event_type": event,
             "reward": reward,
+            "theory_reward": ContextualBanditRecommender.compute_theory_reward(
+                event,
+                listen_seconds=req.listen_seconds,
+                duration_seconds=req.duration_seconds,
+            ),
             "model_updates": bandit.n_updates,
+            "playlist_saved": playlist_saved,
+            "youtube_sync": yt_sync,
         }
 
     return app

@@ -2,21 +2,21 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hidden Gem Radio</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Hidden Gem Radio — Deep Music Theory DNA</title>
   <style>
     :root {
-      --bg: #0c0f16;
-      --panel: #151b28;
-      --panel-soft: #1d2536;
-      --border: #2a344a;
+      --bg: #0b0f18;
+      --panel: #141b29;
+      --panel-soft: #1d2638;
+      --border: #2a3650;
       --text: #eef2ff;
-      --muted: #93a1be;
+      --muted: #94a3c0;
       --accent: #38bdf8;
       --good: #22c55e;
       --bad: #ef4444;
-      --explore: #a78bfa;
-      --exploit: #34d399;
+      --dna: #a78bfa;
+      --warn: #f59e0b;
     }
 
     * { box-sizing: border-box; }
@@ -24,26 +24,26 @@
       margin: 0;
       min-height: 100vh;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans", sans-serif;
-      background: radial-gradient(circle at top, #172033 0%, var(--bg) 62%);
+      background: radial-gradient(circle at top, #172238 0%, var(--bg) 62%);
       color: var(--text);
       display: flex;
       justify-content: center;
-      padding: 24px 16px;
+      padding: 18px 14px 40px;
     }
 
     .radio-shell {
       width: 100%;
-      max-width: 780px;
+      max-width: 860px;
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
 
     .header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       flex-wrap: wrap;
     }
 
@@ -63,27 +63,42 @@
 
     .brand h1 {
       margin: 0;
-      font-size: 1.25rem;
+      font-size: 1.2rem;
       letter-spacing: 0.02em;
     }
 
     .status-pill {
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       color: var(--muted);
       background: var(--panel);
       border: 1px solid var(--border);
       padding: 6px 12px;
       border-radius: 999px;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .card {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 16px;
-      padding: 18px;
+      padding: 16px;
     }
 
-    /* 1. Station Switcher (Station-First UI) */
+    .card-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 12px 0;
+      font-size: 0.88rem;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    /* Station Switcher (5 DNA Stations) */
     .station-row {
       display: flex;
       gap: 8px;
@@ -96,15 +111,15 @@
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 9px 14px;
-      font-size: 0.88rem;
+      padding: 9px 13px;
+      font-size: 0.85rem;
       cursor: pointer;
       transition: all 0.15s ease;
     }
 
     .station-btn:hover { border-color: var(--accent); }
     .station-btn.active {
-      background: rgba(56, 189, 248, 0.16);
+      background: rgba(56, 189, 248, 0.18);
       border-color: var(--accent);
       color: #fff;
       font-weight: 600;
@@ -114,12 +129,8 @@
     .player-grid {
       display: grid;
       grid-template-columns: 280px 1fr;
-      gap: 18px;
+      gap: 16px;
       align-items: center;
-    }
-
-    @media (max-width: 680px) {
-      .player-grid { grid-template-columns: 1fr; }
     }
 
     .video-box {
@@ -134,27 +145,26 @@
     .now-label {
       font-size: 0.72rem;
       text-transform: uppercase;
-      letter-spacing: 0.1em;
+      letter-spacing: 0.08em;
       color: var(--accent);
-      margin-bottom: 6px;
+      margin-bottom: 4px;
     }
 
     .track-title {
       margin: 0 0 4px 0;
-      font-size: 1.35rem;
+      font-size: 1.28rem;
       line-height: 1.3;
     }
 
     .track-artist {
-      margin: 0 0 12px 0;
+      margin: 0 0 10px 0;
       color: var(--muted);
-      font-size: 0.98rem;
+      font-size: 0.96rem;
     }
 
-    /* 1-line recommendation reason */
     .reason-line {
-      font-size: 0.84rem;
-      padding: 8px 12px;
+      font-size: 0.82rem;
+      padding: 7px 11px;
       border-radius: 10px;
       background: var(--panel-soft);
       border: 1px solid var(--border);
@@ -162,10 +172,59 @@
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      margin-bottom: 14px;
+      margin-bottom: 8px;
     }
 
-    /* Core 3 Playback/Feedback Controls (+ Station Switcher = 4 UI controls) */
+    .theory-line {
+      font-size: 0.8rem;
+      padding: 7px 11px;
+      border-radius: 10px;
+      background: rgba(167, 139, 250, 0.12);
+      border: 1px solid rgba(167, 139, 250, 0.35);
+      color: #e9d5ff;
+      margin-bottom: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .axis-chip {
+      display: inline-block;
+      font-size: 0.73rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(167, 139, 250, 0.22);
+      border: 1px solid rgba(167, 139, 250, 0.45);
+      color: #f3e8ff;
+      font-weight: 600;
+    }
+
+    .playlist-picker-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    .playlist-picker-row label {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    .select-input, .text-input {
+      background: var(--panel-soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 7px 10px;
+      font-size: 0.84rem;
+    }
+
+    .select-input { flex: 1; min-width: 150px; }
+
+    /* Controls */
     .controls {
       display: flex;
       gap: 10px;
@@ -174,19 +233,20 @@
 
     .ctrl-btn {
       flex: 1;
-      min-width: 110px;
-      padding: 12px 14px;
+      min-width: 100px;
+      min-height: 46px;
+      padding: 11px 12px;
       border-radius: 12px;
       border: 1px solid var(--border);
       background: var(--panel-soft);
       color: var(--text);
-      font-size: 0.94rem;
+      font-size: 0.92rem;
       font-weight: 600;
       cursor: pointer;
-      transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
+      transition: transform 0.1s ease, background 0.15s ease;
     }
 
-    .ctrl-btn:active { transform: scale(0.98); }
+    .ctrl-btn:active { transform: scale(0.97); }
     .ctrl-play { border-color: var(--accent); }
     .ctrl-good {
       background: rgba(34, 197, 94, 0.14);
@@ -195,7 +255,6 @@
     }
     .ctrl-good:hover { background: rgba(34, 197, 94, 0.25); }
     .ctrl-good.rated { background: var(--good); color: #052e16; }
-
     .ctrl-bad {
       background: rgba(239, 68, 68, 0.14);
       border-color: rgba(239, 68, 68, 0.55);
@@ -203,23 +262,40 @@
     }
     .ctrl-bad:hover { background: rgba(239, 68, 68, 0.26); }
 
-    /* Prefetch Queue N=3 */
-    .queue-header {
-      display: flex;
-      justify-content: space-between;
+    .post-good-bar {
+      display: none;
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(34, 197, 94, 0.1);
+      border: 1px solid rgba(34, 197, 94, 0.35);
+      gap: 6px;
+      flex-wrap: wrap;
       align-items: center;
-      margin-bottom: 10px;
-      font-size: 0.85rem;
-      color: var(--muted);
+      font-size: 0.78rem;
     }
+    .post-good-bar.visible { display: flex; }
 
+    .mini-chip-btn {
+      background: var(--panel-soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 0.76rem;
+      cursor: pointer;
+    }
+    .mini-chip-btn:hover { border-color: var(--good); }
+    .mini-chip-btn.added { background: rgba(34, 197, 94, 0.25); border-color: var(--good); }
+
+    /* Prefetch Queue */
     .queue-list {
       list-style: none;
       padding: 0;
       margin: 0;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 7px;
     }
 
     .queue-item {
@@ -227,16 +303,105 @@
       justify-content: space-between;
       align-items: center;
       gap: 10px;
-      padding: 9px 12px;
+      padding: 9px 11px;
       border-radius: 10px;
       background: var(--panel-soft);
-      font-size: 0.86rem;
+      font-size: 0.85rem;
     }
 
     .queue-meta {
       color: var(--muted);
-      font-size: 0.78rem;
+      font-size: 0.75rem;
       white-space: nowrap;
+    }
+
+    /* Music Theory DNA Bars (T1-T5) */
+    .dna-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    .dna-row {
+      display: grid;
+      grid-template-columns: 165px 1fr 44px;
+      gap: 10px;
+      align-items: center;
+      font-size: 0.81rem;
+    }
+
+    .dna-track {
+      height: 10px;
+      border-radius: 999px;
+      background: var(--panel-soft);
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+
+    .dna-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent), var(--dna));
+      transition: width 0.35s ease;
+    }
+
+    .dna-pct {
+      text-align: right;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* My Playlists Section */
+    .playlist-tabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    .pl-tab {
+      background: var(--panel-soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    .pl-tab.active {
+      background: rgba(56, 189, 248, 0.18);
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+
+    .pl-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .yt-open-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+      background: rgba(239, 68, 68, 0.16);
+      color: #fecaca;
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      border-radius: 9px;
+      padding: 7px 12px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .yt-open-btn:hover { background: rgba(239, 68, 68, 0.28); }
+
+    .pl-create-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+      flex-wrap: wrap;
     }
 
     .tiny-link {
@@ -246,6 +411,46 @@
       font-size: 0.8rem;
       cursor: pointer;
       padding: 0;
+    }
+
+    .yt-auth-row {
+      display: none;
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 0.78rem;
+    }
+    .yt-auth-row.visible { display: flex; }
+
+    /* Mobile vertical fixed bottom control bar (Android Termux + Brave) */
+    @media (max-width: 680px) {
+      body {
+        padding: 12px 10px calc(116px + env(safe-area-inset-bottom));
+      }
+      .player-grid { grid-template-columns: 1fr; }
+      .dna-row { grid-template-columns: 126px 1fr 40px; font-size: 0.76rem; }
+      .controls-bar {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 50;
+        background: rgba(14, 19, 30, 0.96);
+        backdrop-filter: blur(10px);
+        border-top: 1px solid var(--border);
+        padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+      }
+      .ctrl-btn {
+        min-height: 50px;
+        min-width: 0;
+        font-size: 0.88rem;
+        padding: 10px 8px;
+      }
     }
   </style>
 </head>
@@ -259,12 +464,12 @@
       <div class="status-pill" id="statusPill">局を読み込み中...</div>
     </header>
 
-    <!-- Control 1: Station Switcher -->
+    <!-- 5 Deep Music Theory DNA Stations -->
     <section class="card" aria-label="局切替">
       <div class="station-row" id="stationRow"></div>
     </section>
 
-    <!-- Now Playing + YouTube IFrame + Core Controls -->
+    <!-- Now Playing + YouTube IFrame + Theory DNA + Controls -->
     <section class="card">
       <div class="player-grid">
         <div class="video-box">
@@ -275,12 +480,29 @@
           <h2 class="track-title" id="trackTitle">局を選択して再生を開始</h2>
           <p class="track-artist" id="trackArtist">—</p>
           <div class="reason-line" id="reasonLine">推薦理由: 待機中</div>
+          <div class="theory-line" id="theoryLine">音楽理論DNA: 解析待機中</div>
 
-          <!-- Controls 2, 3, 4: Play/Mute, Good, BAD (Instant Next) -->
-          <div class="controls">
-            <button class="ctrl-btn ctrl-play" id="btnPlayMute" type="button">再生 / ミュート</button>
-            <button class="ctrl-btn ctrl-good" id="btnGood" type="button">👍 Good</button>
-            <button class="ctrl-btn ctrl-bad" id="btnBad" type="button">👎 BAD（即次曲）</button>
+          <div class="playlist-picker-row">
+            <label for="goodPlaylistSelect">Good保存先:</label>
+            <select id="goodPlaylistSelect" class="select-input" aria-label="Good保存先プレイリスト"></select>
+          </div>
+
+          <div class="yt-auth-row" id="ytAuthRow">
+            <span>YouTube自動同期:</span>
+            <select id="ytSyncPlaylistSelect" class="select-input" aria-label="YouTube同期先プレイリスト"></select>
+          </div>
+
+          <div class="controls-bar">
+            <div class="controls">
+              <button class="ctrl-btn ctrl-play" id="btnPlayMute" type="button">再生 / ミュート</button>
+              <button class="ctrl-btn ctrl-good" id="btnGood" type="button">👍 Good</button>
+              <button class="ctrl-btn ctrl-bad" id="btnBad" type="button">👎 BAD（即次曲）</button>
+            </div>
+          </div>
+
+          <div class="post-good-bar" id="postGoodBar">
+            <span>他プレイリストにも追加:</span>
+            <div id="postGoodChips" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
           </div>
         </div>
       </div>
@@ -288,13 +510,39 @@
 
     <!-- Rolling Prefetch Queue (N=3) -->
     <section class="card">
-      <div class="queue-header">
+      <div class="card-title">
         <span>Rolling Prefetch Queue (N=3)</span>
         <button class="tiny-link" id="btnDigMore" type="button">候補を追加ディグ</button>
       </div>
       <ul class="queue-list" id="queueList">
         <li class="queue-item"><span>キュー準備中...</span></li>
       </ul>
+    </section>
+
+    <!-- Deep Music Theory DNA Preference Bars (T1-T5) -->
+    <section class="card" aria-label="音楽理論DNAバー">
+      <div class="card-title">
+        <span>音楽理論DNAバー（T1〜T5 リアルタイム学習）</span>
+        <span id="dnaUpdatesLabel">学習 0 回</span>
+      </div>
+      <div class="dna-grid" id="dnaGrid"></div>
+    </section>
+
+    <!-- My Playlists + YouTube Export/Sync -->
+    <section class="card" aria-label="マイプレイリスト">
+      <div class="card-title">
+        <span>マイプレイリスト</span>
+        <span id="playlistCountBadge">0 曲</span>
+      </div>
+      <div class="playlist-tabs" id="playlistTabs"></div>
+      <div class="pl-actions" id="playlistActions"></div>
+      <ul class="queue-list" id="playlistTrackList">
+        <li class="queue-item"><span>Good した曲がここに保存されます</span></li>
+      </ul>
+      <div class="pl-create-row">
+        <input id="newPlaylistName" class="text-input" type="text" placeholder="新しいプレイリスト名（例: 深夜ドライブ）" style="flex:1;min-width:180px;" />
+        <button class="station-btn" id="btnCreatePlaylist" type="button">+ 新規作成</button>
+      </div>
     </section>
   </main>
 
@@ -310,14 +558,22 @@
       playerReady: false,
       consecutiveErrors: 0,
       prefetchPromise: null,
-      prefetchPromiseEpoch: -1,
       prefetchEpoch: 0,
       blockedArtists: new Set(),
       retryTimerId: null,
+      watchdogTimerId: null,
+      watchdogPollId: null,
+      playlists: [],
+      selectedGoodPlaylistId: "pl_favorites",
+      viewingPlaylistId: "pl_favorites",
+      ytAuth: { authenticated: false, playlists: [] },
+      selectedYtPlaylistId: "",
     };
 
     const MAX_CONSECUTIVE_ERRORS = 8;
     const RETRY_BACKOFF_MS = 3000;
+    const PLAYBACK_WATCHDOG_MS = 7000;
+    const WATCHDOG_MIN_PLAY_SEC = 0.3;
 
     const el = {
       statusPill: document.getElementById("statusPill"),
@@ -326,11 +582,25 @@
       trackTitle: document.getElementById("trackTitle"),
       trackArtist: document.getElementById("trackArtist"),
       reasonLine: document.getElementById("reasonLine"),
+      theoryLine: document.getElementById("theoryLine"),
       queueList: document.getElementById("queueList"),
       btnPlayMute: document.getElementById("btnPlayMute"),
       btnGood: document.getElementById("btnGood"),
       btnBad: document.getElementById("btnBad"),
       btnDigMore: document.getElementById("btnDigMore"),
+      goodPlaylistSelect: document.getElementById("goodPlaylistSelect"),
+      postGoodBar: document.getElementById("postGoodBar"),
+      postGoodChips: document.getElementById("postGoodChips"),
+      dnaGrid: document.getElementById("dnaGrid"),
+      dnaUpdatesLabel: document.getElementById("dnaUpdatesLabel"),
+      playlistTabs: document.getElementById("playlistTabs"),
+      playlistActions: document.getElementById("playlistActions"),
+      playlistTrackList: document.getElementById("playlistTrackList"),
+      playlistCountBadge: document.getElementById("playlistCountBadge"),
+      newPlaylistName: document.getElementById("newPlaylistName"),
+      btnCreatePlaylist: document.getElementById("btnCreatePlaylist"),
+      ytAuthRow: document.getElementById("ytAuthRow"),
+      ytSyncPlaylistSelect: document.getElementById("ytSyncPlaylistSelect"),
     };
 
     function setStatus(msg) {
@@ -353,6 +623,48 @@
       }
     }
 
+    function clearPlaybackWatchdog() {
+      if (state.watchdogTimerId !== null) {
+        clearTimeout(state.watchdogTimerId);
+        state.watchdogTimerId = null;
+      }
+      if (state.watchdogPollId !== null) {
+        clearInterval(state.watchdogPollId);
+        state.watchdogPollId = null;
+      }
+    }
+
+    // 7-second stall watchdog: auto-skip 0:00/0:00 stalled videos without polluting BAD bandit weights
+    function armPlaybackWatchdog(track) {
+      clearPlaybackWatchdog();
+      if (!track || !track.video_id) return;
+      const expectedVideoId = track.video_id;
+
+      state.watchdogPollId = setInterval(() => {
+        if (!state.player || !state.playerReady) return;
+        if (!state.currentTrack || state.currentTrack.video_id !== expectedVideoId) {
+          clearPlaybackWatchdog();
+          return;
+        }
+        const pState = state.player.getPlayerState();
+        const curSec = Number(state.player.getCurrentTime() || 0);
+        if (pState === YT.PlayerState.PLAYING && curSec > WATCHDOG_MIN_PLAY_SEC) {
+          state.consecutiveErrors = 0;
+          clearPlaybackWatchdog();
+        }
+      }, 500);
+
+      state.watchdogTimerId = setTimeout(async () => {
+        clearPlaybackWatchdog();
+        if (!state.currentTrack || state.currentTrack.video_id !== expectedVideoId) return;
+        const pState = state.player && state.playerReady ? state.player.getPlayerState() : -1;
+        const curSec = state.player && state.playerReady ? Number(state.player.getCurrentTime() || 0) : 0;
+        if (pState === YT.PlayerState.PLAYING && curSec > WATCHDOG_MIN_PLAY_SEC) return;
+
+        await handleUnplayableSkip(state.currentTrack, "stall_watchdog_7s", null);
+      }, PLAYBACK_WATCHDOG_MS);
+    }
+
     function scheduleQueueRetry() {
       if (state.retryTimerId !== null || !state.activeStationId) return;
       const stationAtSchedule = state.activeStationId;
@@ -370,6 +682,39 @@
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+    }
+
+    function updateMediaSession(track) {
+      if (!("mediaSession" in navigator) || !track) return;
+      const st = state.stations.find((s) => s.station_id === state.activeStationId);
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: track.title || "Hidden Gem",
+          artist: track.artist || "Unknown Artist",
+          album: st ? st.name : "Hidden Gem Radio",
+          artwork: track.video_id
+            ? [{ src: `https://i.ytimg.com/vi/${track.video_id}/hqdefault.jpg`, sizes: "480x360", type: "image/jpeg" }]
+            : [],
+        });
+      } catch (_) {}
+    }
+
+    function initMediaSessionHandlers() {
+      if (!("mediaSession" in navigator)) return;
+      try {
+        navigator.mediaSession.setActionHandler("play", () => {
+          if (state.player && state.playerReady) state.player.playVideo();
+        });
+        navigator.mediaSession.setActionHandler("pause", () => {
+          if (state.player && state.playerReady) state.player.pauseVideo();
+        });
+        navigator.mediaSession.setActionHandler("nexttrack", () => {
+          playNextFromQueue();
+        });
+        navigator.mediaSession.setActionHandler("stop", () => {
+          if (state.player && state.playerReady) state.player.pauseVideo();
+        });
+      } catch (_) {}
     }
 
     function renderStations() {
@@ -391,13 +736,15 @@
       }
       el.queueList.innerHTML = state.queue
         .slice(0, 3)
-        .map(
-          (item, i) => `
+        .map((item, i) => {
+          const topAx = item.theory_explanation?.top_axes?.[0];
+          const axLabel = topAx ? `${topAx.axis}:${topAx.label}` : (item.reason?.mode || "探索");
+          return `
           <li class="queue-item">
             <span>#${i + 1} ${escapeHtml(item.artist)} — ${escapeHtml(item.title)}</span>
-            <span class="queue-meta">${escapeHtml(item.reason?.mode || "探索")} · ${escapeHtml(item.reason?.hidden_level || "")}</span>
-          </li>`
-        )
+            <span class="queue-meta">${escapeHtml(axLabel)} · ${escapeHtml(item.reason?.hidden_level || "")}</span>
+          </li>`;
+        })
         .join("");
     }
 
@@ -406,12 +753,48 @@
         el.trackTitle.textContent = "再生可能な候補を取得中...";
         el.trackArtist.textContent = "自動で再試行します（手動は「候補を追加ディグ」）";
         el.reasonLine.textContent = "推薦理由: 候補プール待機中";
+        el.theoryLine.textContent = "音楽理論DNA: 待機中";
+        el.postGoodBar.classList.remove("visible");
         return;
       }
       el.trackTitle.textContent = track.title;
       el.trackArtist.textContent = track.artist;
       el.reasonLine.textContent = track.reason?.summary || "探索 | 隠れ名曲候補";
+
+      const exp = track.theory_explanation;
+      if (exp && Array.isArray(exp.top_axes) && exp.top_axes.length) {
+        const chips = exp.top_axes
+          .map((a) => `<span class="axis-chip">${escapeHtml(a.axis)} ${escapeHtml(a.label)} ${Math.round(a.score * 100)}%</span>`)
+          .join("");
+        el.theoryLine.innerHTML = `${chips} <span>${escapeHtml(exp.summary || "")}</span>`;
+      } else {
+        el.theoryLine.textContent = "音楽理論DNA: 解析中";
+      }
+
       el.btnGood.classList.toggle("rated", state.currentRatedGood);
+      el.postGoodBar.classList.toggle("visible", state.currentRatedGood);
+      updateMediaSession(track);
+    }
+
+    function renderPostGoodChips() {
+      if (!state.currentTrack) return;
+      el.postGoodChips.innerHTML = "";
+      for (const pl of state.playlists) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "mini-chip-btn" + (pl.playlist_id === state.selectedGoodPlaylistId ? " added" : "");
+        btn.textContent = pl.name;
+        btn.onclick = async () => {
+          if (!state.currentTrack) return;
+          try {
+            await addTrackToLocalPlaylist(pl.playlist_id, state.currentTrack);
+            btn.classList.add("added");
+            setStatus(`「${pl.name}」に追加しました`);
+            await loadPlaylists();
+          } catch (_) {}
+        };
+        el.postGoodChips.appendChild(btn);
+      }
     }
 
     async function fetchJson(url, options) {
@@ -442,7 +825,7 @@
           ].join(",");
           const need = Math.max(1, targetSize - state.queue.length);
           const data = await fetchJson(
-            `/queue/next?station_id=${encodeURIComponent(stationId)}&count=${need}&exclude=${encodeURIComponent(exclude)}`
+            `/api/stations/${encodeURIComponent(stationId)}/batch?count=${need}&exclude=${encodeURIComponent(exclude)}`
           );
           if (state.activeStationId !== stationId || state.prefetchEpoch !== requestEpoch) return;
           for (const item of data.items || []) {
@@ -460,16 +843,15 @@
         } finally {
           if (state.prefetchPromise === currentPromise) {
             state.prefetchPromise = null;
-            state.prefetchPromiseEpoch = -1;
           }
         }
       })();
       state.prefetchPromise = currentPromise;
-      state.prefetchPromiseEpoch = requestEpoch;
       await currentPromise;
     }
 
     function playTrack(track) {
+      clearPlaybackWatchdog();
       state.currentTrack = track;
       state.currentRatedGood = false;
       renderNowPlaying(track);
@@ -480,10 +862,10 @@
         if (state.player && state.playerReady) {
           state.player.loadVideoById(track.video_id);
           setStatus("ON AIR");
+          armPlaybackWatchdog(track);
         }
         ensurePrefetchQueue(3);
       } else {
-        // [M2] Never stall permanently on null: retry with 3-second backoff
         scheduleQueueRetry();
       }
     }
@@ -494,6 +876,39 @@
       }
       const next = state.queue.shift() || null;
       playTrack(next);
+    }
+
+    async function handleUnplayableSkip(failedTrack, reason, ytErrorCode) {
+      clearPlaybackWatchdog();
+      state.consecutiveErrors += 1;
+      if (failedTrack && failedTrack.video_id) {
+        try {
+          const res = await fetchJson(`/api/tracks/${encodeURIComponent(failedTrack.video_id)}/unplayable`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              station_id: state.activeStationId,
+              track_id: failedTrack.track_id,
+              reason,
+              yt_error_code: ytErrorCode,
+            }),
+          });
+          if (res?.replacement && !state.queue.some((q) => q.track_id === res.replacement.track_id)) {
+            const artistNorm = normalizeArtistName(res.replacement.artist);
+            if (!artistNorm || !state.blockedArtists.has(artistNorm)) {
+              state.queue.unshift(res.replacement);
+            }
+          }
+        } catch (_) {}
+      }
+      if (state.consecutiveErrors <= MAX_CONSECUTIVE_ERRORS) {
+        setStatus("再生不可を自動スキップ（学習非汚染）");
+        await playNextFromQueue();
+      } else {
+        state.currentTrack = null;
+        state.consecutiveErrors = 0;
+        scheduleQueueRetry();
+      }
     }
 
     async function sendFeedback(eventType, extra = {}) {
@@ -520,8 +935,25 @@
       });
     }
 
+    async function addTrackToLocalPlaylist(playlistId, track) {
+      return fetchJson(`/api/playlists/${encodeURIComponent(playlistId)}/tracks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_id: track.video_id,
+          track_id: track.track_id,
+          artist: track.artist,
+          title: track.title,
+          station_id: state.activeStationId,
+          sync_youtube: Boolean(state.ytAuth.authenticated && state.selectedYtPlaylistId),
+          youtube_playlist_id: state.selectedYtPlaylistId || null,
+        }),
+      });
+    }
+
     async function switchStation(stationId) {
       clearRetryTimer();
+      clearPlaybackWatchdog();
       state.activeStationId = stationId;
       state.queue = [];
       state.currentTrack = null;
@@ -529,11 +961,11 @@
       state.blockedArtists = new Set();
       state.prefetchEpoch += 1;
       state.prefetchPromise = null;
-      state.prefetchPromiseEpoch = -1;
       const st = state.stations.find((s) => s.station_id === stationId);
       el.stationLabel.textContent = st ? `ON AIR · ${st.name}` : "ON AIR";
       renderStations();
       setStatus("チューニング中...");
+      refreshTheoryProfile();
       await ensurePrefetchQueue(3);
       await playNextFromQueue();
     }
@@ -555,43 +987,30 @@
             state.playerReady = true;
             if (state.currentTrack) {
               state.player.loadVideoById(state.currentTrack.video_id);
+              armPlaybackWatchdog(state.currentTrack);
             }
           },
           onStateChange: async (event) => {
             if (event.data === YT.PlayerState.PLAYING) {
-              state.consecutiveErrors = 0;
               updatePlayMuteButton();
+              if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
             } else if (event.data === YT.PlayerState.PAUSED) {
               updatePlayMuteButton();
+              if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
             } else if (event.data === YT.PlayerState.ENDED) {
+              clearPlaybackWatchdog();
               if (!state.currentRatedGood) {
                 try {
                   await sendFeedback("COMPLETE");
+                  refreshTheoryProfile();
                 } catch (_) {}
               }
               await playNextFromQueue();
             }
           },
           onError: async (event) => {
-            // Silent auto-fallback: never display an error popup; flag unplayable (100/101/150) and advance
-            state.consecutiveErrors += 1;
-            const failed = state.currentTrack;
-            if (failed) {
-              try {
-                const res = await sendFeedback("UNPLAYABLE", { yt_error_code: event.data });
-                if (res?.replacement && !state.queue.some((q) => q.track_id === res.replacement.track_id)) {
-                  state.queue.unshift(res.replacement);
-                }
-              } catch (_) {}
-            }
-            if (state.consecutiveErrors <= MAX_CONSECUTIVE_ERRORS) {
-              setStatus("次曲へ自動切替...");
-              await playNextFromQueue();
-            } else {
-              state.currentTrack = null;
-              state.consecutiveErrors = 0;
-              scheduleQueueRetry();
-            }
+            // Silent auto-skip for YT error codes (2, 5, 100, 101, 150) without polluting BAD learning
+            await handleUnplayableSkip(state.currentTrack, `yt_error_${event.data}`, event.data);
           },
         },
       });
@@ -603,13 +1022,12 @@
       if (pState !== YT.PlayerState.PLAYING) {
         el.btnPlayMute.textContent = "▶ 再生";
       } else if (state.player.isMuted()) {
-        el.btnPlayMute.textContent = "🔊 ミュート解除";
+        el.btnPlayMute.textContent = "🔊 解除";
       } else {
         el.btnPlayMute.textContent = "🔇 ミュート";
       }
     }
 
-    // Control 2: Play / Mute
     el.btnPlayMute.addEventListener("click", () => {
       if (!state.player || !state.playerReady) return;
       const pState = state.player.getPlayerState();
@@ -623,35 +1041,50 @@
       setTimeout(updatePlayMuteButton, 150);
     });
 
-    // Control 3: Good (+1.0 reward, keep playing)
+    el.goodPlaylistSelect.addEventListener("change", () => {
+      state.selectedGoodPlaylistId = el.goodPlaylistSelect.value;
+    });
+
+    el.ytSyncPlaylistSelect.addEventListener("change", () => {
+      state.selectedYtPlaylistId = el.ytSyncPlaylistSelect.value;
+    });
+
+    // Good (+1.0 theory reward + save to selected playlist + optional YouTube sync)
     el.btnGood.addEventListener("click", async () => {
       if (!state.currentTrack || state.currentRatedGood) return;
       state.currentRatedGood = true;
       el.btnGood.classList.add("rated");
+      el.postGoodBar.classList.add("visible");
+      renderPostGoodChips();
       try {
-        const res = await sendFeedback("GOOD");
-        setStatus(`👍 学習反映 (更新 #${res?.model_updates ?? ""})`);
+        const res = await sendFeedback("GOOD", {
+          playlist_id: state.selectedGoodPlaylistId,
+          youtube_playlist_id: state.selectedYtPlaylistId || null,
+        });
+        setStatus(`👍 DNA学習 & 保存完了 (更新 #${res?.model_updates ?? ""})`);
+        await Promise.all([refreshTheoryProfile(), loadPlaylists()]);
       } catch (_) {}
     });
 
-    // Control 4: BAD (0.0 reward + block artist + invalidate in-flight prefetch + evict from queue + instant skip)
+    // BAD (-1.0 theory reward + block artist + invalidate in-flight prefetch + instant skip)
     el.btnBad.addEventListener("click", async () => {
       if (!state.currentTrack) return;
+      clearPlaybackWatchdog();
       const badArtistNorm = normalizeArtistName(state.currentTrack.artist);
       if (badArtistNorm) {
         state.blockedArtists.add(badArtistNorm);
       }
       state.prefetchEpoch += 1;
       state.prefetchPromise = null;
-      state.prefetchPromiseEpoch = -1;
       state.queue = state.queue.filter(
         (item) => !state.blockedArtists.has(normalizeArtistName(item.artist))
       );
       renderQueue();
       try {
         await sendFeedback("BAD");
+        refreshTheoryProfile();
       } catch (_) {}
-      setStatus("👎 学習反映 · 次曲へ");
+      setStatus("👎 DNA学習反映 · 次曲へ");
       await playNextFromQueue();
     });
 
@@ -668,6 +1101,129 @@
       }
     });
 
+    el.btnCreatePlaylist.addEventListener("click", async () => {
+      const name = el.newPlaylistName.value.trim();
+      if (!name) return;
+      try {
+        const res = await fetchJson("/api/playlists", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        el.newPlaylistName.value = "";
+        if (res?.playlist?.playlist_id) {
+          state.selectedGoodPlaylistId = res.playlist.playlist_id;
+          state.viewingPlaylistId = res.playlist.playlist_id;
+        }
+        await loadPlaylists();
+        setStatus(`プレイリスト「${name}」を作成`);
+      } catch (_) {}
+    });
+
+    async function refreshTheoryProfile() {
+      try {
+        const qs = state.activeStationId ? `?station_id=${encodeURIComponent(state.activeStationId)}` : "";
+        const prof = await fetchJson(`/api/profile/theory${qs}`);
+        el.dnaUpdatesLabel.textContent = `学習 ${prof.updates || 0} 回`;
+        el.dnaGrid.innerHTML = (prof.axes || [])
+          .map((ax) => {
+            const pct = Math.round(Number(ax.score || 0) * 100);
+            return `
+            <div class="dna-row">
+              <span><strong>${escapeHtml(ax.axis)}</strong> ${escapeHtml(ax.label_ja)}</span>
+              <div class="dna-track"><div class="dna-fill" style="width:${pct}%"></div></div>
+              <span class="dna-pct">${pct}%</span>
+            </div>`;
+          })
+          .join("");
+      } catch (_) {}
+    }
+
+    async function loadPlaylists() {
+      try {
+        const data = await fetchJson("/api/playlists");
+        state.playlists = data.playlists || [];
+        if (!state.playlists.some((p) => p.playlist_id === state.selectedGoodPlaylistId) && state.playlists.length) {
+          state.selectedGoodPlaylistId = state.playlists[0].playlist_id;
+        }
+        if (!state.playlists.some((p) => p.playlist_id === state.viewingPlaylistId) && state.playlists.length) {
+          state.viewingPlaylistId = state.playlists[0].playlist_id;
+        }
+
+        el.goodPlaylistSelect.innerHTML = state.playlists
+          .map((p) => `<option value="${escapeHtml(p.playlist_id)}">${escapeHtml(p.name)} (${p.track_count})</option>`)
+          .join("");
+        el.goodPlaylistSelect.value = state.selectedGoodPlaylistId;
+
+        el.playlistTabs.innerHTML = "";
+        for (const pl of state.playlists) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "pl-tab" + (pl.playlist_id === state.viewingPlaylistId ? " active" : "");
+          btn.textContent = `${pl.name} (${pl.track_count})`;
+          btn.onclick = () => {
+            state.viewingPlaylistId = pl.playlist_id;
+            loadPlaylists();
+          };
+          el.playlistTabs.appendChild(btn);
+        }
+
+        if (state.viewingPlaylistId) {
+          await renderViewingPlaylist(state.viewingPlaylistId);
+        }
+        if (state.currentRatedGood) {
+          renderPostGoodChips();
+        }
+      } catch (_) {}
+    }
+
+    async function renderViewingPlaylist(playlistId) {
+      const detail = await fetchJson(`/api/playlists/${encodeURIComponent(playlistId)}/tracks`);
+      el.playlistCountBadge.textContent = `${detail.track_count || 0} 曲`;
+      const urls = detail.youtube_watch_urls || [];
+      if (urls.length) {
+        el.playlistActions.innerHTML = urls
+          .map(
+            (u, idx) =>
+              `<a class="yt-open-btn" href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer">▶ YouTube でプレイリストを開く${urls.length > 1 ? ` (${idx + 1})` : ""}</a>`
+          )
+          .join("");
+      } else {
+        el.playlistActions.innerHTML = '<span style="font-size:0.78rem;color:var(--muted);">曲を追加すると「YouTube でプレイリストを開く」リンクが生成されます</span>';
+      }
+
+      const tracks = detail.tracks || [];
+      if (!tracks.length) {
+        el.playlistTrackList.innerHTML = '<li class="queue-item"><span>まだ曲がありません。気に入った曲で 👍 Good を押してください。</span></li>';
+        return;
+      }
+      el.playlistTrackList.innerHTML = tracks
+        .slice(0, 50)
+        .map(
+          (t) => `
+          <li class="queue-item">
+            <span>${escapeHtml(t.artist)} — ${escapeHtml(t.title)}</span>
+            <a class="tiny-link" href="https://www.youtube.com/watch?v=${encodeURIComponent(t.video_id)}" target="_blank" rel="noopener noreferrer">YT</a>
+          </li>`
+        )
+        .join("");
+    }
+
+    async function loadYouTubeAuthPlaylists() {
+      try {
+        const res = await fetchJson("/api/youtube/playlists");
+        state.ytAuth = res;
+        if (res.authenticated && Array.isArray(res.playlists) && res.playlists.length) {
+          el.ytSyncPlaylistSelect.innerHTML =
+            '<option value="">同期なし（ローカルのみ）</option>' +
+            res.playlists
+              .map((p) => `<option value="${escapeHtml(p.playlist_id)}">${escapeHtml(p.title)}</option>`)
+              .join("");
+          el.ytAuthRow.classList.add("visible");
+        }
+      } catch (_) {}
+    }
+
     async function loadStations(autoTune = true) {
       const data = await fetchJson("/stations");
       state.stations = data.stations || [];
@@ -677,7 +1233,10 @@
       }
     }
 
-    loadStations(true).catch(() => setStatus("サーバー接続待ち"));
+    initMediaSessionHandlers();
+    Promise.all([loadStations(true), loadPlaylists(), loadYouTubeAuthPlaylists(), refreshTheoryProfile()]).catch(() =>
+      setStatus("サーバー接続待ち")
+    );
   </script>
 </body>
 </html>

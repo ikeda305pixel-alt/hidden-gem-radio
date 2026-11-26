@@ -1,5 +1,7 @@
 # Sensitive personal data & auth (MUST NOT be committed)
 config/browser.json
+data/browser.json
+data/oauth.json
 data/watch-history.json
 
 # Runtime state (SQLite DB & bandit model weights)
@@ -7,6 +9,7 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.pkl
+data/*.pkl.bak
 
 # Python / Test artifacts
 __pycache__/

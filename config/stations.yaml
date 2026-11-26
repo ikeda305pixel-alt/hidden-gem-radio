@@ -1,40 +1,243 @@
 meta:
-  generated_at: '2026-11-25T13:21:35.226940+00:00'
+  generated_at: '2026-11-26T02:43:20.584901+00:00'
   sources_used:
   - default_seed_fallback
   records_imported: 0
   fallback_used: true
+  theory_profile: /home/antigravity/ikeda305pixel-alt/hidden-gem-radio/config/music_theory_profile.yaml
 stations:
-- station_id: melodic_folktronica_gems
-  name: Melodic House & Folktronica Gems
+- station_id: us_hiphop_bouncy
+  name: US Hip-Hop & Bouncy Rap
   seed_tags:
-  - melodic progressive house
-  - folktronica
-  - indietronica
+  - hip hop
+  - bouncy rap
+  - trap
+  - melodic hip hop
   seed_artists:
-  - Avicii
-  - Oberhofer
+  - bbno$
+  - Migos
+  - J. Cole
+  - Lil Durk
+  - KYLE
+  - Macklemore
+  - Lupe Fiasco
+  - Drake
+  - Eminem
+  max_popularity_views: 500000
+  exploration_rate: 0.95
+  target_theory_vector:
+    T1: 0.55
+    T2: 0.9
+    T3: 0.78
+    T4: 0.5
+    T5: 0.88
+  bpm_zones:
+  - 95-115
+  - 125-160
+  theory_archetypes:
+  - harmonic_minor_i_V7
+  - bouncy_808_tresillo
+  - stratified_flow_hook
+  spotify_anchor_seeds:
+  - bbno$ - edamame
+  - bbno$ - bag or die
+  - Migos - Bad and Boujee
+  - J. Cole - ATM
+  - Lil Durk - All My Life
+  - KYLE - iSpy
+  - Macklemore - Marmalade
+  - Lupe Fiasco - The Show Goes On
+  - Drake - In My Feelings
+  - Eminem - The Monster
+  discovery_queries:
+  - bouncy hip hop underground rap 808 groove
+  - bbno$ Yung Gravy Amine similar underground rap
+  - melodic bouncy trap hip hop hidden gem
+- station_id: japan_hiphop_street
+  name: Japan Hip-Hop & Street
+  seed_tags:
+  - japanese hip hop
+  - j-rap
+  - trap
+  - street rap
+  seed_artists:
+  - BAD HOP
+  - ZORN
+  - JJJ
+  - KID FRESINO
+  - Awich
+  - YZERR
   max_popularity_views: 500000
   exploration_rate: 1.0
-- station_id: indietronica_dream_cuts
-  name: Indietronica & Dream Pop Deep Cuts
-  seed_tags:
-  - indietronica
-  - dream pop
-  - downtempo
-  seed_artists:
-  - Oberhofer
-  - Four Tet
-  max_popularity_views: 350000
-  exploration_rate: 1.2
-- station_id: progressive_organic_house
-  name: Melodic Progressive & Organic Electronic
+  target_theory_vector:
+    T1: 0.65
+    T2: 0.75
+    T3: 0.82
+    T4: 0.72
+    T5: 0.85
+  bpm_zones:
+  - 85-105
+  - 130-158
+  theory_archetypes:
+  - melancholic_minor_loop
+  - halftime_trap_anthem
+  - high_density_rhyme_groove
+  spotify_anchor_seeds:
+  - BAD HOP - Hood Gospel
+  discovery_queries:
+  - Japanese hip hop underground melodic trap
+  - BAD HOP YZERR ZORN similar Japanese rap
+  - 邦ラップ メロウ ストリート ヒップホップ
+- station_id: edm_dance_party
+  name: EDM & Dance Party
   seed_tags:
   - melodic progressive house
-  - organic house
-  - deep house
+  - uk garage
+  - dance pop
+  - house
   seed_artists:
   - Avicii
-  - Bonobo
+  - David Guetta
+  - Calvin Harris
+  - Chrystal
+  - NOTION
+  - SAINt JHN
+  - Tiesto
+  - Major Lazer
+  - Jax Jones
   max_popularity_views: 500000
   exploration_rate: 0.9
+  target_theory_vector:
+    T1: 0.92
+    T2: 0.88
+    T3: 0.75
+    T4: 0.85
+    T5: 0.95
+  bpm_zones:
+  - 118-138
+  theory_archetypes:
+  - absent_emergent_tonic
+  - four_on_floor_sidechain
+  - ukg_2step_drive
+  - tresillo_drop
+  spotify_anchor_seeds:
+  - Avicii - Gonna Love Ya
+  - Avicii - What Would I Change It To
+  - David Guetta & Avicii - Sunshine
+  - Calvin Harris - Feel So Close
+  - Chrystal - The Days (NOTION Remix)
+  - SAINt JHN - Roses (Imanbek Remix)
+  - Tiesto - Red Lights
+  - David Guetta - Hey Mama
+  - Major Lazer - Lean On
+  - Jax Jones - Instruction
+  - Black Eyed Peas - I Gotta Feeling
+  - Madism - Pumped Up Kicks
+  - Katy Perry - Last Friday Night
+  discovery_queries:
+  - melodic progressive house UKG 2-step remix hidden gem
+  - NOTION Imanbek Jax Jones similar dance house
+  - euphoric melodic house vocal drop underground
+- station_id: melodic_rap_alt
+  name: Melodic Rap & Alt-Pop
+  seed_tags:
+  - melodic rap
+  - emo rap
+  - alt-pop
+  - pop punk
+  seed_artists:
+  - Lil Peep
+  - Juice WRLD
+  - Post Malone
+  - The Kid LAROI
+  - 24kGoldn
+  - blackbear
+  - iann dior
+  - mgk
+  - Jeremy Zucker
+  max_popularity_views: 500000
+  exploration_rate: 1.05
+  target_theory_vector:
+    T1: 0.78
+    T2: 0.62
+    T3: 0.7
+    T4: 0.96
+    T5: 0.84
+  bpm_zones:
+  - 130-170
+  theory_archetypes:
+  - valence_contrast_major_emo
+  - halftime_trap_guitar
+  - stratified_to_unified_chorus
+  spotify_anchor_seeds:
+  - Lil Peep - Better Off (Dying)
+  - Juice WRLD - Lucid Dreams
+  - Juice WRLD - Come & Go
+  - Post Malone - Sunflower
+  - The Kid LAROI - STAY
+  - 24kGoldn - Mood
+  - blackbear - hot girl bummer
+  - blackbear - do re mi
+  - iann dior - Holding On
+  - mgk - my ex's best friend
+  - Jeremy Zucker - comethru
+  discovery_queries:
+  - melodic emo rap guitar trap underground hidden gem
+  - iann dior blackbear Jeremy Zucker similar alt-pop
+  - bright guitar chord sad vocal melodic rap
+- station_id: indie_groove_hooks
+  name: Indie Groove & Feel-Good
+  seed_tags:
+  - indie pop
+  - folktronica
+  - indietronica
+  - nu-disco
+  - funk pop
+  seed_artists:
+  - Royel Otis
+  - Oberhofer
+  - Foster The People
+  - Fitz and The Tantrums
+  - Hozier
+  - imase
+  - Earth Wind & Fire
+  - Surfaces
+  - Dominic Fike
+  - DOPE LEMON
+  - Phoenix
+  - Bastille
+  - Walk the Moon
+  max_popularity_views: 500000
+  exploration_rate: 1.0
+  target_theory_vector:
+    T1: 0.88
+    T2: 0.86
+    T3: 0.85
+    T4: 0.8
+    T5: 0.86
+  bpm_zones:
+  - 100-125
+  - 160-172
+  theory_archetypes:
+  - dorian_dual_axis
+  - royal_road_secondary_dom
+  - slash_chord_groove
+  - absent_tonic_funk
+  spotify_anchor_seeds:
+  - Royel Otis - Oysters In My Pocket
+  - Oberhofer - Gold
+  - Foster The People - Pumped Up Kicks
+  - Fitz and The Tantrums - Out of My League
+  - Hozier - Too Sweet
+  - imase - NIGHT DANCER
+  - Earth Wind & Fire - September
+  - Surfaces - Sunday Best
+  - Dominic Fike - 3 Nights
+  - DOPE LEMON - Marinade
+  - Phoenix - Girlfriend
+  - Bastille - Pompeii
+  - Walk the Moon - Shut Up and Dance
+  discovery_queries:
+  - indie funk groove feel good bassline hidden gem
+  - Royel Otis DOPE LEMON Parcels Oberhofer similar indie
+  - dorian indie pop nu-disco bouncy bassline
