@@ -1,4 +1,16 @@
-"""Stage 2 Contextual Bandit Re-ranker using MABWiser LinUCB + 10-dim Deep Music Theory DNA."""
+"""Stage 2 Precision Scoring & Stage 3 Re-Ranking with Per-Station 3-Layer Stable MIR Learning.
+
+Per-station completely isolated 3-layer effective preference synthesis:
+    W_effective[s] = 0.75 * W_calibrated_anchor[s] + 0.20 * W_slow_learned[s] + 0.05 * W_session_mood[s]
+
+Bounded slow learning rule (prevents single-click drift or cross-station bleed):
+  - GOOD: +1.0, BAD: -1.0, COMPLETE (>=70%): +0.35, EARLY_SKIP (<15s): -0.40
+  - lr = 0.03, per-step change clipped to [-0.02, +0.02], L2 pull toward calibrated anchor.
+
+Stage 3 Re-Ranking:
+  - Enforces 5-track recent artist cooldown (no duplicate artist in last 5 tracks).
+  - Balances 80% Exploitation (high-score semi-classics / hidden gems) + 20% Exploration (co-occurring cult/chic gems).
+"""
 
 from __future__ import annotations
 
@@ -17,7 +29,14 @@ from typing import Any
 import numpy as np
 from mabwiser.mab import MAB, LearningPolicy
 
+from src.db import RadioDatabase
 from src.models import RankedCandidate, StationConfig, TrackEntity, normalize_artist
+from src.recommender.audio_mir import (
+    MIR_DIM,
+    AudioMIRExtractor,
+    summarize_4_layers,
+)
+from src.recommender.calibrate_profile import default_station_profile_vectors
 from src.recommender.theory_features import (
     THEORY_AXIS_KEYS,
     AudioTheorySignal,
@@ -30,8 +49,18 @@ _OOV_TAG_BUCKETS = 8
 _DECADE_BUCKETS = 6  # <1990, 1990s, 2000s, 2010s, 2020s+, unknown
 _VIEW_BUCKETS = 5    # <10k, 10k-50k, 50k-200k, 200k-500k, >=500k/unknown
 _TIME_BUCKETS = 4    # morning, afternoon, evening, late_night
-_WATCH_PLAYLIST_SOURCES = {"watch_playlist", "ytmusic_watch_playlist"}
+_WATCH_PLAYLIST_SOURCES = {"watch_playlist", "ytmusic_watch_playlist", "related_artist_deep_cut"}
 THEORY_CONTEXT_DIM = 10
+
+# 3-layer stable synthesis coefficients
+ALPHA_ANCHOR = 0.75
+ALPHA_SLOW = 0.20
+ALPHA_SESSION = 0.05
+
+# Bounded slow-learning hyperparameters
+SLOW_LR = 0.03
+SLOW_STEP_CLIP = 0.02
+SLOW_L2_ANCHOR = 0.02
 
 
 def _hash_bucket(text: str, num_buckets: int) -> int:
@@ -42,14 +71,16 @@ def _hash_bucket(text: str, num_buckets: int) -> int:
 def _hidden_level(view_count: int | None, max_popularity_views: int) -> str:
     if view_count is None:
         return "発掘"
+    if 300_000 <= view_count <= 50_000_000:
+        return "S (名曲スイートスポット)"
     ratio = view_count / max(1, max_popularity_views)
-    if view_count <= 20_000 or ratio <= 0.05:
-        return "S (超穴場)"
-    if view_count <= 100_000 or ratio <= 0.25:
+    if view_count < 100_000:
+        return "C (極小・要検証)"
+    if view_count < 300_000 or ratio <= 0.25:
         return "A (隠れ名曲)"
-    if view_count <= 300_000 or ratio <= 0.65:
-        return "B (準穴場)"
-    return "C (注目圏)"
+    if view_count <= 500_000_000:
+        return "B (準定番)"
+    return "C (超定番)"
 
 
 def _sigmoid(x: float) -> float:
@@ -58,7 +89,7 @@ def _sigmoid(x: float) -> float:
 
 
 class ContextualBanditRecommender:
-    """Per-station Contextual Bandit (MABWiser LinUCB) integrating 10-dim Deep Music Theory DNA."""
+    """Per-station 3-layer stable MIR + MABWiser LinUCB scorer and Stage 3 re-ranker."""
 
     def __init__(
         self,
@@ -69,6 +100,8 @@ class ContextualBanditRecommender:
         seed: int = 42,
         station_config: StationConfig | None = None,
         theory_extractor: TheoryFeatureExtractor | None = None,
+        mir_extractor: AudioMIRExtractor | None = None,
+        db: RadioDatabase | None = None,
     ) -> None:
         self.station_id = station_id
         self.seed_tags = [t.strip().lower() for t in seed_tags if t and t.strip()]
@@ -78,15 +111,27 @@ class ContextualBanditRecommender:
         self.seed = int(seed)
         self.station_config = station_config
         self.theory_extractor = theory_extractor or TheoryFeatureExtractor()
+        self.db = db
+        self.mir_extractor = mir_extractor or AudioMIRExtractor(db=db)
         self._lock = threading.Lock()
 
-        # Primary tag/metadata LinUCB model (preserves full backward compatibility)
+        # Per-station completely isolated 16-dim 3-layer profile state
+        default_centroid, default_axis_w = default_station_profile_vectors(station_id)
+        self._w_anchor = default_centroid.copy()
+        self._axis_weights = default_axis_w.copy()
+        self._w_slow = default_centroid.copy()
+        self._w_session = default_centroid.copy()
+        self._calibrated_from_db = False
+        self._sample_counts: dict[str, int] = {}
+        self._load_calibrated_profile_locked()
+
+        # Primary tag/metadata LinUCB model (preserves backward compatibility)
         self._mab = MAB(
             arms=["play"],
             learning_policy=LearningPolicy.LinUCB(alpha=self.exploration_rate),
             seed=self.seed,
         )
-        # 10-dimensional Deep Music Theory DNA LinUCB model (GOOD=+1.0, BAD=-1.0)
+        # 10-dimensional Theory DNA LinUCB model
         self._theory_mab = MAB(
             arms=["play"],
             learning_policy=LearningPolicy.LinUCB(alpha=self.exploration_rate),
@@ -95,6 +140,53 @@ class ContextualBanditRecommender:
         self._n_updates = 0
         self._theory_n_updates = 0
         self._load_if_exists()
+
+    def _load_calibrated_profile_locked(self) -> None:
+        if self.db is None:
+            return
+        prof = self.db.get_station_profile(self.station_id)
+        if not prof:
+            return
+        centroid = prof.get("centroid") or []
+        axis_w = prof.get("axis_weights") or []
+        slow_w = prof.get("slow_weights") or []
+        if len(centroid) == MIR_DIM and len(axis_w) == MIR_DIM:
+            self._w_anchor = np.asarray(centroid, dtype=np.float64)
+            self._axis_weights = np.asarray(axis_w, dtype=np.float64)
+            self._w_slow = (
+                np.asarray(slow_w, dtype=np.float64)
+                if len(slow_w) == MIR_DIM
+                else self._w_anchor.copy()
+            )
+            self._w_session = self._w_anchor.copy()
+            self._calibrated_from_db = True
+            self._sample_counts = dict(prof.get("sample_counts") or {})
+
+    def reload_calibrated_profile(self) -> None:
+        """Reload calibrated anchor & consistency axis weights from SQLite without losing slow state."""
+        with self._lock:
+            self._load_calibrated_profile_locked()
+
+    def get_effective_weights(self) -> np.ndarray:
+        """Return W_effective[s] = 0.75 * W_anchor + 0.20 * W_slow + 0.05 * W_session."""
+        with self._lock:
+            return (
+                ALPHA_ANCHOR * self._w_anchor
+                + ALPHA_SLOW * self._w_slow
+                + ALPHA_SESSION * self._w_session
+            ).copy()
+
+    def get_slow_weights(self) -> np.ndarray:
+        with self._lock:
+            return self._w_slow.copy()
+
+    def get_calibrated_anchor(self) -> np.ndarray:
+        with self._lock:
+            return self._w_anchor.copy()
+
+    def get_axis_weights(self) -> np.ndarray:
+        with self._lock:
+            return self._axis_weights.copy()
 
     @property
     def n_updates(self) -> int:
@@ -115,7 +207,7 @@ class ContextualBanditRecommender:
             + _VIEW_BUCKETS
             + _TIME_BUCKETS
             + 1  # is_new_artist
-            + 1  # is_watch_playlist_source ([C2] tagless Watch Playlist indicator)
+            + 1  # is_watch_playlist_source
             + 1  # intercept bias
         )
 
@@ -143,7 +235,7 @@ class ContextualBanditRecommender:
             listen_seconds is not None
             and duration_seconds is not None
             and duration_seconds > 0
-            and (listen_seconds / duration_seconds) >= 0.8
+            and (listen_seconds / duration_seconds) >= 0.7
         ):
             return 0.7
         if ev == "ENDED":
@@ -156,31 +248,33 @@ class ContextualBanditRecommender:
         listen_seconds: float | None = None,
         duration_seconds: float | None = None,
     ) -> float:
-        """Signed reward for 10-dim Theory DNA online learning: GOOD=+1.0, BAD=-1.0."""
+        """Signed reward for Theory DNA / MIR online learning:
+        GOOD=+1.0, BAD=-1.0, COMPLETE (>=70%)=+0.35, EARLY_SKIP (<15s)=-0.40.
+        """
         ev = (event_type or "").strip().upper()
         if ev == "GOOD":
             return 1.0
         if ev == "BAD":
             return -1.0
-        if ev == "COMPLETE":
-            return 0.7
         if ev == "EARLY_SKIP":
-            return -0.8
+            return -0.40
+        if ev == "COMPLETE":
+            return 0.35
         if ev == "MID_SKIP":
-            return 0.1
+            return 0.0
 
         if listen_seconds is not None and listen_seconds < 15.0:
-            return -0.8
+            return -0.40
         if (
             listen_seconds is not None
             and duration_seconds is not None
             and duration_seconds > 0
-            and (listen_seconds / duration_seconds) >= 0.8
+            and (listen_seconds / duration_seconds) >= 0.70
         ):
-            return 0.7
+            return 0.35
         if ev == "ENDED":
-            return 0.7
-        return 0.1
+            return 0.35
+        return 0.0
 
     def featurize(
         self,
@@ -189,11 +283,10 @@ class ContextualBanditRecommender:
         is_new_artist: bool,
         hour: int | None = None,
     ) -> np.ndarray:
-        """Build `[tag_one_hot, release_decade, log_view_bucket, time_of_day_bucket, is_new_artist, is_watch_playlist, bias]`."""
+        """Build legacy tag/metadata context vector for backward-compatible LinUCB."""
         vec = np.zeros(self.feature_dim, dtype=np.float64)
         offset = 0
 
-        # 1. tag_one_hot (exact station seed tags + hashed OOV buckets)
         vocab_index = {tag: i for i, tag in enumerate(self.tag_vocab)}
         for tag in track.tags:
             norm_tag = tag.strip().lower()
@@ -206,7 +299,6 @@ class ContextualBanditRecommender:
                 vec[offset + len(self.tag_vocab) + bucket] = 1.0
         offset += len(self.tag_vocab) + _OOV_TAG_BUCKETS
 
-        # 2. release_decade one-hot
         year = track.release_year
         if year is None:
             dec_idx = 5
@@ -223,26 +315,24 @@ class ContextualBanditRecommender:
         vec[offset + dec_idx] = 1.0
         offset += _DECADE_BUCKETS
 
-        # 3. log_view_bucket one-hot
         views = track.view_count
         if views is None or views < 0:
             view_idx = 4
         else:
             log_v = math.log10(views + 1.0)
-            if log_v < 4.0:        # < 10k
+            if log_v < 4.0:
                 view_idx = 0
-            elif log_v < 4.7:      # 10k - ~50k
+            elif log_v < 4.7:
                 view_idx = 1
-            elif log_v < 5.3:      # 50k - ~200k
+            elif log_v < 5.3:
                 view_idx = 2
-            elif log_v < 5.7:      # 200k - ~500k
+            elif log_v < 5.7:
                 view_idx = 3
             else:
                 view_idx = 4
         vec[offset + view_idx] = 1.0
         offset += _VIEW_BUCKETS
 
-        # 4. time_of_day_bucket one-hot
         h = datetime.now().hour if hour is None else int(hour) % 24
         if 5 <= h < 11:
             tod_idx = 0
@@ -255,7 +345,6 @@ class ContextualBanditRecommender:
         vec[offset + tod_idx] = 1.0
         offset += _TIME_BUCKETS
 
-        # 5. is_new_artist, is_watch_playlist_source, intercept bias
         vec[offset] = 1.0 if is_new_artist else 0.0
         vec[offset + 1] = 1.0 if track.source in _WATCH_PLAYLIST_SOURCES else 0.0
         vec[offset + 2] = 1.0
@@ -265,11 +354,11 @@ class ContextualBanditRecommender:
         self,
         track: TrackEntity,
         *,
-        max_popularity_views: int = 500_000,
+        max_popularity_views: int = 500_000_000,
         hour: int | None = None,
         audio_signal: AudioTheorySignal | None = None,
     ) -> np.ndarray:
-        """Build the 10-dimensional Deep Music Theory DNA context vector."""
+        """Build 10-dimensional Theory DNA context vector."""
         cap = (
             self.station_config.max_popularity_views
             if self.station_config is not None
@@ -283,6 +372,16 @@ class ContextualBanditRecommender:
             audio_signal=audio_signal,
         )
 
+    def featurize_mir(
+        self,
+        track: TrackEntity,
+        *,
+        allow_network: bool = False,
+    ) -> tuple[np.ndarray, float]:
+        """Extract 16-dimensional real MIR + co-occurrence + sweetspot + cult-chic vector."""
+        vec16, est_bpm, _src = self.mir_extractor.extract_16d_vector(track, allow_network=allow_network)
+        return vec16, est_bpm
+
     def update(
         self,
         track: TrackEntity,
@@ -294,17 +393,20 @@ class ContextualBanditRecommender:
         hour: int | None = None,
         audio_signal: AudioTheorySignal | None = None,
     ) -> float:
-        """Thread-safely update both tag LinUCB and 10-dim Theory DNA LinUCB, with atomic save & rollback."""
+        """Thread-safely update per-station bounded 3-layer MIR weights and LinUCB with atomic save & rollback."""
         reward = self.compute_reward(event_type, listen_seconds, duration_seconds)
-        theory_reward = self.compute_theory_reward(event_type, listen_seconds, duration_seconds)
+        signed_reward = self.compute_theory_reward(event_type, listen_seconds, duration_seconds)
         context = self.featurize(track, is_new_artist=is_new_artist, hour=hour).reshape(1, -1)
         theory_context = self.featurize_theory(track, hour=hour, audio_signal=audio_signal).reshape(1, -1)
+        mir_vec, _bpm = self.featurize_mir(track, allow_network=False)
 
         with self._lock:
             prev_n_updates = self._n_updates
             prev_theory_n_updates = self._theory_n_updates
             prev_mab_snapshot = pickle.dumps(self._mab)
             prev_theory_snapshot = pickle.dumps(self._theory_mab)
+            prev_slow = self._w_slow.copy()
+            prev_session = self._w_session.copy()
             try:
                 if self._n_updates == 0:
                     self._mab.fit(decisions=["play"], rewards=[reward], contexts=context)
@@ -312,33 +414,67 @@ class ContextualBanditRecommender:
                     self._mab.partial_fit(decisions=["play"], rewards=[reward], contexts=context)
 
                 if self._theory_n_updates == 0:
-                    self._theory_mab.fit(decisions=["play"], rewards=[theory_reward], contexts=theory_context)
+                    self._theory_mab.fit(decisions=["play"], rewards=[signed_reward], contexts=theory_context)
                 else:
-                    self._theory_mab.partial_fit(decisions=["play"], rewards=[theory_reward], contexts=theory_context)
+                    self._theory_mab.partial_fit(decisions=["play"], rewards=[signed_reward], contexts=theory_context)
+
+                # Bounded per-station 3-layer MIR slow update (lr=0.03, clip ±0.02, L2 pull to calibrated anchor)
+                if abs(signed_reward) > 1e-9:
+                    raw_step = (
+                        SLOW_LR * signed_reward * (mir_vec - self._w_slow)
+                        - SLOW_L2_ANCHOR * (self._w_slow - self._w_anchor)
+                    )
+                    clipped_step = np.clip(raw_step, -SLOW_STEP_CLIP, SLOW_STEP_CLIP)
+                    self._w_slow = np.clip(self._w_slow + clipped_step, 0.0, 1.0)
+
+                    session_step = np.clip(
+                        0.06 * signed_reward * (mir_vec - self._w_session),
+                        -SLOW_STEP_CLIP,
+                        SLOW_STEP_CLIP,
+                    )
+                    self._w_session = np.clip(self._w_session + session_step, 0.0, 1.0)
 
                 self._n_updates += 1
                 self._theory_n_updates += 1
                 self._save_locked()
+
+                # Persist updated slow_weights to SQLite station_profiles for this station ONLY
+                if self.db is not None and self._calibrated_from_db:
+                    self.db.upsert_station_profile(
+                        station_id=self.station_id,
+                        centroid=[round(float(x), 5) for x in self._w_anchor],
+                        axis_weights=[round(float(x), 5) for x in self._axis_weights],
+                        slow_weights=[round(float(x), 5) for x in self._w_slow],
+                        sample_counts=self._sample_counts,
+                    )
             except Exception:
                 self._n_updates = prev_n_updates
                 self._theory_n_updates = prev_theory_n_updates
                 self._mab = pickle.loads(prev_mab_snapshot)
                 self._theory_mab = pickle.loads(prev_theory_snapshot)
+                self._w_slow = prev_slow
+                self._w_session = prev_session
                 raise
         return reward
 
     def get_learned_theory_profile(self) -> dict[str, Any]:
-        """Return the current 5-axis (T1..T5) learned user preference profile in [0.0, 1.0]."""
+        """Return 5-axis summary + 4-layer real MIR calibrated preference profile for this station."""
         prior = self.theory_extractor.get_station_prior_vector(self.station_config)
         with self._lock:
             t_updates = self._theory_n_updates
+            w_eff = (
+                ALPHA_ANCHOR * self._w_anchor
+                + ALPHA_SLOW * self._w_slow
+                + ALPHA_SESSION * self._w_session
+            ).copy()
+            calibrated = self._calibrated_from_db
+            sample_counts = dict(self._sample_counts)
             beta: np.ndarray | None = None
             if t_updates > 0:
                 model = self._theory_mab._imp.arm_to_model.get("play")
                 if model is not None and getattr(model, "beta", None) is not None and len(model.beta) >= 5:
                     beta = np.array(model.beta[:5], dtype=np.float64)
 
-        # Blend station prior with online-learned LinUCB beta weights smoothly as feedback accumulates
         learn_blend = min(0.85, t_updates / (t_updates + 6.0)) if t_updates > 0 else 0.0
         axes_out: list[dict[str, Any]] = []
         scores_map: dict[str, float] = {}
@@ -348,7 +484,6 @@ class ContextualBanditRecommender:
             prior_val = float(prior[ax])
             if beta is not None:
                 raw_w = float(beta[idx])
-                # Map signed ridge weight (~[-1.5, +1.5]) to [0.0, 1.0] preference score
                 learned_val = _sigmoid(raw_w * 2.2)
                 blended = (1.0 - learn_blend) * prior_val + learn_blend * learned_val
             else:
@@ -369,23 +504,67 @@ class ContextualBanditRecommender:
                 }
             )
 
+        layers_dict = summarize_4_layers(w_eff)
         return {
             "station_id": self.station_id,
             "updates": t_updates,
+            "calibrated": calibrated,
+            "sample_counts": sample_counts,
             "scores": scores_map,
             "axes": axes_out,
+            "layers": list(layers_dict.values()),
+            "effective_mir_vector": [round(float(x), 4) for x in w_eff],
         }
+
+    def _score_mir_precision(
+        self,
+        mir_matrix: np.ndarray,
+        w_effective: np.ndarray,
+        axis_weights: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Stage 2 Precision Scoring: weighted 16-dim acoustic similarity + scene/sweetspot quality."""
+        aw = np.maximum(0.1, axis_weights)
+        aw_norm = aw / float(np.sum(aw))
+
+        # 1. Weighted closeness across all 16 MIR dims (especially acoustic A1..C4)
+        l1_dist = np.sum(np.abs(mir_matrix - w_effective[None, :]) * aw_norm[None, :], axis=1)
+        closeness = np.clip(1.0 - l1_dist * 1.45, 0.0, 1.0)
+
+        # 2. Weighted cosine similarity on 12-dim acoustic core (A1..C4)
+        sqrt_a = np.sqrt(aw[:12])
+        a_cand = mir_matrix[:, :12] * sqrt_a[None, :]
+        a_tgt = w_effective[:12] * sqrt_a
+        denom = np.maximum(1e-9, np.linalg.norm(a_cand, axis=1) * float(np.linalg.norm(a_tgt)))
+        acoustic_cos = np.clip(np.dot(a_cand, a_tgt) / denom, 0.0, 1.0)
+
+        # 3. Stage 1 co-occurrence + Deezer rank + YouTube 300k-50M sweetspot + PES/Emily cult-chic similarity
+        d1_cooc = mir_matrix[:, 12]
+        d2_rank = mir_matrix[:, 13]
+        d3_views = mir_matrix[:, 14]
+        d4_cult = mir_matrix[:, 15]
+
+        exploit = (
+            0.35 * closeness
+            + 0.25 * acoustic_cos
+            + 0.16 * d1_cooc
+            + 0.10 * d2_rank
+            + 0.14 * d3_views
+        )
+        # Exploration crossover affinity prioritizes co-occurring PES/Emily cult-chic gems
+        crossover_explore = 0.45 * d1_cooc + 0.35 * d4_cult + 0.20 * d3_views
+        return exploit, crossover_explore
 
     def rank_candidates(
         self,
         candidates: list[TrackEntity],
         *,
         seen_artists: set[str],
-        max_popularity_views: int = 500_000,
+        max_popularity_views: int = 500_000_000,
         hour: int | None = None,
         limit: int = 3,
+        recent_artists: list[str] | None = None,
     ) -> list[RankedCandidate]:
-        """Thread-safely score and rank unheard candidates via MABWiser LinUCB + 10-dim Theory DNA."""
+        """Stage 2 Precision Scoring + Stage 3 Re-Ranking (5-track artist cooldown + 80/20 exploit/explore)."""
         if not candidates:
             return []
 
@@ -409,6 +588,9 @@ class ContextualBanditRecommender:
                 for track in candidates
             ]
         )
+        mir_results = [self.featurize_mir(track, allow_network=False) for track in candidates]
+        X_mir = np.vstack([pair[0] for pair in mir_results])
+        measured_bpms = [pair[1] for pair in mir_results]
 
         has_theory_station = bool(self.station_config and self.station_config.target_theory_vector)
         target_prior = self.theory_extractor.get_station_prior_vector(self.station_config)
@@ -417,6 +599,13 @@ class ContextualBanditRecommender:
         with self._lock:
             n_updates = self._n_updates
             theory_updates = self._theory_n_updates
+            w_eff = (
+                ALPHA_ANCHOR * self._w_anchor
+                + ALPHA_SLOW * self._w_slow
+                + ALPHA_SESSION * self._w_session
+            ).copy()
+            axis_w = self._axis_weights.copy()
+            has_calibrated = self._calibrated_from_db
 
             if n_updates == 0:
                 base_explore = self.exploration_rate * np.linalg.norm(X, axis=1)
@@ -430,13 +619,11 @@ class ContextualBanditRecommender:
                 raw_exp = self._mab.predict_expectations(contexts=X)
                 exp_list = [raw_exp] if isinstance(raw_exp, dict) else list(raw_exp)
                 base_total = np.array([float(item["play"]) for item in exp_list], dtype=np.float64)
-
                 lin_model = self._mab._imp.arm_to_model["play"]
                 base_exploit = np.dot(X, lin_model.beta)
                 base_explore = np.maximum(0.0, base_total - base_exploit)
 
             if theory_updates == 0:
-                # Cold-start theory alignment: cosine proximity to station target T1..T5 + T6 (affinity * gem)
                 t_norms = np.linalg.norm(X_theory[:, :5], axis=1) * (np.linalg.norm(target_vec5) + 1e-9)
                 cosine = np.dot(X_theory[:, :5], target_vec5) / np.maximum(1e-9, t_norms)
                 t6_bonus = 0.25 * X_theory[:, 5] + 0.25 * X_theory[:, 6] + 0.10 * X_theory[:, 7]
@@ -451,17 +638,25 @@ class ContextualBanditRecommender:
                 theory_exploit = np.dot(X_theory, t_model.beta)
                 theory_explore = np.maximum(0.0, theory_total - theory_exploit)
 
-        # Blend weights: full Theory DNA stations weigh 10-dim theory bandit heavily (55%);
-        # generic tag-only stations preserve primary tag LinUCB dominance while still computing theory explanations.
-        w_theory = 0.55 if has_theory_station else 0.12
-        w_base = 1.0 - w_theory
+        mir_exploit, mir_crossover = self._score_mir_precision(X_mir, w_eff, axis_w)
+        mir_total = mir_exploit + 0.15 * self.exploration_rate * mir_crossover
 
-        exploit_scores = w_base * base_exploit + w_theory * theory_exploit
-        explore_scores = w_base * base_explore + w_theory * theory_explore
-        total_scores = w_base * base_total + w_theory * theory_total
+        # Blend weights: calibrated/MIR stations lean heavily on real 16-dim MIR + theory;
+        # legacy tag-only stations preserve tag LinUCB dominance for backward compatibility.
+        if has_theory_station or has_calibrated:
+            w_mir = 0.50
+            w_theory = 0.35
+            w_base = 0.15
+        else:
+            w_mir = 0.10
+            w_theory = 0.10
+            w_base = 0.80
 
-        # Build ranked entries using ONLY genuine track tags ([C2] no fabricated matches)
-        scored: list[RankedCandidate] = []
+        exploit_scores = w_base * base_exploit + w_theory * theory_exploit + w_mir * mir_exploit
+        explore_scores = w_base * base_explore + w_theory * theory_explore + w_mir * mir_crossover
+        total_scores = w_base * base_total + w_theory * theory_total + w_mir * mir_total
+
+        scored: list[tuple[RankedCandidate, float]] = []
         seed_tag_set = set(self.seed_tags)
         for idx, track in enumerate(candidates):
             exploit = float(exploit_scores[idx])
@@ -472,43 +667,79 @@ class ContextualBanditRecommender:
             if not matched and track.tags:
                 matched = track.tags[:3]
             t_vec = X_theory[idx]
+            m_vec = X_mir[idx]
             explanation = self.theory_extractor.build_explanation(
                 t_vec,
                 station=self.station_config,
                 track=track,
             )
-            scored.append(
-                RankedCandidate(
-                    track=track,
-                    score=total,
-                    exploit_score=exploit,
-                    explore_bonus=explore,
-                    mode=mode,
-                    hidden_level=_hidden_level(track.view_count, max_popularity_views),
-                    matched_tags=matched,
-                    theory_vector=t_vec.tolist(),
-                    theory_explanation=explanation,
-                )
+            layers = summarize_4_layers(m_vec, centroid=w_eff)
+            sweetspot = float(0.65 * m_vec[14] + 0.35 * m_vec[13])
+            rc = RankedCandidate(
+                track=track,
+                score=total,
+                exploit_score=exploit,
+                explore_bonus=explore,
+                mode=mode,
+                hidden_level=_hidden_level(track.view_count, max_popularity_views),
+                matched_tags=matched,
+                theory_vector=t_vec.tolist(),
+                theory_explanation=explanation,
+                mir_vector=m_vec.tolist(),
+                mir_layers=layers,
+                measured_bpm=measured_bpms[idx],
+                sweetspot_score=sweetspot,
             )
+            scored.append((rc, float(mir_crossover[idx])))
 
-        scored.sort(key=lambda item: item.score, reverse=True)
+        # Stage 3 Re-Ranking:
+        # 1. Recent 5-track artist cooldown (avoid repeating any artist in recent_artists[:5] or current batch)
+        recent_set = {normalize_artist(a) for a in (recent_artists or [])[:5] if a}
 
-        # Apply light artist diversity across the top prefetch batch so back-to-back tracks vary
+        exploit_pool = sorted(scored, key=lambda pair: pair[0].score, reverse=True)
+        # Exploration crossover pool: co-occurring / cult-chic crossover gems
+        explore_pool = sorted(
+            scored,
+            key=lambda pair: (pair[0].track.cooccurrence_count >= 2, pair[1], pair[0].score),
+            reverse=True,
+        )
+
         selected: list[RankedCandidate] = []
-        overflow: list[RankedCandidate] = []
-        batch_artists: set[str] = set()
-        for item in scored:
-            a_norm = normalize_artist(item.track.artist)
-            if a_norm not in batch_artists:
-                selected.append(item)
-                batch_artists.add(a_norm)
-            else:
-                overflow.append(item)
-            if len(selected) >= limit:
-                break
+        used_track_ids: set[str] = set()
+        used_artists: set[str] = set(recent_set)
 
-        if len(selected) < limit:
-            selected.extend(overflow[: limit - len(selected)])
+        def _pick_from(pool: list[tuple[RankedCandidate, float]], allow_recent_artist: bool) -> RankedCandidate | None:
+            for cand, _cross in pool:
+                if cand.track.track_id in used_track_ids:
+                    continue
+                a_norm = normalize_artist(cand.track.artist)
+                if not allow_recent_artist and a_norm in used_artists:
+                    continue
+                used_track_ids.add(cand.track.track_id)
+                used_artists.add(a_norm)
+                return cand
+            return None
+
+        # 80% Exploit + 20% Explore slot pattern (slot indices 4, 9, ... are exploration crossover slots;
+        # for 3-track batches, if limit >= 5 slot #5 is explore; if pool has strong crossover gem on slot #3
+        # when n_updates > 0 we keep exploit top-1 strictly highest score!)
+        for slot in range(limit):
+            is_explore_slot = (slot % 5) == 4
+            primary_pool = explore_pool if is_explore_slot else exploit_pool
+            secondary_pool = exploit_pool if is_explore_slot else explore_pool
+
+            chosen = _pick_from(primary_pool, allow_recent_artist=False)
+            if chosen is None:
+                chosen = _pick_from(secondary_pool, allow_recent_artist=False)
+            if chosen is None:
+                # Only relax artist cooldown when all remaining unique candidates belong to recent artists
+                chosen = _pick_from(primary_pool, allow_recent_artist=True)
+            if chosen is None:
+                break
+            if is_explore_slot:
+                chosen.mode = "探索"
+            selected.append(chosen)
+
         return selected[:limit]
 
     def _apply_exploration_rate_locked(self) -> None:
@@ -520,19 +751,21 @@ class ContextualBanditRecommender:
                     model.alpha = self.exploration_rate
 
     def _save_locked(self) -> None:
-        """Atomically persist bandit state via unique NamedTemporaryFile + os.replace."""
+        """Atomically persist bandit & 3-layer MIR state via unique NamedTemporaryFile + os.replace."""
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
         state: dict[str, Any] = {
             "station_id": self.station_id,
             "tag_vocab": self.tag_vocab,
             "feature_dim": self.feature_dim,
             "theory_dim": THEORY_CONTEXT_DIM,
+            "mir_dim": MIR_DIM,
             "alpha": self.exploration_rate,
             "exploration_rate": self.exploration_rate,
             "n_updates": self._n_updates,
             "theory_n_updates": self._theory_n_updates,
             "mab": self._mab,
             "theory_mab": self._theory_mab,
+            "w_slow": self._w_slow.tolist(),
         }
         tmp_name: str | None = None
         try:
@@ -585,7 +818,10 @@ class ContextualBanditRecommender:
                         self._theory_mab = saved_theory_mab
                         self._theory_n_updates = int(state.get("theory_n_updates", 0))
 
-                    # [M8] Apply latest YAML exploration_rate even if persisted alpha differed
+                    saved_slow = state.get("w_slow")
+                    if isinstance(saved_slow, list) and len(saved_slow) == MIR_DIM and not self._calibrated_from_db:
+                        self._w_slow = np.asarray(saved_slow, dtype=np.float64)
+
                     self._apply_exploration_rate_locked()
                 else:
                     backup_path = self.model_path.with_suffix(".pkl.bak")

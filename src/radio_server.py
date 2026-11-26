@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
+from src.adapters.deezer import DeezerClient
 from src.adapters.youtube import YouTubeMusicAdapter
 from src.db import RadioDatabase, sanitize_video_id
 from src.digger.history_importer import generate_stations_yaml
@@ -21,6 +22,7 @@ from src.models import (
     load_stations_yaml,
     normalize_artist,
 )
+from src.recommender.audio_mir import AudioMIRExtractor
 from src.recommender.bandit import ContextualBanditRecommender
 from src.recommender.theory_features import THEORY_AXIS_KEYS, TheoryFeatureExtractor
 
@@ -95,7 +97,7 @@ class YouTubeSyncRequest(BaseModel):
 
 
 class RadioRuntime:
-    """Holds stations, SQLite DB, digger, per-station ownership-token locks, and Theory DNA Bandits."""
+    """Holds stations, SQLite DB, Stage 1 graph digger, 16-dim MIR extractor, and per-station Bandits."""
 
     def __init__(
         self,
@@ -114,6 +116,8 @@ class RadioRuntime:
 
         self.db = RadioDatabase(db_path)
         self.theory_extractor = TheoryFeatureExtractor()
+        self._deezer_client: DeezerClient | None = None
+        self.mir_extractor = AudioMIRExtractor(db=self.db)
         self._yt_adapter: YouTubeMusicAdapter | None = None
         self._digger: CandidatePoolDigger | None = None
         self._digger_init_lock = threading.Lock()
@@ -147,7 +151,15 @@ class RadioRuntime:
                             browser_auth_path=self.browser_auth_path,
                             project_root=PROJECT_ROOT,
                         )
-                    self._digger = CandidatePoolDigger(self.db, yt_adapter=self._yt_adapter)
+                    if self._deezer_client is None:
+                        self._deezer_client = DeezerClient(db=self.db)
+                        self.mir_extractor.deezer = self._deezer_client
+                    self._digger = CandidatePoolDigger(
+                        self.db,
+                        yt_adapter=self._yt_adapter,
+                        deezer_client=self._deezer_client,
+                        mir_extractor=self.mir_extractor,
+                    )
         return self._digger
 
     def reload_stations(self) -> None:
@@ -170,6 +182,8 @@ class RadioRuntime:
                 model_path=self.model_dir / f"bandit_{s.station_id}.pkl",
                 station_config=s,
                 theory_extractor=self.theory_extractor,
+                mir_extractor=self.mir_extractor,
+                db=self.db,
             )
             for s in station_list
         }
@@ -344,6 +358,7 @@ class RadioRuntime:
             seen_artists=self.db.get_seen_artists(station.station_id),
             max_popularity_views=station.max_popularity_views,
             limit=count,
+            recent_artists=self.db.get_recent_played_artists(station.station_id, limit=5),
         )
         return [item.to_queue_dict() for item in ranked]
 

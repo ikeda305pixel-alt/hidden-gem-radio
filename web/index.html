@@ -479,8 +479,10 @@
           <div class="now-label" id="stationLabel">NOW TUNED</div>
           <h2 class="track-title" id="trackTitle">局を選択して再生を開始</h2>
           <p class="track-artist" id="trackArtist">—</p>
+          <div class="reason-line" id="discoveryRouteLine">発掘ルート: 待機中</div>
+          <div class="reason-line" id="mirMetaLine">実測BPM / 知名度スイートスポット: 待機中</div>
           <div class="reason-line" id="reasonLine">推薦理由: 待機中</div>
-          <div class="theory-line" id="theoryLine">音楽理論DNA: 解析待機中</div>
+          <div class="theory-line" id="theoryLine">4レイヤー安定嗜好マッチ: 解析待機中</div>
 
           <div class="playlist-picker-row">
             <label for="goodPlaylistSelect">Good保存先:</label>
@@ -496,6 +498,7 @@
             <div class="controls">
               <button class="ctrl-btn ctrl-play" id="btnPlayMute" type="button">再生 / ミュート</button>
               <button class="ctrl-btn ctrl-good" id="btnGood" type="button">👍 Good</button>
+              <button class="ctrl-btn" id="btnSkip" type="button">⏭ 次曲</button>
               <button class="ctrl-btn ctrl-bad" id="btnBad" type="button">👎 BAD（即次曲）</button>
             </div>
           </div>
@@ -519,10 +522,10 @@
       </ul>
     </section>
 
-    <!-- Deep Music Theory DNA Preference Bars (T1-T5) -->
+    <!-- 4-Layer Real MIR & Deep Music Theory DNA Preference Bars -->
     <section class="card" aria-label="音楽理論DNAバー">
       <div class="card-title">
-        <span>音楽理論DNAバー（T1〜T5 リアルタイム学習）</span>
+        <span>音楽理論DNAバー（4レイヤー実測MIR ＆ 安定嗜好学習）</span>
         <span id="dnaUpdatesLabel">学習 0 回</span>
       </div>
       <div class="dna-grid" id="dnaGrid"></div>
@@ -554,6 +557,7 @@
       queue: [],
       currentTrack: null,
       currentRatedGood: false,
+      implicitFeedbackSentVideoId: null,
       player: null,
       playerReady: false,
       consecutiveErrors: 0,
@@ -580,6 +584,8 @@
     const PLAYBACK_WATCHDOG_MS = 7000;
     const WATCHDOG_MIN_PLAY_SEC = 0.3;
     const EMPTY_BATCH_COOLDOWN_MS = 2500;
+    const IMPLICIT_COMPLETE_RATIO = 0.70;
+    const IMPLICIT_EARLY_SKIP_SEC = 15.0;
 
     const el = {
       statusPill: document.getElementById("statusPill"),
@@ -587,11 +593,14 @@
       stationLabel: document.getElementById("stationLabel"),
       trackTitle: document.getElementById("trackTitle"),
       trackArtist: document.getElementById("trackArtist"),
+      discoveryRouteLine: document.getElementById("discoveryRouteLine"),
+      mirMetaLine: document.getElementById("mirMetaLine"),
       reasonLine: document.getElementById("reasonLine"),
       theoryLine: document.getElementById("theoryLine"),
       queueList: document.getElementById("queueList"),
       btnPlayMute: document.getElementById("btnPlayMute"),
       btnGood: document.getElementById("btnGood"),
+      btnSkip: document.getElementById("btnSkip"),
       btnBad: document.getElementById("btnBad"),
       btnDigMore: document.getElementById("btnDigMore"),
       goodPlaylistSelect: document.getElementById("goodPlaylistSelect"),
@@ -767,7 +776,7 @@
           if (state.player && state.playerReady) state.player.pauseVideo();
         });
         navigator.mediaSession.setActionHandler("nexttrack", () => {
-          playNextFromQueue();
+          handleManualSkip();
         });
         navigator.mediaSession.setActionHandler("stop", () => {
           clearPlaybackWatchdog();
@@ -796,12 +805,13 @@
       el.queueList.innerHTML = state.queue
         .slice(0, 3)
         .map((item, i) => {
-          const topAx = item.theory_explanation?.top_axes?.[0];
-          const axLabel = topAx ? `${topAx.axis}:${topAx.label}` : (item.reason?.mode || "探索");
+          const route = item.discovery_route || item.reason?.mode || "探索";
+          const bpmText = item.measured_bpm ? `${Math.round(item.measured_bpm)} BPM` : "";
+          const metaParts = [route, bpmText, item.reason?.hidden_level || ""].filter(Boolean).join(" · ");
           return `
           <li class="queue-item">
             <span>#${i + 1} ${escapeHtml(item.artist)} — ${escapeHtml(item.title)}</span>
-            <span class="queue-meta">${escapeHtml(axLabel)} · ${escapeHtml(item.reason?.hidden_level || "")}</span>
+            <span class="queue-meta">${escapeHtml(metaParts)}</span>
           </li>`;
         })
         .join("");
@@ -815,23 +825,44 @@
         el.trackArtist.textContent = state.circuitBroken
           ? "▶ 再生 または局切替で再開してください"
           : "自動で再試行します（手動は「候補を追加ディグ」）";
+        el.discoveryRouteLine.textContent = "発掘ルート: 待機中";
+        el.mirMetaLine.textContent = "実測BPM / 知名度スイートスポット: 待機中";
         el.reasonLine.textContent = "推薦理由: 候補プール待機中";
-        el.theoryLine.textContent = "音楽理論DNA: 待機中";
+        el.theoryLine.textContent = "4レイヤー安定嗜好マッチ: 待機中";
         el.postGoodBar.classList.remove("visible");
         return;
       }
       el.trackTitle.textContent = track.title;
       el.trackArtist.textContent = track.artist;
+
+      const route = track.discovery_route || track.reason?.discovery_route || "協調グラフ発掘";
+      el.discoveryRouteLine.textContent = `発掘ルート: ${route}`;
+
+      const bpmLabel = track.measured_bpm ? `実測 ${Math.round(Number(track.measured_bpm))} BPM` : "BPM 推定中";
+      const sweetPct =
+        track.sweetspot_score !== undefined && track.sweetspot_score !== null
+          ? `知名度スイートスポット適合 ${Math.round(Number(track.sweetspot_score) * 100)}%`
+          : "知名度スイートスポット計算中";
+      el.mirMetaLine.textContent = `${bpmLabel} · ${sweetPct}`;
       el.reasonLine.textContent = track.reason?.summary || "探索 | 隠れ名曲候補";
 
-      const exp = track.theory_explanation;
-      if (exp && Array.isArray(exp.top_axes) && exp.top_axes.length) {
-        const chips = exp.top_axes
-          .map((a) => `<span class="axis-chip">${escapeHtml(a.axis)} ${escapeHtml(a.label)} ${Math.round(a.score * 100)}%</span>`)
+      const layers = track.mir_layers;
+      if (layers && typeof layers === "object") {
+        const layerOrder = [layers.rhythm, layers.harmony, layers.timbre, layers.cult_chic].filter(Boolean);
+        const chips = layerOrder
+          .map((ly) => `<span class="axis-chip">${escapeHtml(ly.label_ja)} ${Math.round(Number(ly.score || 0) * 100)}%</span>`)
           .join("");
-        el.theoryLine.innerHTML = `${chips} <span>${escapeHtml(exp.summary || "")}</span>`;
+        el.theoryLine.innerHTML = `${chips}`;
       } else {
-        el.theoryLine.textContent = "音楽理論DNA: 解析中";
+        const exp = track.theory_explanation;
+        if (exp && Array.isArray(exp.top_axes) && exp.top_axes.length) {
+          const chips = exp.top_axes
+            .map((a) => `<span class="axis-chip">${escapeHtml(a.axis)} ${escapeHtml(a.label)} ${Math.round(a.score * 100)}%</span>`)
+            .join("");
+          el.theoryLine.innerHTML = `${chips} <span>${escapeHtml(exp.summary || "")}</span>`;
+        } else {
+          el.theoryLine.textContent = "4レイヤー安定嗜好マッチ: 解析中";
+        }
       }
 
       el.btnGood.classList.toggle("rated", state.currentRatedGood);
@@ -938,6 +969,7 @@
       clearPlaybackWatchdog();
       state.currentTrack = track;
       state.currentRatedGood = false;
+      state.implicitFeedbackSentVideoId = null;
       state.trackConfirmedPlayingVideoId = null;
       renderNowPlaying(track);
       renderQueue();
@@ -953,6 +985,45 @@
       } else if (!state.circuitBroken) {
         scheduleQueueRetry();
       }
+    }
+
+    async function sendImplicitPlaybackFeedback(isManualSkip) {
+      if (!state.currentTrack || state.currentRatedGood) return;
+      const vid = state.currentTrack.video_id;
+      if (vid && state.implicitFeedbackSentVideoId === vid) return;
+
+      let listenSeconds = 0;
+      let durationSeconds = Number(state.currentTrack.duration_seconds || 0);
+      if (state.player && state.playerReady && typeof state.player.getCurrentTime === "function") {
+        listenSeconds = Number(state.player.getCurrentTime() || 0);
+        const ytDur = Number(state.player.getDuration() || 0);
+        if (ytDur > 0) durationSeconds = ytDur;
+      }
+
+      let eventType = null;
+      if (!isManualSkip) {
+        eventType = "COMPLETE";
+      } else if (durationSeconds > 0 && listenSeconds / durationSeconds >= IMPLICIT_COMPLETE_RATIO) {
+        eventType = "COMPLETE";
+      } else if (listenSeconds > 0 && listenSeconds < IMPLICIT_EARLY_SKIP_SEC) {
+        eventType = "EARLY_SKIP";
+      }
+
+      if (!eventType) return;
+      if (vid) state.implicitFeedbackSentVideoId = vid;
+      try {
+        await sendFeedback(eventType, {
+          listen_seconds: listenSeconds,
+          duration_seconds: durationSeconds || null,
+        });
+        refreshTheoryProfile();
+      } catch (_) {}
+    }
+
+    async function handleManualSkip() {
+      clearPlaybackWatchdog();
+      await sendImplicitPlaybackFeedback(true);
+      await playNextFromQueue();
     }
 
     async function playNextFromQueue() {
@@ -1140,12 +1211,7 @@
               }
             } else if (event.data === YT.PlayerState.ENDED) {
               clearPlaybackWatchdog();
-              if (!state.currentRatedGood) {
-                try {
-                  await sendFeedback("COMPLETE");
-                  refreshTheoryProfile();
-                } catch (_) {}
-              }
+              await sendImplicitPlaybackFeedback(false);
               await playNextFromQueue();
             }
           },
@@ -1208,6 +1274,13 @@
       state.selectedYtPlaylistId = el.ytSyncPlaylistSelect.value;
     });
 
+    // Manual skip (sends implicit EARLY_SKIP if <15s, or COMPLETE if >=70% listened)
+    if (el.btnSkip) {
+      el.btnSkip.addEventListener("click", async () => {
+        await handleManualSkip();
+      });
+    }
+
     // Good (+1.0 theory reward + save to selected playlist + optional YouTube sync)
     el.btnGood.addEventListener("click", async () => {
       if (!state.currentTrack || state.currentRatedGood) return;
@@ -1220,7 +1293,7 @@
           playlist_id: state.selectedGoodPlaylistId,
           youtube_playlist_id: state.selectedYtPlaylistId || null,
         });
-        setStatus(`👍 DNA学習 & 保存完了 (更新 #${res?.model_updates ?? ""})`);
+        setStatus(`👍 安定MIR学習 & 保存完了 (更新 #${res?.model_updates ?? ""})`);
         await Promise.all([refreshTheoryProfile(), loadPlaylists()]);
       } catch (_) {
         state.currentRatedGood = false;
@@ -1249,14 +1322,14 @@
         await sendFeedback("BAD");
         refreshTheoryProfile();
       } catch (_) {}
-      setStatus("👎 DNA学習反映 · 次曲へ");
+      setStatus("👎 安定MIR学習反映 · 次曲へ");
       await playNextFromQueue();
     });
 
     el.btnDigMore.addEventListener("click", async () => {
       if (!state.activeStationId) return;
       resetEmptyBatchCooldown();
-      setStatus("新規候補をディグ中...");
+      setStatus("協調グラフから新規候補をディグ中...");
       try {
         const res = await fetchJson(`/stations/${encodeURIComponent(state.activeStationId)}/dig`, { method: "POST" });
         setStatus(`+${res.added}曲 追加 (計${res.total_playable}曲)`);
@@ -1291,17 +1364,28 @@
         const qs = state.activeStationId ? `?station_id=${encodeURIComponent(state.activeStationId)}` : "";
         const prof = await fetchJson(`/api/profile/theory${qs}`);
         el.dnaUpdatesLabel.textContent = `学習 ${prof.updates || 0} 回`;
-        el.dnaGrid.innerHTML = (prof.axes || [])
-          .map((ax) => {
-            const pct = Math.round(Number(ax.score || 0) * 100);
-            return `
+        const rows = [];
+        if (Array.isArray(prof.layers) && prof.layers.length) {
+          for (const ly of prof.layers) {
+            const pct = Math.round(Number(ly.score || 0) * 100);
+            rows.push(`
+              <div class="dna-row">
+                <span><strong>MIR</strong> ${escapeHtml(ly.label_ja)}</span>
+                <div class="dna-track"><div class="dna-fill" style="width:${pct}%"></div></div>
+                <span class="dna-pct">${pct}%</span>
+              </div>`);
+          }
+        }
+        for (const ax of prof.axes || []) {
+          const pct = Math.round(Number(ax.score || 0) * 100);
+          rows.push(`
             <div class="dna-row">
               <span><strong>${escapeHtml(ax.axis)}</strong> ${escapeHtml(ax.label_ja)}</span>
               <div class="dna-track"><div class="dna-fill" style="width:${pct}%"></div></div>
               <span class="dna-pct">${pct}%</span>
-            </div>`;
-          })
-          .join("");
+            </div>`);
+        }
+        el.dnaGrid.innerHTML = rows.join("");
       } catch (_) {}
     }
 

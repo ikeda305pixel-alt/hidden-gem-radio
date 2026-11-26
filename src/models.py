@@ -62,12 +62,14 @@ class StationConfig:
     name: str
     seed_tags: list[str]
     seed_artists: list[str]
-    max_popularity_views: int = 500_000
+    max_popularity_views: int = 500_000_000
     exploration_rate: float = 1.0
     target_theory_vector: dict[str, float] = field(default_factory=dict)
     bpm_zones: list[str] = field(default_factory=list)
     theory_archetypes: list[str] = field(default_factory=list)
     spotify_anchor_seeds: list[str] = field(default_factory=list)
+    pes_anchors: list[str] = field(default_factory=list)
+    emily_anchors: list[str] = field(default_factory=list)
     discovery_queries: list[str] = field(default_factory=list)
     weighted_seeds: list[dict[str, Any]] = field(default_factory=list)
 
@@ -90,6 +92,10 @@ class StationConfig:
             payload["theory_archetypes"] = list(self.theory_archetypes)
         if self.spotify_anchor_seeds:
             payload["spotify_anchor_seeds"] = list(self.spotify_anchor_seeds)
+        if self.pes_anchors:
+            payload["pes_anchors"] = list(self.pes_anchors)
+        if self.emily_anchors:
+            payload["emily_anchors"] = list(self.emily_anchors)
         if self.discovery_queries:
             payload["discovery_queries"] = list(self.discovery_queries)
         if self.weighted_seeds:
@@ -109,12 +115,14 @@ class StationConfig:
             name=str(data["name"]).strip(),
             seed_tags=[str(t).strip().lower() for t in data.get("seed_tags", []) if str(t).strip()],
             seed_artists=[str(a).strip() for a in data.get("seed_artists", []) if str(a).strip()],
-            max_popularity_views=int(data.get("max_popularity_views", 500_000)),
+            max_popularity_views=int(data.get("max_popularity_views", 500_000_000)),
             exploration_rate=float(data.get("exploration_rate", 1.0)),
             target_theory_vector=target_vec,
             bpm_zones=[str(z).strip() for z in data.get("bpm_zones", []) if str(z).strip()],
             theory_archetypes=[str(a).strip() for a in data.get("theory_archetypes", []) if str(a).strip()],
             spotify_anchor_seeds=[str(s).strip() for s in data.get("spotify_anchor_seeds", []) if str(s).strip()],
+            pes_anchors=[str(s).strip() for s in data.get("pes_anchors", []) if str(s).strip()],
+            emily_anchors=[str(s).strip() for s in data.get("emily_anchors", []) if str(s).strip()],
             discovery_queries=[str(q).strip() for q in data.get("discovery_queries", []) if str(q).strip()],
             weighted_seeds=[dict(item) for item in data.get("weighted_seeds", []) if isinstance(item, dict)],
         )
@@ -139,6 +147,14 @@ class TrackEntity:
     source: str = "unknown"
     seed_artist: str | None = None
     seed_archetype: str | None = None
+    cooccurrence_count: int = 1
+    discovery_sources: list[str] = field(default_factory=list)
+    discovery_route: str | None = None
+    deezer_id: int | None = None
+    deezer_bpm: float | None = None
+    deezer_gain: float | None = None
+    deezer_rank: int | None = None
+    mir_vector: list[float] | None = None
 
     @classmethod
     def build(
@@ -155,12 +171,21 @@ class TrackEntity:
         source: str = "unknown",
         seed_artist: str | None = None,
         seed_archetype: str | None = None,
+        cooccurrence_count: int = 1,
+        discovery_sources: list[str] | None = None,
+        discovery_route: str | None = None,
+        deezer_id: int | None = None,
+        deezer_bpm: float | None = None,
+        deezer_gain: float | None = None,
+        deezer_rank: int | None = None,
+        mir_vector: list[float] | None = None,
     ) -> TrackEntity:
         clean_artist = (artist or "Unknown Artist").strip()
         clean_title = (title or "Untitled").strip()
         canonical_key = normalize_track_key(clean_artist, clean_title)
         track_id = make_track_id(clean_artist, clean_title, isrc=isrc, mbid=mbid)
         norm_tags = sorted({t.strip().lower() for t in (tags or []) if t and t.strip()})
+        sources = list(dict.fromkeys(str(s).strip() for s in (discovery_sources or []) if str(s).strip()))
         return cls(
             track_id=track_id,
             canonical_key=canonical_key,
@@ -177,6 +202,14 @@ class TrackEntity:
             source=source,
             seed_artist=seed_artist.strip() if seed_artist else None,
             seed_archetype=seed_archetype.strip() if seed_archetype else None,
+            cooccurrence_count=max(1, int(cooccurrence_count)),
+            discovery_sources=sources,
+            discovery_route=discovery_route.strip() if discovery_route else None,
+            deezer_id=deezer_id,
+            deezer_bpm=float(deezer_bpm) if deezer_bpm is not None else None,
+            deezer_gain=float(deezer_gain) if deezer_gain is not None else None,
+            deezer_rank=int(deezer_rank) if deezer_rank is not None else None,
+            mir_vector=[float(v) for v in mir_vector] if mir_vector is not None else None,
         )
 
 
@@ -191,11 +224,12 @@ class PlaybackResolution:
     view_count: int | None = None
     duration_seconds: int | None = None
     release_year: int | None = None
+    artist_browse_id: str | None = None
 
 
 @dataclass(slots=True)
 class RankedCandidate:
-    """Track paired with its Contextual Bandit score, theory DNA explanation, and 1-line summary."""
+    """Track paired with its MIR/Bandit score, discovery route, 4-layer match, and summary."""
 
     track: TrackEntity
     score: float
@@ -206,13 +240,20 @@ class RankedCandidate:
     matched_tags: list[str]
     theory_vector: list[float] | None = None
     theory_explanation: dict[str, Any] | None = None
+    mir_vector: list[float] | None = None
+    mir_layers: dict[str, Any] | None = None
+    measured_bpm: float | None = None
+    sweetspot_score: float | None = None
 
     def to_queue_dict(self) -> dict[str, Any]:
         views_label = (
             f"{self.track.view_count:,} views" if self.track.view_count is not None else "views不明"
         )
-        tags_str = ", ".join(self.matched_tags[:3]) if self.matched_tags else "新規発掘"
-        summary = f"{self.mode} | 隠れ度:{self.hidden_level} ({views_label}) | タグ:{tags_str}"
+        route_str = self.track.discovery_route or (
+            f"シード関連: {self.track.seed_artist}" if self.track.seed_artist else "協調グラフ発掘"
+        )
+        tags_str = ", ".join(self.matched_tags[:3]) if self.matched_tags else route_str
+        summary = f"{self.mode} | 隠れ度:{self.hidden_level} ({views_label}) | {tags_str}"
         payload: dict[str, Any] = {
             "track_id": self.track.track_id,
             "video_id": self.track.video_id,
@@ -227,6 +268,11 @@ class RankedCandidate:
             "source": self.track.source,
             "seed_artist": self.track.seed_artist,
             "seed_archetype": self.track.seed_archetype,
+            "cooccurrence_count": self.track.cooccurrence_count,
+            "discovery_sources": list(self.track.discovery_sources),
+            "discovery_route": route_str,
+            "measured_bpm": round(float(self.measured_bpm), 1) if self.measured_bpm else None,
+            "sweetspot_score": round(float(self.sweetspot_score), 3) if self.sweetspot_score is not None else None,
             "score": round(float(self.score), 4),
             "reason": {
                 "mode": self.mode,
@@ -234,6 +280,7 @@ class RankedCandidate:
                 "explore_bonus": round(float(self.explore_bonus), 4),
                 "hidden_level": self.hidden_level,
                 "matched_tags": self.matched_tags[:3],
+                "discovery_route": route_str,
                 "summary": summary,
             },
         }
@@ -241,6 +288,10 @@ class RankedCandidate:
             payload["theory_vector"] = [round(float(v), 4) for v in self.theory_vector]
         if self.theory_explanation is not None:
             payload["theory_explanation"] = self.theory_explanation
+        if self.mir_vector is not None:
+            payload["mir_vector"] = [round(float(v), 4) for v in self.mir_vector]
+        if self.mir_layers is not None:
+            payload["mir_layers"] = self.mir_layers
         return payload
 
 

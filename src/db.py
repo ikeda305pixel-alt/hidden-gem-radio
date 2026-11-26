@@ -102,6 +102,14 @@ class RadioDatabase:
                     source TEXT NOT NULL DEFAULT 'unknown',
                     seed_artist TEXT,
                     seed_archetype TEXT,
+                    cooccurrence_count INTEGER NOT NULL DEFAULT 1,
+                    discovery_sources_json TEXT NOT NULL DEFAULT '[]',
+                    discovery_route TEXT,
+                    deezer_id INTEGER,
+                    deezer_bpm REAL,
+                    deezer_gain REAL,
+                    deezer_rank INTEGER,
+                    mir_vector_json TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -167,14 +175,52 @@ class RadioDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_added
                     ON playlist_tracks(playlist_id, added_at DESC);
+
+                CREATE TABLE IF NOT EXISTS audio_features_cache (
+                    canonical_key TEXT PRIMARY KEY,
+                    video_id TEXT,
+                    deezer_id INTEGER,
+                    artist TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    bpm REAL,
+                    gain REAL,
+                    rank INTEGER,
+                    duration INTEGER,
+                    preview_url TEXT,
+                    mir_a1_c4_json TEXT,
+                    analysis_source TEXT NOT NULL DEFAULT 'deezer_metadata',
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audio_cache_video_id ON audio_features_cache(video_id);
+
+                CREATE TABLE IF NOT EXISTS station_profiles (
+                    station_id TEXT PRIMARY KEY,
+                    centroid_json TEXT NOT NULL,
+                    axis_weights_json TEXT NOT NULL,
+                    slow_weights_json TEXT NOT NULL,
+                    sample_counts_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL
+                );
                 """
             )
-            # Safe idempotent migration for pre-existing radio.db files missing lineage columns
+            # Safe idempotent migration for pre-existing radio.db files
             cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(tracks)").fetchall()}
-            if "seed_artist" not in cols:
-                conn.execute("ALTER TABLE tracks ADD COLUMN seed_artist TEXT;")
-            if "seed_archetype" not in cols:
-                conn.execute("ALTER TABLE tracks ADD COLUMN seed_archetype TEXT;")
+            migrations = (
+                ("seed_artist", "ALTER TABLE tracks ADD COLUMN seed_artist TEXT;"),
+                ("seed_archetype", "ALTER TABLE tracks ADD COLUMN seed_archetype TEXT;"),
+                ("cooccurrence_count", "ALTER TABLE tracks ADD COLUMN cooccurrence_count INTEGER NOT NULL DEFAULT 1;"),
+                ("discovery_sources_json", "ALTER TABLE tracks ADD COLUMN discovery_sources_json TEXT NOT NULL DEFAULT '[]';"),
+                ("discovery_route", "ALTER TABLE tracks ADD COLUMN discovery_route TEXT;"),
+                ("deezer_id", "ALTER TABLE tracks ADD COLUMN deezer_id INTEGER;"),
+                ("deezer_bpm", "ALTER TABLE tracks ADD COLUMN deezer_bpm REAL;"),
+                ("deezer_gain", "ALTER TABLE tracks ADD COLUMN deezer_gain REAL;"),
+                ("deezer_rank", "ALTER TABLE tracks ADD COLUMN deezer_rank INTEGER;"),
+                ("mir_vector_json", "ALTER TABLE tracks ADD COLUMN mir_vector_json TEXT;"),
+            )
+            for col_name, ddl in migrations:
+                if col_name not in cols:
+                    conn.execute(ddl)
 
             for pl_id, pl_name in DEFAULT_PLAYLISTS:
                 conn.execute(
@@ -190,13 +236,17 @@ class RadioDatabase:
         now = time.time()
         artist_norm = normalize_artist(track.artist)
         tags_json = json.dumps(sorted({t.lower() for t in track.tags if t}), ensure_ascii=False)
+        disc_sources_json = json.dumps(list(track.discovery_sources), ensure_ascii=False)
+        mir_json = json.dumps(track.mir_vector) if track.mir_vector is not None else None
 
         with self._connect() as conn:
             # Match by canonical_key, ISRC, or MBID to keep entities deduplicated across platforms
             existing = conn.execute(
                 """
                 SELECT track_id, tags_json, isrc, mbid, release_year, view_count,
-                       duration_seconds, video_id, unplayable, seed_artist, seed_archetype
+                       duration_seconds, video_id, unplayable, seed_artist, seed_archetype,
+                       cooccurrence_count, discovery_sources_json, discovery_route,
+                       deezer_id, deezer_bpm, deezer_gain, deezer_rank, mir_vector_json
                 FROM tracks
                 WHERE track_id = ?
                    OR canonical_key = ?
@@ -214,8 +264,11 @@ class RadioDatabase:
                     INSERT INTO tracks (
                         track_id, canonical_key, isrc, mbid, artist, artist_norm, title,
                         tags_json, release_year, view_count, duration_seconds, video_id,
-                        unplayable, source, seed_artist, seed_archetype, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        unplayable, source, seed_artist, seed_archetype,
+                        cooccurrence_count, discovery_sources_json, discovery_route,
+                        deezer_id, deezer_bpm, deezer_gain, deezer_rank, mir_vector_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         resolved_id,
@@ -234,6 +287,14 @@ class RadioDatabase:
                         track.source,
                         track.seed_artist,
                         track.seed_archetype,
+                        max(1, int(track.cooccurrence_count)),
+                        disc_sources_json,
+                        track.discovery_route,
+                        track.deezer_id,
+                        track.deezer_bpm,
+                        track.deezer_gain,
+                        track.deezer_rank,
+                        mir_json,
                         now,
                         now,
                     ),
@@ -241,6 +302,9 @@ class RadioDatabase:
             else:
                 resolved_id = str(existing["track_id"])
                 merged_tags = sorted(set(json.loads(existing["tags_json"] or "[]")) | set(track.tags))
+                prev_sources = json.loads(existing["discovery_sources_json"] or "[]")
+                merged_sources = list(dict.fromkeys([*prev_sources, *track.discovery_sources]))
+                merged_cooc = max(int(existing["cooccurrence_count"] or 1), int(track.cooccurrence_count or 1), len(merged_sources) or 1)
                 conn.execute(
                     """
                     UPDATE tracks
@@ -253,6 +317,14 @@ class RadioDatabase:
                         video_id = COALESCE(?, video_id),
                         seed_artist = COALESCE(?, seed_artist),
                         seed_archetype = COALESCE(?, seed_archetype),
+                        cooccurrence_count = ?,
+                        discovery_sources_json = ?,
+                        discovery_route = COALESCE(?, discovery_route),
+                        deezer_id = COALESCE(?, deezer_id),
+                        deezer_bpm = COALESCE(?, deezer_bpm),
+                        deezer_gain = COALESCE(?, deezer_gain),
+                        deezer_rank = COALESCE(?, deezer_rank),
+                        mir_vector_json = COALESCE(?, mir_vector_json),
                         updated_at = ?
                     WHERE track_id = ?
                     """,
@@ -266,6 +338,14 @@ class RadioDatabase:
                         track.video_id,
                         track.seed_artist,
                         track.seed_archetype,
+                        merged_cooc,
+                        json.dumps(merged_sources, ensure_ascii=False),
+                        track.discovery_route,
+                        track.deezer_id,
+                        track.deezer_bpm,
+                        track.deezer_gain,
+                        track.deezer_rank,
+                        mir_json,
                         now,
                         resolved_id,
                     ),
@@ -651,9 +731,206 @@ class RadioDatabase:
             ).fetchone()
             return int(row["cnt"]) if row else 0
 
+    def get_recent_played_artists(self, station_id: str, limit: int = 5) -> list[str]:
+        """Return normalized artist names of the most recent N played/rated tracks on this station."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT artist_norm
+                FROM feedback_events
+                WHERE station_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (station_id, max(1, int(limit))),
+            ).fetchall()
+            return [str(r["artist_norm"]) for r in rows if r["artist_norm"]]
+
+    def get_audio_feature_cache(
+        self,
+        *,
+        canonical_key: str | None = None,
+        video_id: str | None = None,
+    ) -> dict[str, object] | None:
+        """Fetch cached Deezer metadata & 12-dim MIR features from SQLite."""
+        with self._connect() as conn:
+            row = None
+            if canonical_key:
+                row = conn.execute(
+                    "SELECT * FROM audio_features_cache WHERE canonical_key = ? LIMIT 1",
+                    (canonical_key,),
+                ).fetchone()
+            if row is None and video_id:
+                row = conn.execute(
+                    "SELECT * FROM audio_features_cache WHERE video_id = ? LIMIT 1",
+                    (video_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            raw_mir = row["mir_a1_c4_json"]
+            return {
+                "canonical_key": str(row["canonical_key"]),
+                "video_id": row["video_id"],
+                "deezer_id": row["deezer_id"],
+                "artist": str(row["artist"]),
+                "title": str(row["title"]),
+                "bpm": row["bpm"],
+                "gain": row["gain"],
+                "rank": row["rank"],
+                "duration": row["duration"],
+                "preview_url": row["preview_url"],
+                "mir_a1_c4": list(json.loads(raw_mir)) if raw_mir else None,
+                "analysis_source": str(row["analysis_source"]),
+                "updated_at": float(row["updated_at"]),
+            }
+
+    def upsert_audio_feature_cache(
+        self,
+        *,
+        canonical_key: str,
+        video_id: str | None = None,
+        deezer_id: int | None = None,
+        artist: str = "",
+        title: str = "",
+        bpm: float | None = None,
+        gain: float | None = None,
+        rank: int | None = None,
+        duration: int | None = None,
+        preview_url: str | None = None,
+        mir_a1_c4: list[float] | None = None,
+        analysis_source: str = "deezer_metadata",
+    ) -> None:
+        """Store or update Deezer metadata and measured 12-dim MIR vector in SQLite cache."""
+        now = time.time()
+        mir_json = json.dumps([float(x) for x in mir_a1_c4]) if mir_a1_c4 is not None else None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO audio_features_cache (
+                    canonical_key, video_id, deezer_id, artist, title, bpm, gain, rank,
+                    duration, preview_url, mir_a1_c4_json, analysis_source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_key) DO UPDATE SET
+                    video_id = COALESCE(excluded.video_id, audio_features_cache.video_id),
+                    deezer_id = COALESCE(excluded.deezer_id, audio_features_cache.deezer_id),
+                    artist = COALESCE(NULLIF(excluded.artist, ''), audio_features_cache.artist),
+                    title = COALESCE(NULLIF(excluded.title, ''), audio_features_cache.title),
+                    bpm = COALESCE(excluded.bpm, audio_features_cache.bpm),
+                    gain = COALESCE(excluded.gain, audio_features_cache.gain),
+                    rank = COALESCE(excluded.rank, audio_features_cache.rank),
+                    duration = COALESCE(excluded.duration, audio_features_cache.duration),
+                    preview_url = COALESCE(excluded.preview_url, audio_features_cache.preview_url),
+                    mir_a1_c4_json = COALESCE(excluded.mir_a1_c4_json, audio_features_cache.mir_a1_c4_json),
+                    analysis_source = excluded.analysis_source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    canonical_key,
+                    video_id,
+                    deezer_id,
+                    artist,
+                    title,
+                    bpm,
+                    gain,
+                    rank,
+                    duration,
+                    preview_url,
+                    mir_json,
+                    analysis_source,
+                    now,
+                ),
+            )
+
+    def get_station_profile(self, station_id: str) -> dict[str, object] | None:
+        """Load calibrated 16-dim centroid, consistency axis_weights, and slow_weights for station_id."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM station_profiles WHERE station_id = ? LIMIT 1",
+                (station_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "station_id": str(row["station_id"]),
+                "centroid": list(json.loads(row["centroid_json"])),
+                "axis_weights": list(json.loads(row["axis_weights_json"])),
+                "slow_weights": list(json.loads(row["slow_weights_json"])),
+                "sample_counts": dict(json.loads(row["sample_counts_json"] or "{}")),
+                "updated_at": float(row["updated_at"]),
+            }
+
+    def upsert_station_profile(
+        self,
+        *,
+        station_id: str,
+        centroid: list[float],
+        axis_weights: list[float],
+        slow_weights: list[float],
+        sample_counts: dict[str, int] | None = None,
+    ) -> None:
+        """Persist calibrated 16-dim station centroid, axis_weights, and slow_weights to SQLite."""
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO station_profiles (
+                    station_id, centroid_json, axis_weights_json, slow_weights_json,
+                    sample_counts_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(station_id) DO UPDATE SET
+                    centroid_json = excluded.centroid_json,
+                    axis_weights_json = excluded.axis_weights_json,
+                    slow_weights_json = excluded.slow_weights_json,
+                    sample_counts_json = excluded.sample_counts_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    station_id,
+                    json.dumps([float(x) for x in centroid]),
+                    json.dumps([float(x) for x in axis_weights]),
+                    json.dumps([float(x) for x in slow_weights]),
+                    json.dumps(sample_counts or {}),
+                    now,
+                ),
+            )
+
+    def reset_unrated_tracks(self) -> dict[str, int]:
+        """Purge unrated legacy candidate tracks while preserving playlists, Good/BAD feedback, and rated tracks."""
+        with self._connect() as conn:
+            before_tracks = int(conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0])
+            # Delete station_candidates & tracks that have NO feedback_events and are NOT in playlist_tracks
+            cur_links = conn.execute(
+                """
+                DELETE FROM station_candidates
+                WHERE track_id NOT IN (SELECT DISTINCT track_id FROM feedback_events WHERE track_id IS NOT NULL)
+                  AND track_id NOT IN (SELECT DISTINCT track_id FROM playlist_tracks WHERE track_id IS NOT NULL)
+                """
+            )
+            cur_tracks = conn.execute(
+                """
+                DELETE FROM tracks
+                WHERE track_id NOT IN (SELECT DISTINCT track_id FROM feedback_events WHERE track_id IS NOT NULL)
+                  AND track_id NOT IN (SELECT DISTINCT track_id FROM playlist_tracks WHERE track_id IS NOT NULL)
+                  AND (video_id IS NULL OR video_id NOT IN (SELECT DISTINCT video_id FROM playlist_tracks WHERE video_id IS NOT NULL))
+                """
+            )
+            remaining_tracks = int(conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0])
+            preserved_playlists = int(conn.execute("SELECT COUNT(*) FROM playlist_tracks").fetchone()[0])
+            preserved_feedback = int(conn.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0])
+            return {
+                "before_tracks": before_tracks,
+                "deleted_tracks": cur_tracks.rowcount,
+                "deleted_candidate_links": cur_links.rowcount,
+                "remaining_tracks": remaining_tracks,
+                "preserved_playlist_tracks": preserved_playlists,
+                "preserved_feedback_events": preserved_feedback,
+            }
+
     @staticmethod
     def _row_to_track(row: sqlite3.Row) -> TrackEntity:
         keys = set(row.keys())
+        raw_sources = row["discovery_sources_json"] if "discovery_sources_json" in keys else "[]"
+        raw_mir = row["mir_vector_json"] if "mir_vector_json" in keys else None
         return TrackEntity(
             track_id=str(row["track_id"]),
             canonical_key=str(row["canonical_key"]),
@@ -670,4 +947,12 @@ class RadioDatabase:
             source=str(row["source"]),
             seed_artist=row["seed_artist"] if "seed_artist" in keys else None,
             seed_archetype=row["seed_archetype"] if "seed_archetype" in keys else None,
+            cooccurrence_count=int(row["cooccurrence_count"]) if "cooccurrence_count" in keys and row["cooccurrence_count"] is not None else 1,
+            discovery_sources=list(json.loads(raw_sources or "[]")),
+            discovery_route=row["discovery_route"] if "discovery_route" in keys else None,
+            deezer_id=row["deezer_id"] if "deezer_id" in keys else None,
+            deezer_bpm=row["deezer_bpm"] if "deezer_bpm" in keys else None,
+            deezer_gain=row["deezer_gain"] if "deezer_gain" in keys else None,
+            deezer_rank=row["deezer_rank"] if "deezer_rank" in keys else None,
+            mir_vector=list(json.loads(raw_mir)) if raw_mir else None,
         )

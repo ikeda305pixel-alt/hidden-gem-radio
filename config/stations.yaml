@@ -1,5 +1,5 @@
 meta:
-  generated_at: '2026-11-26T02:43:20.584901+00:00'
+  generated_at: '2026-11-26T06:07:23.104976+00:00'
   sources_used:
   - default_seed_fallback
   records_imported: 0
@@ -15,15 +15,18 @@ stations:
   - melodic hip hop
   seed_artists:
   - bbno$
+  - KYLE
   - Migos
   - J. Cole
   - Lil Durk
-  - KYLE
   - Macklemore
   - Lupe Fiasco
   - Drake
   - Eminem
-  max_popularity_views: 500000
+  - DJ Shadow
+  - Social House
+  - Paul Russell
+  max_popularity_views: 500000000
   exploration_rate: 0.95
   target_theory_vector:
     T1: 0.55
@@ -41,18 +44,28 @@ stations:
   spotify_anchor_seeds:
   - bbno$ - edamame
   - bbno$ - bag or die
-  - Migos - Bad and Boujee
+  - bbno$ - b to the b
+  - bbno$ & lentra - imma
+  - tha Supreme & bbno$ - Offline
+  - MAX & bbno$ - Working For The Weekend
+  - KYLE & Lil Yachty - iSpy
+  - KYLE & Kehlani - Playinwitme
+  - Social House & Lil Yachty - Magic In The Hamptons
+  - Macklemore & Lil Yachty - Marmalade
+  - Macklemore & Skylar Grey - Glorious
+  - Migos & Lil Uzi Vert - Bad and Boujee
+  - DJ Shadow & Run The Jewels - Nobody Speak
   - J. Cole - ATM
-  - Lil Durk - All My Life
-  - KYLE - iSpy
-  - Macklemore - Marmalade
+  - Lil Durk & J. Cole - All My Life
   - Lupe Fiasco - The Show Goes On
   - Drake - In My Feelings
-  - Eminem - The Monster
-  discovery_queries:
-  - bouncy hip hop underground rap 808 groove
-  - bbno$ Yung Gravy Amine similar underground rap
-  - melodic bouncy trap hip hop hidden gem
+  - Cardi B - I Like It
+  - Eminem & Rihanna - The Monster
+  - Iggy Azalea - Fancy
+  - Paul Russell - Hallelujah
+  - Blanco Brown - The Git Up
+  - Kent Jones - Don't Mind
+  - Lil Nas X - HOLIDAY
 - station_id: japan_hiphop_street
   name: Japan Hip-Hop & Street
   seed_tags:
@@ -67,7 +80,11 @@ stations:
   - KID FRESINO
   - Awich
   - YZERR
-  max_popularity_views: 500000
+  - STUTS
+  - PUNPEE
+  - KEIJU
+  - ¥ellow Bucks
+  max_popularity_views: 500000000
   exploration_rate: 1.0
   target_theory_vector:
     T1: 0.65
@@ -84,12 +101,10 @@ stations:
   - high_density_rhyme_groove
   spotify_anchor_seeds:
   - BAD HOP - Hood Gospel
-  discovery_queries:
-  - Japanese hip hop underground melodic trap
-  - BAD HOP YZERR ZORN similar Japanese rap
-  - 邦ラップ メロウ ストリート ヒップホップ
+  pes_anchors:
+  - Jabberloop x Soft Lipa - Dental Driller
 - station_id: edm_dance_party
-  name: EDM & Dance Party
+  name: EDM, UKG & Dance Party
   seed_tags:
   - melodic progressive house
   - uk garage
@@ -103,9 +118,13 @@ stations:
   - NOTION
   - SAINt JHN
   - Tiesto
+  - Gryffin
   - Major Lazer
   - Jax Jones
-  max_popularity_views: 500000
+  - Bakermat
+  - Snakehips
+  - Diplo
+  max_popularity_views: 500000000
   exploration_rate: 0.9
   target_theory_vector:
     T1: 0.92
@@ -122,22 +141,44 @@ stations:
   - tresillo_drop
   spotify_anchor_seeds:
   - Avicii - Gonna Love Ya
-  - Avicii - What Would I Change It To
+  - Avicii & Aluna - What Would I Change It To
   - David Guetta & Avicii - Sunshine
   - Calvin Harris - Feel So Close
-  - Chrystal - The Days (NOTION Remix)
+  - Chrystal & NOTION - The Days (NOTION Remix)
   - SAINt JHN - Roses (Imanbek Remix)
+  - Madism - Pumped Up Kicks
   - Tiesto - Red Lights
+  - Tiesto & Post Malone - Jackie Chan
+  - Gryffin - Tie Me Down
+  - David Guetta & Showtek - Bad
   - David Guetta - Hey Mama
   - Major Lazer - Lean On
+  - Major Lazer - Powerful
   - Jax Jones - Instruction
+  - Bakermat - Baiana
+  - La Roux & GAMPER & DADONI - Bulletproof
+  - Diplo & MO - Get It Right
+  - Snakehips - All My Friends
   - Black Eyed Peas - I Gotta Feeling
-  - Madism - Pumped Up Kicks
+  - Black Eyed Peas - The Time (Dirty Bit)
+  - DJ Snake - Taki Taki
+  - Daddy Yankee - Con Calma
+  - Flo Rida - Club Can't Handle Me
+  - Flo Rida - I Don't Like It, I Love It
   - Katy Perry - Last Friday Night
-  discovery_queries:
-  - melodic progressive house UKG 2-step remix hidden gem
-  - NOTION Imanbek Jax Jones similar dance house
-  - euphoric melodic house vocal drop underground
+  - Ellie Goulding - Burn
+  - Ellie Goulding - Lights
+  - Dua Lipa - New Rules
+  - Justin Bieber - Sorry
+  - Justin Bieber - What Do You Mean?
+  - Mike Perry - All Star
+  - Sam Smith & Kim Petras - Unholy
+  - Chris Brown - Yeah 3x
+  - Rihanna - Only Girl (In The World)
+  pes_anchors:
+  - Data - Aerius Light
+  - The xx - Crystalized (Rory Phillips Remix)
+  - Elite Force - The Law of Life
 - station_id: melodic_rap_alt
   name: Melodic Rap & Alt-Pop
   seed_tags:
@@ -155,7 +196,10 @@ stations:
   - iann dior
   - mgk
   - Jeremy Zucker
-  max_popularity_views: 500000
+  - Twenty One Pilots
+  - Sub Urban
+  - Imagine Dragons
+  max_popularity_views: 500000000
   exploration_rate: 1.05
   target_theory_vector:
     T1: 0.78
@@ -172,42 +216,55 @@ stations:
   spotify_anchor_seeds:
   - Lil Peep - Better Off (Dying)
   - Juice WRLD - Lucid Dreams
-  - Juice WRLD - Come & Go
-  - Post Malone - Sunflower
-  - The Kid LAROI - STAY
-  - 24kGoldn - Mood
+  - Juice WRLD & Marshmello - Come & Go
+  - Post Malone & Swae Lee - Sunflower
+  - The Kid LAROI & Justin Bieber - STAY
+  - 24kGoldn & iann dior - Mood
+  - iann dior - Holding On
+  - mgk & blackbear - my ex's best friend
   - blackbear - hot girl bummer
   - blackbear - do re mi
-  - iann dior - Holding On
-  - mgk - my ex's best friend
+  - Lil Nas X - THATS WHAT I WANT
+  - Lil Nas X - MONTERO
+  - ElyOtto - SugarCrash!
+  - Jeremy Zucker - 18
   - Jeremy Zucker - comethru
-  discovery_queries:
-  - melodic emo rap guitar trap underground hidden gem
-  - iann dior blackbear Jeremy Zucker similar alt-pop
-  - bright guitar chord sad vocal melodic rap
-- station_id: indie_groove_hooks
-  name: Indie Groove & Feel-Good
+  - Twenty One Pilots - Chlorine
+  - SHAED & ZAYN - Trampoline
+  - Sub Urban - Cradles
+  - Halsey - Walls Could Talk
+  - Imagine Dragons - Demons
+  - Imagine Dragons - Radioactive
+  - Imagine Dragons - Bad Liar
+  - Imagine Dragons - Natural
+  - ari hicks - Good Boy
+  - margø - guts
+  - Papithbk - Losing Interest
+- station_id: indie_groove_cult
+  name: Indie Groove, PES Cult & Parisian Chic
   seed_tags:
   - indie pop
   - folktronica
-  - indietronica
   - nu-disco
+  - french pop
   - funk pop
+  - indietronica
   seed_artists:
   - Royel Otis
   - Oberhofer
+  - DOPE LEMON
+  - Phoenix
+  - L'Imperatrice
+  - Kid Francescoli
+  - French 79
   - Foster The People
   - Fitz and The Tantrums
   - Hozier
+  - Dominic Fike
+  - Surfaces
   - imase
   - Earth Wind & Fire
-  - Surfaces
-  - Dominic Fike
-  - DOPE LEMON
-  - Phoenix
-  - Bastille
-  - Walk the Moon
-  max_popularity_views: 500000
+  max_popularity_views: 500000000
   exploration_rate: 1.0
   target_theory_vector:
     T1: 0.88
@@ -226,18 +283,69 @@ stations:
   spotify_anchor_seeds:
   - Royel Otis - Oysters In My Pocket
   - Oberhofer - Gold
+  - DOPE LEMON - Marinade
+  - DICE - Stop Sign
+  - Rancid Eddie - Dry
+  - The Rare Occasions - Origami
+  - BØRNS - Electric Love
+  - Phoenix - Girlfriend
+  - Architecture In Helsinki - Escapee
+  - The Royal Concept - On Our Way
   - Foster The People - Pumped Up Kicks
   - Fitz and The Tantrums - Out of My League
+  - Fitz and The Tantrums - I Just Wanna Shine
   - Hozier - Too Sweet
-  - imase - NIGHT DANCER
-  - Earth Wind & Fire - September
-  - Surfaces - Sunday Best
   - Dominic Fike - 3 Nights
-  - DOPE LEMON - Marinade
-  - Phoenix - Girlfriend
+  - Surfaces - Sunday Best
+  - Milky Chance - Stolen Dance
   - Bastille - Pompeii
-  - Walk the Moon - Shut Up and Dance
-  discovery_queries:
-  - indie funk groove feel good bassline hidden gem
-  - Royel Otis DOPE LEMON Parcels Oberhofer similar indie
-  - dorian indie pop nu-disco bouncy bassline
+  - Bastille - Good Grief
+  - WALK THE MOON - Shut Up and Dance
+  - Engelwood - One Step Ahead
+  - imase - NIGHT DANCER
+  - Nicky Youre - Sunroof
+  - Nicky Youre - Shut Me Up
+  - Eagles Of Death Metal - Miss Alissa
+  - Tally Hall - The Bidding
+  - George Ezra - Paradise
+  - George Ezra - Dance All Over Me
+  - Tai Verdes - AOK
+  - MKTO - Classic
+  - Toploader - Dancing in the Moonlight
+  - Earth Wind & Fire - September
+  - The Weeknd - Can't Feel My Face
+  - Robin Thicke - Blurred Lines
+  - Miley Cyrus - Flowers
+  - Charlie Puth - I Don't Think That I Like Her
+  - Ashley Park - Mon Soleil
+  - Charlie Faron - Claire
+  - Ali Danel - La nuit qui vient
+  - DOPAMOON & Lydia Kepinski - Reine de l'attitude
+  - Black Lodge Collective - Funky Sax Action
+  - Yael Naim - New Soul
+  - La La Land Cast - Another Day Of Sun
+  - TOTO - Africa
+  - Fall Out Boy - Uma Thurman
+  - Benson Boone - Beautiful Things
+  - Journey - Any Way You Want It
+  pes_anchors:
+  - Phoenix - Armistice
+  - The Temper Trap - Sweet Disposition
+  - Passion Pit - The Reeling
+  - Vampire Weekend - Cousins
+  - Crystal Castles - Celestica
+  - Fever Ray - When I Grow Up
+  - Keane ft. K'Naan - Stop for a Minute
+  - Azymuth - Roda Piao
+  - Balkan Beat Box - Marcha de la Vida
+  - Black Blood - A.I.E. (A Mwana)
+  - Nina Zilli - 50mila
+  - Babasónicos - Microdancing
+  emily_anchors:
+  - L'Imperatrice - Paris
+  - L'Imperatrice - Matahari
+  - Kid Francescoli - Moon (And It Went Like)
+  - French 79 & Kid Francescoli - Lovin' Feeling
+  - Bon Entendeur - Le temps est bon
+  - Vendredi sur Mer - Le Lac
+  - Therapie TAXI - Hit Sale

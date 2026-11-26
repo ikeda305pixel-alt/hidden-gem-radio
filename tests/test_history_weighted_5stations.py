@@ -36,8 +36,8 @@ def test_classify_entry_routes_all_5_stations_accurately() -> None:
     assert classify_entry_to_station("Chrystal", "The Days (NOTION Remix)") == "edm_dance_party"
     assert classify_entry_to_station("Juice WRLD", "Lucid Dreams") == "melodic_rap_alt"
     assert classify_entry_to_station("Lil Peep", "Better Off (Dying)") == "melodic_rap_alt"
-    assert classify_entry_to_station("Royel Otis", "Oysters In My Pocket") == "indie_groove_hooks"
-    assert classify_entry_to_station("imase", "NIGHT DANCER") == "indie_groove_hooks"
+    assert classify_entry_to_station("Royel Otis", "Oysters In My Pocket") == "indie_groove_cult"
+    assert classify_entry_to_station("imase", "NIGHT DANCER") == "indie_groove_cult"
 
 
 def test_weighted_history_generates_5_stations_and_skips_heavy_rotation_originals(tmp_path: Path) -> None:

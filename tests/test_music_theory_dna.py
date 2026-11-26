@@ -31,7 +31,7 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
         "japan_hiphop_street",
         "edm_dance_party",
         "melodic_rap_alt",
-        "indie_groove_hooks",
+        "indie_groove_cult",
     ]
 
     by_id = {s.station_id: s for s in stations}
@@ -47,14 +47,15 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
     assert by_id["melodic_rap_alt"].target_theory_vector == {
         "T1": 0.78, "T2": 0.62, "T3": 0.70, "T4": 0.96, "T5": 0.84,
     }
-    assert by_id["indie_groove_hooks"].target_theory_vector == {
+    assert by_id["indie_groove_cult"].target_theory_vector == {
         "T1": 0.88, "T2": 0.86, "T3": 0.85, "T4": 0.80, "T5": 0.86,
     }
     for st in stations:
         assert st.bpm_zones
         assert st.theory_archetypes
         assert st.spotify_anchor_seeds
-        assert st.discovery_queries
+    assert len(by_id["indie_groove_cult"].pes_anchors) == 12
+    assert len(by_id["indie_groove_cult"].emily_anchors) == 7
 
 
 def test_theory_feature_extractor_produces_10_dim_vector_and_merges_dsp_signal() -> None:

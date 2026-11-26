@@ -130,6 +130,8 @@ _US_HIPHOP_ARTISTS = {
     "yung gravy", "snoop dogg", "kanye west", "pusha t", "joey bada", "jack harlow",
     "da baby", "dababy", "kodak black", "roddy ricch", "lil wayne", "50 cent",
     "outkast", "anderson paak", "mac miller", "wiz khalifa", "logic", "big sean",
+    "lil yachty", "social house", "dj shadow", "run the jewels", "cardi b",
+    "iggy azalea", "paul russell", "blanco brown", "kent jones", "tha supreme",
 }
 _US_HIPHOP_KW_RE = re.compile(
     r"\b(?:hip\s*hop|rap|trap|drill|808|bouncy\s*rap|boom\s*bap|freestyle|cypher|gangsta)\b",
@@ -143,7 +145,10 @@ _EDM_ARTISTS = {
     "marshmello", "fisher", "peggy gou", "kaytranada", "sub focus", "chase status",
     "bonobo", "caribou", "flume", "odesza", "illenium", "porter robinson", "madeon",
     "galantis", "alan walker", "david guetta avicii", "diplo", "dom dolla", "john summit",
-    "barry can t swim", "sammy virji", "interplanetary criminal",
+    "barry can t swim", "sammy virji", "interplanetary criminal", "gryffin", "showtek",
+    "bakermat", "la roux", "gamper dadoni", "snakehips", "dj snake", "daddy yankee",
+    "flo rida", "ellie goulding", "dua lipa", "justin bieber", "mike perry",
+    "sam smith", "kim petras", "chris brown", "rihanna", "elite force", "data",
 }
 _EDM_KW_RE = re.compile(
     r"\b(?:remix|edm|house|ukg|uk\s*garage|2-?step|techno|trance|dnb|drum\s*and\s*bass|"
@@ -156,7 +161,9 @@ _MELODIC_RAP_ALT_ARTISTS = {
     "xxxtentacion", "trippie redd", "nf", "lauv", "bazzi", "joji", "oliver tree",
     "d4vd", "powfu", "yungblud", "glaive", "brakence", "lil tecca", "polo g",
     "kid cudi", "chase atlantic", "billie eilish", "conan gray", "chelsea cutler",
-    "alec benjamin", "tate mcrae", "jvke", "g eazy",
+    "alec benjamin", "tate mcrae", "jvke", "g eazy", "lil nas x", "elyotto",
+    "twenty one pilots", "shaed", "sub urban", "halsey", "imagine dragons",
+    "ari hicks", "margo", "margø", "papithbk",
 }
 _MELODIC_RAP_ALT_KW_RE = re.compile(
     r"\b(?:emo\s*rap|melodic\s*rap|alt-?pop|pop\s*punk|sad\s*trap|emo|heartbreak|soundcloud\s*rap)\b",
@@ -171,7 +178,16 @@ _INDIE_GROOVE_ARTISTS = {
     "nulbarich", "kroi", "lucky kilimanjaro", "sirup", "bruno mars", "silk sonic",
     "mac demarco", "men i trust", "clairo", "rex orange county", "still woozy",
     "glass animals", "metronomy", "the 1975", "arctic monkeys", "cage the elephant",
-    "the strokes", "the shins", "phoebe bridgers",
+    "the strokes", "the shins", "phoebe bridgers", "dice", "rancid eddie",
+    "the rare occasions", "borns", "børns", "architecture in helsinki", "the royal concept",
+    "milky chance", "engelwood", "nicky youre", "eagles of death metal", "tally hall",
+    "george ezra", "tai verdes", "mkto", "toploader", "the weeknd", "robin thicke",
+    "miley cyrus", "charlie puth", "ashley park", "charlie faron", "ali danel",
+    "dopamoon", "black lodge collective", "yael naim", "toto", "fall out boy",
+    "benson boone", "journey", "the temper trap", "passion pit", "crystal castles",
+    "fever ray", "keane", "azymuth", "balkan beat box", "black blood", "nina zilli",
+    "babasonicos", "babasónicos", "kid francescoli", "french 79", "bon entendeur",
+    "vendredi sur mer", "therapie taxi",
 }
 
 
@@ -185,7 +201,7 @@ def compute_recency_frequency_weight(play_count: int, days_ago: float) -> float:
 def default_theory_stations(
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
 ) -> list[StationConfig]:
-    """Load the 5 Deep Music Theory DNA stations from config/music_theory_profile.yaml."""
+    """Load the 5 MIR + Collaborative Graph stations from config/music_theory_profile.yaml."""
     profile = load_music_theory_profile(profile_path)
     raw_stations = profile.get("stations") or []
     stations = [StationConfig.from_dict(item) for item in raw_stations if isinstance(item, dict)]
@@ -195,25 +211,25 @@ def default_theory_stations(
 
 
 def default_fallback_stations() -> list[StationConfig]:
-    """Fallback stations prioritizing the 5 Deep Music Theory DNA stations."""
+    """Fallback stations prioritizing the 5 canonical stations."""
     profile_stations = load_music_theory_profile(DEFAULT_THEORY_PROFILE_PATH).get("stations") or []
     if profile_stations:
         return [StationConfig.from_dict(item) for item in profile_stations if isinstance(item, dict)]
     return [
         StationConfig(
             station_id="edm_dance_party",
-            name="EDM & Dance Party",
+            name="EDM, UKG & Dance Party",
             seed_tags=["melodic progressive house", "uk garage", "dance pop"],
             seed_artists=["Avicii", "Calvin Harris"],
-            max_popularity_views=500_000,
+            max_popularity_views=500_000_000,
             exploration_rate=0.9,
         ),
         StationConfig(
-            station_id="indie_groove_hooks",
-            name="Indie Groove & Feel-Good",
-            seed_tags=["indie pop", "folktronica", "indietronica"],
-            seed_artists=["Oberhofer", "Royel Otis"],
-            max_popularity_views=500_000,
+            station_id="indie_groove_cult",
+            name="Indie Groove, PES Cult & Parisian Chic",
+            seed_tags=["indie pop", "nu-disco", "french pop"],
+            seed_artists=["Oberhofer", "Royel Otis", "L'Imperatrice"],
+            max_popularity_views=500_000_000,
             exploration_rate=1.0,
         ),
         StationConfig(
@@ -221,7 +237,7 @@ def default_fallback_stations() -> list[StationConfig]:
             name="US Hip-Hop & Bouncy Rap",
             seed_tags=["hip hop", "bouncy rap", "trap"],
             seed_artists=["bbno$", "Migos"],
-            max_popularity_views=500_000,
+            max_popularity_views=500_000_000,
             exploration_rate=0.95,
         ),
     ]
@@ -261,7 +277,7 @@ def classify_entry_to_station(
     title: str,
     tags: list[str] | None = None,
 ) -> str:
-    """Route a YouTube/YTMusic watch entry into one of the 5 Deep Music Theory DNA stations."""
+    """Route a YouTube/YTMusic watch entry into one of the 5 canonical stations."""
     candidate_norms: set[str] = set()
     for token in _split_artist_tokens(artist):
         candidate_norms.update(_artist_lookup_variants(token))
@@ -281,7 +297,7 @@ def classify_entry_to_station(
     if candidate_norms & _EDM_ARTISTS:
         return "edm_dance_party"
     if candidate_norms & _INDIE_GROOVE_ARTISTS:
-        return "indie_groove_hooks"
+        return "indie_groove_cult"
 
     # Step 2: Keyword / script fallback when artist is not in explicit lexicons
     if _JP_SCRIPT_RE.search(combined) and _JP_HIPHOP_KW_RE.search(combined):
@@ -293,8 +309,8 @@ def classify_entry_to_station(
     if _US_HIPHOP_KW_RE.search(combined):
         return "us_hiphop_bouncy"
     if a_norm in _INDIE_GROOVE_ARTISTS:
-        return "indie_groove_hooks"
-    return "indie_groove_hooks"
+        return "indie_groove_cult"
+    return "indie_groove_cult"
 
 
 def _extract_video_id(url: str) -> str | None:
@@ -812,10 +828,10 @@ def _select_stations_for_count(all_five: list[StationConfig], num_stations: int)
     n = max(2, min(5, int(num_stations)))
     if n >= len(all_five):
         return list(all_five)
-    # Prioritize edm_dance_party & indie_groove_hooks when slicing to <5 so fallback seeds stay covered
+    # Prioritize edm_dance_party & indie_groove_cult when slicing to <5 so fallback seeds stay covered
     priority_order = [
         "edm_dance_party",
-        "indie_groove_hooks",
+        "indie_groove_cult",
         "us_hiphop_bouncy",
         "melodic_rap_alt",
         "japan_hiphop_street",
@@ -836,8 +852,9 @@ def generate_stations_yaml(
     offline: bool = False,
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
     reference_time: datetime | None = None,
+    calibrate_db_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Read available history sources, build weighted 5-station DNA config, and write stations.yaml."""
+    """Read available history sources, build weighted 5-station config, and optionally calibrate SQLite MIR profiles."""
     records: list[dict[str, Any]] = []
     sources_used: list[str] = []
     warnings: list[str] = []
@@ -891,7 +908,7 @@ def generate_stations_yaml(
         finally:
             lb_client.close()
 
-    stations = _select_stations_for_count(all_stations, num_stations)
+    stations = _select_stations_for_count(all_five=all_stations, num_stations=num_stations)
 
     meta = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -907,11 +924,28 @@ def generate_stations_yaml(
         meta=meta,
         history_index=history_index if (history_index["known_video_ids"] or history_index["known_track_keys"]) else None,
     )
+
+    calibrated_stations = 0
+    if calibrate_db_path is not None:
+        from src.db import RadioDatabase
+        from src.recommender.calibrate_profile import calibrate_all_stations
+
+        cal_db = RadioDatabase(calibrate_db_path)
+        cal_res = calibrate_all_stations(
+            cal_db,
+            stations=stations,
+            takeout_records=records,
+            allow_network=not offline,
+            reference_time=reference_time,
+        )
+        calibrated_stations = len(cal_res.get("stations") or {})
+
     return {
         "output_path": str(out),
         "station_count": len(stations),
         "station_ids": [s.station_id for s in stations],
         "records_imported": len(records),
+        "calibrated_stations": calibrated_stations,
         "known_video_ids_count": len(history_index["known_video_ids"]),
         "known_track_keys_count": len(history_index["known_track_keys"]),
         "sources_used": meta["sources_used"],
