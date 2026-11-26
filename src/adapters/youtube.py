@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +21,22 @@ logger = logging.getLogger(__name__)
 
 _OEMBED_ENDPOINT = "https://www.youtube.com/oembed"
 _EMBED_PAGE_URL = "https://www.youtube.com/embed/{video_id}"
+_EMBED_REJECT_HTTP_STATUSES = frozenset({400, 401, 403, 404})
+_EMBED_REQUEST_HEADERS = {
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "http://127.0.0.1:8000/",
+    "Origin": "http://127.0.0.1:8000",
+}
+_EMBEDDED_PLAYER_RESPONSE_RE = re.compile(
+    r'"embedded_player_response"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
+_UNPLAYABLE_PLAYABILITY_STATUSES = frozenset(
+    {"UNPLAYABLE", "LOGIN_REQUIRED", "CONTENT_CHECK_REQUIRED"}
+)
 _EMBED_UNPLAYABLE_PATTERNS = (
     re.compile(r'\\?"playableInEmbed\\?"\s*:\s*false', re.IGNORECASE),
     re.compile(
-        r'\\?"playabilityStatus\\?"\s*:\s*\{[^}]{0,400}\\?"status\\?"\s*:\s*\\?"(?:UNPLAYABLE|ERROR|LOGIN_REQUIRED)\\?"',
+        r'\\?"(?:previewP|p)layabilityStatus\\?"\s*:\s*\{[^}]{0,450}\\?"status\\?"\s*:\s*\\?"(?:UNPLAYABLE|LOGIN_REQUIRED|CONTENT_CHECK_REQUIRED)\\?"',
         re.IGNORECASE,
     ),
     re.compile(r'\\?"status\\?"\s*:\s*\\?"UNPLAYABLE\\?"', re.IGNORECASE),
@@ -46,31 +61,82 @@ _SLOP_TITLE_RE = re.compile(
 _ALT_REJECT_RE = re.compile(
     r"(?:\b(?:ai\s*generated|suno|udio|type\s*beat|free\s*beat|1\s*hour|slowed|reverb|"
     r"nightcore|sped\s*up|spedup|karaoke|cover|full\s*album|loop\s*1h|8d\s*audio|"
-    r"live|concert|unofficial|fan\s*made|fanmade|bootleg|mashup|pitched)\b)",
+    r"live|concert|unofficial|fan\s*made|fanmade|bootleg|mashup|pitched|"
+    r"instrumental|acapella|reaction|bass\s*boosted|8\s*bit|tutorial|shorts?)\b)",
     re.IGNORECASE,
 )
 _LYRIC_TITLE_RE = re.compile(r"\blyrics?\b", re.IGNORECASE)
+_OFFICIAL_LABEL_RE = re.compile(
+    r"\b(?:interscope\s+records|atlantic\s+records|republic\s+records|def\s+jam\s+recordings|"
+    r"rca\s+records|columbia\s+records|capitol\s+records|warner\s+records|sony\s+music|"
+    r"universal\s+music|xl\s+recordings|4ad|domino\s+recording\s+co|sub\s+pop|warp\s+records|"
+    r"ninja\s+tune|stones\s+throw\s+records|top\s+dawg\s+entertainment|dreamville|ovo\s+sound|"
+    r"cactus\s+jack|roc\s+nation|lyrical\s+lemonade|worldstarhiphop)\b",
+    re.IGNORECASE,
+)
 _OFFICIAL_CHANNEL_RE = re.compile(
-    r"(?:vevo\b|\bofficial\b|\brecords?\b|\brecordings?\b|\bmusic\b|\bentertainment\b|"
-    r"\binterscope\b|\batlantic\b|\brepublic\b|\bdef\s*jam\b|\brca\b|\bcolumbia\b|"
-    r"\bcapitol\b|\bwarner\b|\bsony\b|\buniversal\b|\bxl\s*recordings\b|\b4ad\b|"
-    r"\bdomino\b|\bsub\s*pop\b|\bwarp\b|\bninja\s*tune\b|\bstones\s*throw\b|\btde\b|"
-    r"\btop\s*dawg\b|\bdreamville\b|\bovo\b|\bcactus\s*jack\b|\broc\s*nation\b|"
-    r"\bempire\b|\bawal\b|\bcolors\b|\blyrical\s*lemonade\b|\bworldstarhiphop\b|"
-    r"-\s*topic$)",
+    r"(?:vevo$|-\s*topic$|" + _OFFICIAL_LABEL_RE.pattern + r")",
     re.IGNORECASE,
 )
 
 
+def _is_playability_dict_unplayable(status_obj: Any) -> bool:
+    """Inspect a playabilityStatus / previewPlayabilityStatus dict for embed unplayability."""
+    if not isinstance(status_obj, dict):
+        return False
+    if status_obj.get("playableInEmbed") is False:
+        return True
+    status_str = str(status_obj.get("status") or "").upper()
+    if status_str in _UNPLAYABLE_PLAYABILITY_STATUSES:
+        return True
+    if status_str == "ERROR":
+        serialized = json.dumps(status_obj, ensure_ascii=False).upper()
+        if "MISSING_REFERRER" not in serialized:
+            return True
+    return False
+
+
 def _is_embed_html_unplayable(html_text: str) -> bool:
-    """Detect playableInEmbed:false / UNPLAYABLE / disabled-embedding signals in YouTube embed HTML."""
+    """Detect playableInEmbed:false / previewPlayabilityStatus / playabilityStatus unplayability in embed HTML."""
     if not html_text:
         return False
-    return any(pat.search(html_text) for pat in _EMBED_UNPLAYABLE_PATTERNS)
+
+    # 1. Structured JSON decode of ytcfg "embedded_player_response" string literal
+    match = _EMBEDDED_PLAYER_RESPONSE_RE.search(html_text)
+    if match:
+        try:
+            decoded_str = json.loads(f'"{match.group(1)}"')
+            payload = json.loads(decoded_str)
+            if isinstance(payload, dict):
+                status_objs = [
+                    payload.get("previewPlayabilityStatus"),
+                    payload.get("playabilityStatus"),
+                ]
+                found_dicts = [obj for obj in status_objs if isinstance(obj, dict)]
+                if found_dicts:
+                    return any(_is_playability_dict_unplayable(obj) for obj in found_dicts)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # 2. Fallback regex scan (also handles ERROR status unless MISSING_REFERRER)
+    if any(pat.search(html_text) for pat in _EMBED_UNPLAYABLE_PATTERNS):
+        return True
+    err_match = re.search(
+        r'\\?"(?:previewP|p)layabilityStatus\\?"\s*:\s*\{[^}]{0,450}\\?"status\\?"\s*:\s*\\?"ERROR\\?"[^}]{0,450}',
+        html_text,
+        re.IGNORECASE,
+    )
+    return bool(err_match and "MISSING_REFERRER" not in err_match.group(0).upper())
 
 
 def _compact_alnum(text: str) -> str:
     return re.sub(r"[^a-z0-9\u3040-\u30ff\u4e00-\u9fff]+", "", normalize_text(text))
+
+
+def _word_boundary_match(needle_norm: str, haystack_norm: str) -> bool:
+    if not needle_norm or not haystack_norm:
+        return False
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(needle_norm)}(?![a-z0-9])", haystack_norm))
 
 
 def _title_matches(target_title: str, candidate_title: str) -> bool:
@@ -78,7 +144,10 @@ def _title_matches(target_title: str, candidate_title: str) -> bool:
     c_norm = normalize_text(candidate_title)
     if not t_norm or not c_norm:
         return False
-    if t_norm in c_norm or c_norm in t_norm:
+    if len(t_norm) <= 3:
+        if _word_boundary_match(t_norm, c_norm):
+            return True
+    elif t_norm in c_norm:
         return True
     t_tokens = [tok for tok in t_norm.split() if len(tok) >= 2]
     if not t_tokens:
@@ -89,34 +158,59 @@ def _title_matches(target_title: str, candidate_title: str) -> bool:
 
 
 def _artist_matches(target_artist: str, candidate_text: str) -> bool:
+    """Match target_artist inside candidate_text without reverse substring matching; short names require word boundaries."""
+    t_norm = normalize_text(target_artist)
+    c_norm = normalize_text(candidate_text)
     t_compact = _compact_alnum(target_artist)
     c_compact = _compact_alnum(candidate_text)
     if not t_compact or not c_compact:
         return False
-    if t_compact in c_compact or c_compact in t_compact:
+
+    # Strip known VEVO / - Topic channel suffixes for exact artist channel matching
+    stripped_channel = re.sub(r"(?:\s*-\s*topic|\s*vevo)$", "", candidate_text.strip(), flags=re.IGNORECASE).strip()
+    stripped_compact = _compact_alnum(stripped_channel)
+    stripped_norm = normalize_text(stripped_channel)
+
+    # Short artist names (<= 3 chars, e.g. "IO", "Nas", "SZA") must match on word boundaries or exact stripped channel
+    if len(t_compact) <= 3:
+        return (
+            t_compact == stripped_compact
+            or _word_boundary_match(t_norm, c_norm)
+            or _word_boundary_match(t_norm, stripped_norm)
+        )
+
+    if t_compact in c_compact or t_compact in stripped_compact:
         return True
-    t_tokens = [tok for tok in normalize_text(target_artist).split() if len(tok) >= 2]
+    t_tokens = [tok for tok in t_norm.split() if len(tok) >= 2]
     if not t_tokens:
         return False
-    c_norm = normalize_text(candidate_text)
-    return all(tok in c_norm for tok in t_tokens)
+    return all(_word_boundary_match(tok, c_norm) for tok in t_tokens)
 
 
 def _is_official_lyric_channel(item: dict[str, Any], target_artist: str) -> bool:
-    """Verify a lyric video comes from the artist or an official label/channel (rejecting random lyric uploaders)."""
-    if str(item.get("videoType") or "") in _ALLOWED_OFFICIAL_VIDEO_TYPES:
-        return True
+    """Verify a lyric video comes from the target artist (本人 / VEVO / - Topic) or a concrete official major label."""
+    raw_title = str(item.get("title") or "")
     artists = item.get("artists") or []
-    for entry in artists:
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("name") or "").strip()
-        if not name:
-            continue
+    channel_names = [
+        str(entry.get("name") or "").strip()
+        for entry in artists
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+
+    # Direct match against target artist (covers Artist, ArtistVEVO, Artist - Topic)
+    for name in channel_names:
         if _artist_matches(target_artist, name):
             return True
-        if _OFFICIAL_CHANNEL_RE.search(name):
+
+    # Official YouTube Music videoType (OMV/ATV/OFFICIAL_SOURCE_MUSIC) still requires artist attribution
+    if str(item.get("videoType") or "") in _ALLOWED_OFFICIAL_VIDEO_TYPES and _artist_matches(target_artist, raw_title):
+        return True
+
+    # Concrete real major/indie label channel (e.g. "Interscope Records") requires artist name in the video title
+    for name in channel_names:
+        if _OFFICIAL_LABEL_RE.search(name) and _artist_matches(target_artist, raw_title):
             return True
+
     return False
 
 
@@ -124,12 +218,17 @@ def is_slop_or_unofficial(item: dict[str, Any]) -> bool:
     """Reject unavailable, UGC/unverified, and AI slop / slowed / nightcore / type beat / cover items."""
     if item.get("isAvailable") is False:
         return True
+    video_type = str(item.get("videoType") or "")
     result_type = item.get("resultType")
-    if result_type and str(result_type).lower() not in {"song"}:
-        return True
-    video_type = item.get("videoType")
+    if result_type:
+        rt_lower = str(result_type).lower()
+        is_allowed_result = rt_lower == "song" or (
+            rt_lower == "video" and video_type in _ALLOWED_OFFICIAL_VIDEO_TYPES
+        )
+        if not is_allowed_result:
+            return True
     if video_type:
-        if str(video_type) not in _ALLOWED_OFFICIAL_VIDEO_TYPES:
+        if video_type not in _ALLOWED_OFFICIAL_VIDEO_TYPES:
             return True
     else:
         # When videoType is absent, require official song metadata (album or verified artist browse ID)
@@ -247,10 +346,14 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             else (client is None or http_client is not None)
         )
         self._oembed_client: httpx.Client | None = http_client
-        self._embeddable_cache: dict[str, bool] = {}
+        self._owns_oembed_client: bool = False
+        self._embeddable_cache: OrderedDict[str, bool] = OrderedDict()
+        self._embed_cache_max_size: int = 4096
         self._embed_lock = threading.Lock()
         self._embed_consecutive_net_errors = 0
         self._embed_max_net_errors = 4
+        self._embed_breaker_until: float = 0.0
+        self._embed_breaker_ttl_sec: float = 60.0
 
         if client is not None:
             self._yt = client
@@ -276,6 +379,38 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             else:
                 self._yt = YTMusic()
 
+    def close(self) -> None:
+        """Close the internally created httpx.Client if owned by this adapter."""
+        with self._embed_lock:
+            client = self._oembed_client
+            owns = self._owns_oembed_client
+            if owns:
+                self._oembed_client = None
+                self._owns_oembed_client = False
+        if owns and client is not None:
+            try:
+                client.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to close owned oEmbed httpx.Client: %s", exc)
+
+    def _cache_embeddable_locked(self, vid: str, playable: bool) -> None:
+        self._embeddable_cache[vid] = playable
+        self._embeddable_cache.move_to_end(vid)
+        while len(self._embeddable_cache) > self._embed_cache_max_size:
+            self._embeddable_cache.popitem(last=False)
+
+    def _record_embed_net_error_locked(self) -> None:
+        self._embed_consecutive_net_errors += 1
+        if self._embed_consecutive_net_errors >= self._embed_max_net_errors:
+            self._embed_breaker_until = time.monotonic() + self._embed_breaker_ttl_sec
+
+    def _is_embed_breaker_open(self) -> bool:
+        with self._embed_lock:
+            return (
+                self._embed_consecutive_net_errors >= self._embed_max_net_errors
+                and time.monotonic() < self._embed_breaker_until
+            )
+
     @property
     def client(self) -> YTMusic:
         return self._yt
@@ -295,12 +430,13 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
     def is_video_embeddable(self, video_id: str, *, timeout: float = 4.0) -> bool:
         """Check via lightweight auth-free oEmbed + /embed/{video_id} whether a video is playable in external IFrames.
 
-        - oEmbed HTTP 401 / 403 / 404 -> False (cached)
-        - oEmbed HTTP 200 -> fetch /embed/{video_id} and check playableInEmbed / playabilityStatus / unplayable signals:
-          - Unplayable / playableInEmbed:false -> False (cached)
+        - oEmbed / embed HTTP 400 / 401 / 403 / 404 -> False (cached)
+        - oEmbed HTTP 200 -> fetch /embed/{video_id} (with Referer/Origin headers) and parse
+          embedded_player_response previewPlayabilityStatus / playabilityStatus:
+          - playableInEmbed:false or UNPLAYABLE / LOGIN_REQUIRED / CONTENT_CHECK_REQUIRED / non-MISSING_REFERRER ERROR -> False (cached)
           - Otherwise -> True (cached)
         - Timeout / 429 / 5xx / network error -> safe fallback True (not cached as False),
-          with a consecutive network-error circuit breaker to avoid slowing down digging during outages.
+          with a Half-Open 60s TTL circuit breaker after consecutive network failures.
         """
         vid = str(video_id or "").strip()
         if not vid:
@@ -309,11 +445,16 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         with self._embed_lock:
             cached = self._embeddable_cache.get(vid)
             if cached is not None:
+                self._embeddable_cache.move_to_end(vid)
                 return cached
-            if self._embed_consecutive_net_errors >= self._embed_max_net_errors:
+            if (
+                self._embed_consecutive_net_errors >= self._embed_max_net_errors
+                and time.monotonic() < self._embed_breaker_until
+            ):
                 return True
             if self._oembed_client is None:
                 self._oembed_client = httpx.Client(timeout=timeout, follow_redirects=True)
+                self._owns_oembed_client = True
             client = self._oembed_client
 
         try:
@@ -328,51 +469,54 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         except (httpx.HTTPError, OSError) as exc:
             logger.debug("oEmbed check network fallback for %s: %s", vid, exc)
             with self._embed_lock:
-                self._embed_consecutive_net_errors += 1
+                self._record_embed_net_error_locked()
             return True
 
         status = resp.status_code
-        if status in {401, 403, 404}:
+        if status in _EMBED_REJECT_HTTP_STATUSES:
             with self._embed_lock:
                 self._embed_consecutive_net_errors = 0
-                self._embeddable_cache[vid] = False
+                self._embed_breaker_until = 0.0
+                self._cache_embeddable_locked(vid, False)
             return False
         if status == 429 or status >= 500:
             with self._embed_lock:
-                self._embed_consecutive_net_errors += 1
+                self._record_embed_net_error_locked()
             return True
         if status != 200:
             return True
 
         # oEmbed returned 200, but major-label official tracks often still have playableInEmbed:false.
-        # Perform a lightweight check on /embed/{video_id} for direct playabilityStatus / playableInEmbed signals.
+        # Perform a lightweight check on /embed/{video_id} with Referer/Origin to avoid Error 153.
         try:
             embed_resp = client.get(
                 _EMBED_PAGE_URL.format(video_id=vid),
-                headers={"Accept-Language": "en-US,en;q=0.9"},
+                headers=_EMBED_REQUEST_HEADERS,
                 timeout=timeout,
             )
         except (httpx.HTTPError, OSError) as exc:
             logger.debug("Embed page check network fallback for %s: %s", vid, exc)
             with self._embed_lock:
-                self._embed_consecutive_net_errors += 1
+                self._record_embed_net_error_locked()
             return True
 
         embed_status = embed_resp.status_code
-        if embed_status in {401, 403, 404}:
+        if embed_status in _EMBED_REJECT_HTTP_STATUSES:
             with self._embed_lock:
                 self._embed_consecutive_net_errors = 0
-                self._embeddable_cache[vid] = False
+                self._embed_breaker_until = 0.0
+                self._cache_embeddable_locked(vid, False)
             return False
         if embed_status == 429 or embed_status >= 500:
             with self._embed_lock:
-                self._embed_consecutive_net_errors += 1
+                self._record_embed_net_error_locked()
             return True
         if embed_status == 200:
             is_playable = not _is_embed_html_unplayable(embed_resp.text)
             with self._embed_lock:
                 self._embed_consecutive_net_errors = 0
-                self._embeddable_cache[vid] = is_playable
+                self._embed_breaker_until = 0.0
+                self._cache_embeddable_locked(vid, is_playable)
             return is_playable
         return True
 
@@ -390,24 +534,49 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         title: str,
         *,
         exclude_video_ids: set[str] | None = None,
+        max_embed_checks_per_pass: int = 3,
     ) -> tuple[TrackEntity, str] | None:
         """Find one embeddable official alternative when the primary video_id is embed-disabled.
 
         Priority:
-        1. Official Music Video (MUSIC_VIDEO_TYPE_OMV) matching artist & title.
-        2. Official Lyric Video from artist / official label channel, rejecting AI slop / cover / live / remix / slowed.
+        1. Official Music Video (MUSIC_VIDEO_TYPE_OMV) matching artist & title (max 3 embed checks).
+        2. Official Lyric Video from target artist / official label channel, rejecting slop/cover/live/remix (max 3 embed checks).
+        Skips replacement confirmation whenever the embed network circuit breaker is open.
         """
+        if self._is_embed_breaker_open():
+            return None
+
         excluded = set(exclude_video_ids or set())
         allow_remix = "remix" in title.lower()
+        check_cap = max(1, int(max_embed_checks_per_pass))
 
         def _is_rejected_title(raw_title: str, channel_name: str) -> bool:
             if _ALT_REJECT_RE.search(raw_title) or _ALT_REJECT_RE.search(channel_name):
                 return True
             return bool(not allow_remix and re.search(r"\bremix\b", raw_title, re.IGNORECASE))
 
+        def _is_verified_embeddable(vid: str) -> bool:
+            if self._is_embed_breaker_open():
+                return False
+            playable = self.is_video_embeddable(vid)
+            if not playable:
+                return False
+            with self._embed_lock:
+                if (
+                    self._embed_consecutive_net_errors >= self._embed_max_net_errors
+                    and time.monotonic() < self._embed_breaker_until
+                ):
+                    return False
+                if self._embed_consecutive_net_errors > 0 and vid not in self._embeddable_cache:
+                    return False
+            return True
+
         # Pass 1: Official Music Video (OMV)
         omv_rows = self._search_videos_raw(f"{artist} {title}".strip(), limit=8)
+        omv_checks = 0
         for item in omv_rows:
+            if omv_checks >= check_cap or self._is_embed_breaker_open():
+                break
             vid = str(item.get("videoId") or "").strip()
             if not vid or vid in excluded:
                 continue
@@ -426,10 +595,9 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 continue
             if not (_artist_matches(artist, found_artist) or _artist_matches(artist, raw_title)):
                 continue
-            if self.is_video_embeddable(vid):
-                alt = TrackEntity(
-                    track_id=f"yt:{vid}",
-                    canonical_key=f"{normalize_text(artist)}::{normalize_text(title)}",
+            omv_checks += 1
+            if _is_verified_embeddable(vid):
+                alt = TrackEntity.build(
                     artist=artist,
                     title=title,
                     view_count=parse_view_count(item.get("views")),
@@ -439,9 +607,15 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 )
                 return alt, "omv"
 
+        if self._is_embed_breaker_open():
+            return None
+
         # Pass 2: Official Lyric Video
         lyric_rows = self._search_videos_raw(f"{artist} {title} official lyric video".strip(), limit=8)
+        lyric_checks = 0
         for item in lyric_rows:
+            if lyric_checks >= check_cap or self._is_embed_breaker_open():
+                break
             vid = str(item.get("videoId") or "").strip()
             if not vid or vid in excluded:
                 continue
@@ -460,10 +634,9 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 continue
             if not _is_official_lyric_channel(item, artist):
                 continue
-            if self.is_video_embeddable(vid):
-                alt = TrackEntity(
-                    track_id=f"yt:{vid}",
-                    canonical_key=f"{normalize_text(artist)}::{normalize_text(title)}",
+            lyric_checks += 1
+            if _is_verified_embeddable(vid):
+                alt = TrackEntity.build(
                     artist=artist,
                     title=title,
                     view_count=parse_view_count(item.get("views")),
@@ -557,12 +730,19 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         }
 
     def search_playable(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Search YouTube Music strictly for official songs (filter='songs', ATV/OMV only, zero slop/UGC)."""
+        """Search YouTube Music for official songs (filter='songs', falling back to filter='videos' official OMV/ATV)."""
         try:
             rows = self._yt.search(query, filter="songs", limit=limit)
         except Exception as exc:  # noqa: BLE001
             logger.warning("ytmusicapi search(filter='songs') failed (query=%r): %s", query, exc)
-            return []
+            rows = []
+
+        if not rows:
+            try:
+                rows = self._yt.search(query, filter="videos", limit=limit)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ytmusicapi search(filter='videos') fallback failed (query=%r): %s", query, exc)
+                return []
 
         return [
             r

@@ -331,19 +331,22 @@ def analyze_pcm_a1_c4(
     win = np.hanning(nperseg).astype(np.float32)
     win = win / np.float32(win.sum())
     frames = np.lib.stride_tricks.sliding_window_view(y, nperseg)[::hop]
-    Zxx = rfft(frames * win, axis=1).T
+    # Keep (T, F) C-contiguous layout for fast SIMD/BLAS frequency-axis reductions
+    Zxx_tf = rfft(frames * win, axis=1)
     freqs = np.fft.rfftfreq(nperseg, d=1.0 / sr)
-    mag = np.abs(Zxx).astype(np.float32, copy=False)
-    power = mag * mag
+    freqs32 = freqs.astype(np.float32, copy=False)
+    mag_tf = np.abs(Zxx_tf).astype(np.float32, copy=False)  # shape: (T, F)
     frame_rate = float(sr) / float(hop)
 
-    if mag.shape[1] < 8:
+    if mag_tf.shape[0] < 8:
         fallback_bpm = round(float(deezer_bpm), 1) if (deezer_bpm is not None and deezer_bpm > 0.0) else None
         return np.full(12, 0.5, dtype=np.float64), fallback_bpm
 
     # ---------------- Layer A: Rhythm & Groove ----------------
-    log_mag = np.log1p(np.float32(10.0) * mag)
-    flux = np.maximum(np.float32(0.0), np.diff(log_mag, axis=1)).mean(axis=0, dtype=np.float64)
+    # Frequency-decimated log-magnitude flux preserves full time resolution for BPM autocorrelation at 2x speed
+    mag_flux = mag_tf[:, ::2]
+    log_mag = np.log1p(np.float32(10.0) * mag_flux)
+    flux = np.maximum(np.float32(0.0), np.diff(log_mag, axis=0)).mean(axis=1, dtype=np.float32).astype(np.float64)
     flux_centered = flux - flux.mean()
     flux_energy = float(np.dot(flux_centered, flux_centered))
 
@@ -388,14 +391,17 @@ def analyze_pcm_a1_c4(
 
     a1_bpm = bpm_to_norm(est_bpm if est_bpm is not None else 118.0)
 
-    total_power = float(power.sum(dtype=np.float64)) + 1e-12
+    # Decimate time frames by 2x for stationary spectral power statistics (float32)
+    mag_sub = mag_tf[::2]
+    power_sub = mag_sub * mag_sub
+    total_power = float(power_sub.sum(dtype=np.float64)) + 1e-12
     sub_mask = (freqs >= 20.0) & (freqs <= 120.0)
-    sub_ratio = float(power[sub_mask].sum(dtype=np.float64)) / total_power
+    sub_ratio = float(power_sub[:, sub_mask].sum(dtype=np.float64)) / total_power
     a4_sub_bass = _clip01(math.pow(max(0.0, sub_ratio), 0.45))
 
     # ---------------- Layer B: Harmony & Tonality ----------------
-    chroma_mat = _get_chroma_matrix(nperseg, sr)
-    chroma_frames = (chroma_mat @ mag).astype(np.float64, copy=False)  # shape: (12, T)
+    chroma_mat = _get_chroma_matrix(nperseg, sr)  # shape: (12, F), float32
+    chroma_frames = (mag_tf @ chroma_mat.T).T.astype(np.float64, copy=False)  # shape: (12, T)
     chroma_mean = chroma_frames.mean(axis=1)
     c_sum = float(chroma_mean.sum())
     if c_sum > 1e-12:
@@ -429,9 +435,9 @@ def analyze_pcm_a1_c4(
         b3_chord_change = 0.35
 
     # Fast decimated float32 HPSS (~15-30x faster than full-resolution float64 median_filter)
-    f_step = 4 if mag.shape[0] >= 256 else 2
-    t_step = 4 if mag.shape[1] >= 128 else 2
-    mag_small = np.ascontiguousarray(mag[::f_step, ::t_step], dtype=np.float32)
+    f_step = 4 if mag_tf.shape[1] >= 256 else 2
+    t_step = 4 if mag_tf.shape[0] >= 128 else 2
+    mag_small = np.ascontiguousarray(mag_tf[::t_step, ::f_step].T, dtype=np.float32)
     h_spec = median_filter(mag_small, size=(1, 9))
     p_spec = median_filter(mag_small, size=(9, 1))
     h_energy = float(np.sum(h_spec * h_spec, dtype=np.float64))
@@ -439,20 +445,20 @@ def analyze_pcm_a1_c4(
     b4_hpr = _clip01(h_energy / (h_energy + p_energy + 1e-12))
 
     # ---------------- Layer C: Timbre, Loudness & Structure ----------------
-    freqs32 = freqs.astype(np.float32, copy=False)
-    frame_mag_sum = np.sum(mag, axis=0, dtype=np.float64) + 1e-12
-    centroid_hz = float(np.mean((freqs32[:, None] * mag).sum(axis=0, dtype=np.float64) / frame_mag_sum))
+    frame_mag_sum = mag_sub.sum(axis=1, dtype=np.float32) + np.float32(1e-12)
+    centroid_hz = float(np.mean((mag_sub @ freqs32) / frame_mag_sum, dtype=np.float64))
     c1_centroid = _clip01((centroid_hz - 300.0) / 4200.0)
 
     eps = np.float32(1e-10)
-    geo_mean = np.exp(np.mean(np.log(power + eps), axis=0, dtype=np.float64))
-    arith_mean = np.mean(power + eps, axis=0, dtype=np.float64)
-    flatness = float(np.mean(geo_mean / arith_mean))
+    power_pos = power_sub + eps
+    geo_mean = np.exp(np.mean(np.log(power_pos), axis=1, dtype=np.float32))
+    arith_mean = np.mean(power_pos, axis=1, dtype=np.float32)
+    flatness = float(np.mean(geo_mean / arith_mean, dtype=np.float64))
     c2_flatness = _clip01(math.pow(max(0.0, flatness), 0.35))
 
-    frame_rms = np.sqrt(np.mean(power, axis=0, dtype=np.float64))
-    rms_mean = float(np.mean(frame_rms)) + 1e-9
-    rms_cv = float(np.std(frame_rms)) / rms_mean
+    frame_rms = np.sqrt(np.mean(power_sub, axis=1, dtype=np.float32))
+    rms_mean = float(np.mean(frame_rms, dtype=np.float64)) + 1e-9
+    rms_cv = float(np.std(frame_rms, dtype=np.float64)) / rms_mean
     dyn_score = _clip01(rms_cv / 0.85)
     if deezer_gain is not None:
         loud_score = _clip01((-float(deezer_gain) - 3.0) / 10.0)
@@ -461,7 +467,7 @@ def analyze_pcm_a1_c4(
         c3_loudness_punch = _clip01(0.35 + 0.65 * dyn_score)
 
     vocal_mask = (freqs >= 300.0) & (freqs <= 3400.0)
-    vocal_ratio = float(power[vocal_mask].sum(dtype=np.float64)) / total_power
+    vocal_ratio = float(power_sub[:, vocal_mask].sum(dtype=np.float64)) / total_power
     c4_vocal_presence = _clip01(math.pow(max(0.0, vocal_ratio), 0.55))
 
     vec12 = np.array(

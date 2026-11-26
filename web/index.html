@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
   <title>Hidden Gem Radio — Deep Music Theory DNA</title>
   <style>
     :root {
@@ -1082,7 +1083,19 @@
       playTrack(next);
     }
 
+    function stopPlayerSafely() {
+      if (!state.player || !state.playerReady) return;
+      try {
+        if (typeof state.player.stopVideo === "function") {
+          state.player.stopVideo();
+        } else if (typeof state.player.pauseVideo === "function") {
+          state.player.pauseVideo();
+        }
+      } catch (_) {}
+    }
+
     async function handleUnplayableSkip(failedTrack, reason, ytErrorCode) {
+      if (state.circuitBroken || !failedTrack) return;
       const failedVideoId = failedTrack?.video_id || null;
       if (failedVideoId && state.handlingUnplayableVideoId === failedVideoId) return;
       const stationAtFail = state.activeStationId;
@@ -1093,6 +1106,7 @@
         clearPlaybackWatchdog();
         const isEmbedRestricted =
           ytErrorCode === 100 || ytErrorCode === 101 || ytErrorCode === 150;
+        const isReferrerConfigError = ytErrorCode === 153;
         let apiFailed = false;
 
         if (failedVideoId) {
@@ -1108,6 +1122,7 @@
               }),
             });
             if (
+              state.circuitBroken ||
               state.activeStationId !== stationAtFail ||
               state.prefetchEpoch !== epochAtFail ||
               state.currentTrack?.video_id !== failedVideoId
@@ -1123,6 +1138,7 @@
           } catch (_) {
             apiFailed = true;
             if (
+              state.circuitBroken ||
               state.activeStationId !== stationAtFail ||
               state.prefetchEpoch !== epochAtFail ||
               state.currentTrack?.video_id !== failedVideoId
@@ -1133,6 +1149,7 @@
         }
 
         if (
+          state.circuitBroken ||
           state.activeStationId !== stationAtFail ||
           state.prefetchEpoch !== epochAtFail ||
           (failedVideoId && state.currentTrack?.video_id !== failedVideoId)
@@ -1146,6 +1163,7 @@
             state.circuitBroken = true;
             state.currentTrack = null;
             clearRetryTimer();
+            stopPlayerSafely();
             renderNowPlaying(null);
             updatePlayMuteButton();
             setStatus("埋め込み制限曲が続いたため自動スキップを停止しました（▶ 再開・⏭ 次曲・または局切替で再開）");
@@ -1161,11 +1179,20 @@
             state.circuitBroken = true;
             state.currentTrack = null;
             clearRetryTimer();
+            stopPlayerSafely();
             renderNowPlaying(null);
             updatePlayMuteButton();
-            setStatus("連続再生失敗のため自動スキップを停止しました（▶ 再開・⏭ 次曲・または局切替で再開）");
+            setStatus(
+              isReferrerConfigError
+                ? "埋め込み設定/Referrerエラー(153)が続いたため停止しました（▶ 再開・または再読込）"
+                : "連続再生失敗のため自動スキップを停止しました（▶ 再開・⏭ 次曲・または局切替で再開）"
+            );
           } else {
-            setStatus("再生不可を自動スキップ（学習非汚染）");
+            setStatus(
+              isReferrerConfigError
+                ? "埋め込み設定/Referrerエラー(153)のため次曲へスキップ"
+                : "再生不可を自動スキップ（学習非汚染）"
+            );
             await playNextFromQueue();
           }
         }
@@ -1243,16 +1270,20 @@
 
     // YouTube IFrame Player API Hooks
     window.onYouTubeIframeAPIReady = function () {
+      const playerVars = {
+        autoplay: 1,
+        controls: 1,
+        rel: 0,
+        modestbranding: 1,
+        playsinline: 1,
+      };
+      if (typeof window !== "undefined" && window.location && window.location.origin) {
+        playerVars.origin = window.location.origin;
+      }
       state.player = new YT.Player("ytPlayer", {
         width: "100%",
         height: "100%",
-        playerVars: {
-          autoplay: 1,
-          controls: 1,
-          rel: 0,
-          modestbranding: 1,
-          playsinline: 1,
-        },
+        playerVars,
         events: {
           onReady: () => {
             state.playerReady = true;
@@ -1288,7 +1319,7 @@
             }
           },
           onError: async (event) => {
-            // Silent auto-skip for YT error codes (2, 5, 100, 101, 150) without polluting BAD learning
+            // Silent auto-skip for YT error codes (2, 5, 100, 101, 150, 153) without polluting BAD learning
             await handleUnplayableSkip(state.currentTrack, `yt_error_${event.data}`, event.data);
           },
         },
@@ -1314,12 +1345,18 @@
     el.btnPlayMute.addEventListener("click", async () => {
       state.hasUserPlaybackStarted = true;
       if (state.circuitBroken || !state.currentTrack) {
-        state.consecutiveErrors = 0;
-        state.consecutiveEmbedSkips = 0;
-        state.circuitBroken = false;
-        resetEmptyBatchCooldown();
-        updatePlayMuteButton();
-        await playNextFromQueue();
+        if (state.skippingInProgress) return;
+        state.skippingInProgress = true;
+        try {
+          state.consecutiveErrors = 0;
+          state.consecutiveEmbedSkips = 0;
+          state.circuitBroken = false;
+          resetEmptyBatchCooldown();
+          updatePlayMuteButton();
+          await playNextFromQueue();
+        } finally {
+          state.skippingInProgress = false;
+        }
         return;
       }
       if (!state.player || !state.playerReady) return;

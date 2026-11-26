@@ -274,7 +274,7 @@ class RadioDatabase:
             existing = conn.execute(
                 """
                 SELECT track_id, tags_json, isrc, mbid, release_year, view_count,
-                       duration_seconds, video_id, unplayable, seed_artist, seed_archetype,
+                       duration_seconds, video_id, unplayable, source, seed_artist, seed_archetype,
                        cooccurrence_count, discovery_sources_json, discovery_route,
                        deezer_id, deezer_bpm, deezer_gain, deezer_rank, mir_vector_json
                 FROM tracks
@@ -761,8 +761,23 @@ class RadioDatabase:
         # Prefer strictly unheard candidates; fall back to previously liked/completed tracks only if exhausted
         return unheard if unheard else heard_non_bad
 
-    def count_playable_candidates(self, station_id: str, max_popularity_views: int) -> int:
-        return len(self.get_eligible_candidates(station_id, max_popularity_views, include_heard_fallback=False))
+    def count_playable_candidates(
+        self,
+        station_id: str,
+        max_popularity_views: int,
+        *,
+        exclude_track_ids: set[str] | None = None,
+        exclude_canonical_keys: set[str] | None = None,
+    ) -> int:
+        return len(
+            self.get_eligible_candidates(
+                station_id,
+                max_popularity_views,
+                exclude_track_ids=exclude_track_ids,
+                include_heard_fallback=False,
+                exclude_canonical_keys=exclude_canonical_keys,
+            )
+        )
 
     def count_feedback(self, station_id: str) -> int:
         with self._connect() as conn:

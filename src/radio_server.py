@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _PERMANENT_YT_UNPLAYABLE_CODES = frozenset({100, 101, 150})
-_TRANSIENT_YT_ERROR_CODES = frozenset({2, 5})
+_CONFIG_YT_ERROR_CODES = frozenset({153})  # Referrer / embed configuration error (not permanent track unplayability)
+_TRANSIENT_YT_ERROR_CODES = frozenset({2, 5}) | _CONFIG_YT_ERROR_CODES
 LOW_POOL_BG_DIG_THRESHOLD = 10
 STARTUP_BG_DIG_THRESHOLD = 5
 DIG_TARGET_UNHEARD = 25
@@ -224,6 +225,15 @@ class RadioRuntime:
                 if not tokens:
                     del self._digging_stations[station_id]
 
+    def _count_effective_unheard(self, station: StationConfig) -> int:
+        """Count unheard playable candidates excluding known YouTube watch-history tracks."""
+        return self.db.count_playable_candidates(
+            station.station_id,
+            station.max_popularity_views,
+            exclude_track_ids=self.known_video_ids,
+            exclude_canonical_keys=self.known_track_keys,
+        )
+
     def _run_station_dig(
         self,
         station: StationConfig,
@@ -240,10 +250,7 @@ class RadioRuntime:
                     my_token = object()
                 self._add_dig_token(station.station_id, my_token)
                 if skip_if_unheard_gte > 0:
-                    existing = self.db.count_playable_candidates(
-                        station.station_id,
-                        station.max_popularity_views,
-                    )
+                    existing = self._count_effective_unheard(station)
                     if existing >= skip_if_unheard_gte:
                         return {
                             "station_id": station.station_id,
@@ -450,9 +457,7 @@ def create_app(
         for s in runtime.stations.values():
             bandit = runtime.bandits[s.station_id]
             entry = s.to_dict()
-            cand_count = runtime.db.count_playable_candidates(
-                s.station_id, s.max_popularity_views
-            )
+            cand_count = runtime._count_effective_unheard(s)
             entry["candidate_count"] = cand_count
             entry["model_updates"] = bandit.n_updates
             entry["feedback_count"] = runtime.db.count_feedback(s.station_id)
@@ -531,7 +536,7 @@ def create_app(
     ) -> dict[str, Any]:
         """Blacklist an unplayable/stalled video_id for 30 days WITHOUT polluting BAD bandit learning.
 
-        Transient YT player errors (codes 2, 5) return a replacement without blacklisting.
+        Transient / config YT player errors (codes 2, 5, 153) return a replacement without blacklisting.
         Permanent YT errors (codes 100, 101, 150) also mark tracks.unplayable = 1 and immediately
         trigger a non-blocking background dig if remaining playable inventory falls below 10.
         """
@@ -560,10 +565,7 @@ def create_app(
         if target_station_id and target_station_id in runtime.stations:
             station = runtime.stations[target_station_id]
             if is_permanent and runtime.auto_dig:
-                remaining_playable = runtime.db.count_playable_candidates(
-                    station.station_id,
-                    station.max_popularity_views,
-                )
+                remaining_playable = runtime._count_effective_unheard(station)
                 if remaining_playable < LOW_POOL_BG_DIG_THRESHOLD:
                     bg_dig_triggered = runtime._trigger_background_dig(
                         station,

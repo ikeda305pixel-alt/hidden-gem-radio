@@ -143,6 +143,7 @@ class CandidatePoolDigger:
         known_video_ids: set[str] | None = None,
         known_track_keys: set[str] | None = None,
         max_seeds: int = 8,
+        max_alt_searches_per_dig: int = 12,
     ) -> dict[str, Any]:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
         _ = max_lb_resolves  # Preserved for signature compatibility
@@ -248,6 +249,8 @@ class CandidatePoolDigger:
         skipped_unembeddable = 0
         replaced_omv = 0
         replaced_lyric = 0
+        alt_searches_used = 0
+        alt_search_cap = max(0, int(max_alt_searches_per_dig))
         persisted_vids: set[str] = set()
         persisted_keys: set[str] = set()
         alt_finder = getattr(self.yt, "find_embeddable_alternative", None)
@@ -273,7 +276,8 @@ class CandidatePoolDigger:
                     blacklisted_vids.add(track.video_id)
 
                 alt_result = None
-                if callable(alt_finder):
+                if callable(alt_finder) and alt_searches_used < alt_search_cap:
+                    alt_searches_used += 1
                     alt_result = alt_finder(
                         track.artist,
                         track.title,
@@ -290,7 +294,7 @@ class CandidatePoolDigger:
                     continue
 
                 track = TrackEntity(
-                    track_id=f"yt:{alt_track.video_id}",
+                    track_id=track.track_id,
                     canonical_key=track.canonical_key,
                     isrc=track.isrc,
                     mbid=track.mbid,
@@ -353,6 +357,8 @@ class CandidatePoolDigger:
         total_playable = self.db.count_playable_candidates(
             station.station_id,
             station.max_popularity_views,
+            exclude_track_ids=known_vids,
+            exclude_canonical_keys=skip_keys,
         )
         return {
             "station_id": station.station_id,
@@ -365,6 +371,7 @@ class CandidatePoolDigger:
             "skipped_unembeddable": skipped_unembeddable,
             "replaced_omv": replaced_omv,
             "replaced_lyric": replaced_lyric,
+            "alt_searches_used": alt_searches_used,
             "total_playable": total_playable,
         }
 
