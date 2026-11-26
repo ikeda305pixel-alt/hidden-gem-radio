@@ -32,6 +32,7 @@ from src.adapters.youtube import resolve_youtube_auth_file
 from src.digger.listenbrainz import ListenBrainzClient
 from src.models import (
     StationConfig,
+    is_japanese_artist_or_text,
     normalize_artist,
     normalize_track_key,
     save_stations_yaml,
@@ -92,6 +93,7 @@ _MUSIC_SIGNAL_TITLE_RE = re.compile(
     r"[\(\[\{]\s*(?:official\s*)?(?:audio|lyrics?|original\s+mix|remix|extended\s+mix|live\s+(?:on|at)\s+[^\)\]\}]*)\s*[\)\]\}])",
     re.IGNORECASE,
 )
+_TOPIC_CHANNEL_RE = re.compile(r"\s*-\s*(?:topic|トピック)$", re.IGNORECASE)
 _MUSIC_CHANNEL_RE = re.compile(
     r"(?:\s*-\s*(?:topic|トピック)$|vevo$|records?$|music$|official\s*(?:music|artist)|"
     r"sounds?$|recordings?$|^\s*(?:kexp|boiler\s*room|ninja\s*tune|colors|colorsxstudios|sub\s*pop|"
@@ -107,21 +109,53 @@ _JP_BRACKET_TITLE_RE = re.compile(r"^[「『](.+?)[」』]$")
 _AD_DETAIL_RE = re.compile(r"(?:google\s*ads|広告)", re.IGNORECASE)
 _JP_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
 
-# 5-station classification lexicons
+_WESTERN_ONLY_STATION_IDS = frozenset(
+    {
+        "us_hiphop_bouncy",
+        "edm_dance_party",
+        "melodic_rap_alt",
+        "indie_groove_cult",
+    }
+)
+
+# 6-station classification lexicons (strictly separating Western stations from JP Hip-Hop & J-Pop/City Pop)
 _JP_HIPHOP_ARTISTS = {
     "bad hop", "yzerr", "t pablow", "ak 69", "zorn", "creepy nuts", "awich",
     "jp the wavy", "lex", "ralph", "jjj", "kid fresino", "bim", "kzm", "tohji",
-    "watson", "lana", "chanmina", "ちゃんみな", "梅田サイファー", "舐達麻", "般若",
-    "kohh", "千葉雄喜", "yellow bucks", "eyden", "bonbero", "c o s a", "5lack",
+    "watson", "lana", "chanmina", "ちゃんみな", "梅田サイファー", "舐達麻", "namedaruma", "般若",
+    "kohh", "千葉雄喜", "yuki chiba", "yellow bucks", "eyden", "bonbero", "c o s a", "5lack",
     "punpee", "stuts", "仙人掌", "kandytown", "keiju", "io", "ozworld", "red eye",
     "jin dogg", "guca owl", "rykeydaddydirty", "anarchy", "norikiyo",
     "salu", "kohjiya", "dahlia", "mari", "百足", "韻マン", "mcニガリ", "r指定",
+    "hentai shinshi club", "変態紳士クラブ", "wilywnka", "vigorman", "basi",
 }
 _JP_HIPHOP_KW_RE = re.compile(
     r"(?:ラップ|ヒップホップ|フリースタイル|サイファー|ストリート|ビーフ|ラップスタア|"
     r"\b(?:j-?rap|japanese\s*hip\s*hop|cypher|freestyle|hood|drill|trap|mc\s*battle|03-?\s*performance)\b)",
     re.IGNORECASE,
 )
+_JPOP_CITYPOP_ARTISTS = {
+    "southern all stars", "サザンオールスターズ", "keisuke kuwata", "桑田佳祐",
+    "tatsuro yamashita", "山下達郎", "mariya takeuchi", "竹内まりや",
+    "taeko onuki", "大貫妙子", "toshiki kadomatsu", "角松敏生",
+    "miki matsubara", "松原みき", "anri", "杏里", "junko ohashi", "junko yagami",
+    "momoko kikuchi", "kiyotaka sugiyama", "omega tribe", "1986 omega tribe",
+    "yumi matsutoya", "松任谷由実", "eiichi ohtaki", "大滝詠一", "haruomi hosono", "細野晴臣",
+    "ryuichi sakamoto", "yukihiro takahashi", "yellow magic orchestra", "ymo",
+    "hiroshi sato", "minako yoshida", "makoto matsushita", "masayoshi takanaka",
+    "piper", "casiopea", "t square", "ryusenkei", "hitomitoi", "kirinji", "キリンジ",
+    "original love", "fishmans", "shintaro sakamoto", "ichiko aoba",
+    "imase", "fujii kaze", "藤井風", "vaundy", "official hige dandism", "official髭男dism",
+    "gen hoshino", "星野源", "hikaru utada", "宇多田ヒカル", "kenshi yonezu", "米津玄師",
+    "shiina ringo", "椎名林檎", "tokyo incidents", "東京事変", "spitz", "スピッツ",
+    "sakanaction", "aimyon", "zutomayo", "yorushika", "king gnu", "millennium parade",
+    "yoasobi", "mrs green apple", "back number", "mr children", "bump of chicken",
+    "radwimps", "one ok rock", "perfume", "capsule", "ado", "yama",
+    "suchmos", "nulbarich", "kroi", "lucky kilimanjaro", "sirup",
+    "kan sano", "tendre", "iri", "chelmico", "tofubeats", "cero",
+    "yogee new waves", "never young beach", "toconoma", "ovall", "lamp",
+    "pizzicato five", "cornelius", "sugar babe", "tin pan alley",
+}
 _US_HIPHOP_ARTISTS = {
     "bbno", "migos", "j cole", "lil durk", "kyle", "macklemore", "lupe fiasco",
     "drake", "eminem", "kendrick lamar", "travis scott", "future", "21 savage",
@@ -171,11 +205,10 @@ _MELODIC_RAP_ALT_KW_RE = re.compile(
 )
 _INDIE_GROOVE_ARTISTS = {
     "royel otis", "oberhofer", "foster the people", "fitz and the tantrums", "hozier",
-    "imase", "earth wind fire", "surfaces", "dominic fike", "dope lemon", "phoenix",
+    "earth wind fire", "surfaces", "dominic fike", "dope lemon", "phoenix",
     "bastille", "walk the moon", "tame impala", "parcels", "vulfpeck", "khruangbin",
     "two door cinema club", "vampire weekend", "mgmt", "jungle", "l imperatrice",
-    "fujii kaze", "藤井風", "vaundy", "official髭男dism", "星野源", "suchmos",
-    "nulbarich", "kroi", "lucky kilimanjaro", "sirup", "bruno mars", "silk sonic",
+    "bruno mars", "silk sonic",
     "mac demarco", "men i trust", "clairo", "rex orange county", "still woozy",
     "glass animals", "metronomy", "the 1975", "arctic monkeys", "cage the elephant",
     "the strokes", "the shins", "phoebe bridgers", "dice", "rancid eddie",
@@ -201,7 +234,7 @@ def compute_recency_frequency_weight(play_count: int, days_ago: float) -> float:
 def default_theory_stations(
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
 ) -> list[StationConfig]:
-    """Load the 5 MIR + Collaborative Graph stations from config/music_theory_profile.yaml."""
+    """Load the 6 MIR + Collaborative Graph stations from config/music_theory_profile.yaml."""
     profile = load_music_theory_profile(profile_path)
     raw_stations = profile.get("stations") or []
     stations = [StationConfig.from_dict(item) for item in raw_stations if isinstance(item, dict)]
@@ -211,7 +244,7 @@ def default_theory_stations(
 
 
 def default_fallback_stations() -> list[StationConfig]:
-    """Fallback stations prioritizing the 5 canonical stations."""
+    """Fallback stations prioritizing the 6 canonical stations."""
     profile_stations = load_music_theory_profile(DEFAULT_THEORY_PROFILE_PATH).get("stations") or []
     if profile_stations:
         return [StationConfig.from_dict(item) for item in profile_stations if isinstance(item, dict)]
@@ -277,19 +310,28 @@ def classify_entry_to_station(
     title: str,
     tags: list[str] | None = None,
 ) -> str:
-    """Route a YouTube/YTMusic watch entry into one of the 5 canonical stations."""
+    """Route a YouTube/YTMusic watch entry into one of the 6 canonical stations without JP/Western mixing."""
     candidate_norms: set[str] = set()
     for token in _split_artist_tokens(artist):
         candidate_norms.update(_artist_lookup_variants(token))
     a_norm = normalize_artist(artist)
     combined = " ".join([artist or "", title or "", *(tags or [])])
+    is_jp = is_japanese_artist_or_text(artist, title)
 
-    # Step 1: Explicit artist lexicon match FIRST (before generic keyword checks like "remix")
-    jp_substrings = ("bad hop", "yzerr", "zorn", "awich", "creepy nuts", "舐達麻", "yellow bucks")
+    # Step 1: Japanese Hip-Hop vs Japanese Pop/City Pop/Groove (strictly prevented from entering Western stations)
+    jp_hiphop_substrings = (
+        "bad hop", "yzerr", "zorn", "awich", "creepy nuts", "舐達麻", "namedaruma", "yellow bucks", "yuki chiba",
+    )
     if (candidate_norms & _JP_HIPHOP_ARTISTS) or any(
-        k in norm for norm in candidate_norms for k in jp_substrings
+        k in norm for norm in candidate_norms for k in jp_hiphop_substrings
     ):
         return "japan_hiphop_street"
+    if is_jp and _JP_HIPHOP_KW_RE.search(combined):
+        return "japan_hiphop_street"
+    if (candidate_norms & _JPOP_CITYPOP_ARTISTS) or is_jp:
+        return "jpop_citypop_groove"
+
+    # Step 2: Western explicit artist lexicons
     if candidate_norms & _MELODIC_RAP_ALT_ARTISTS:
         return "melodic_rap_alt"
     if candidate_norms & _US_HIPHOP_ARTISTS:
@@ -299,9 +341,7 @@ def classify_entry_to_station(
     if candidate_norms & _INDIE_GROOVE_ARTISTS:
         return "indie_groove_cult"
 
-    # Step 2: Keyword / script fallback when artist is not in explicit lexicons
-    if _JP_SCRIPT_RE.search(combined) and _JP_HIPHOP_KW_RE.search(combined):
-        return "japan_hiphop_street"
+    # Step 3: Western keyword fallback
     if _MELODIC_RAP_ALT_KW_RE.search(combined):
         return "melodic_rap_alt"
     if _EDM_KW_RE.search(combined):
@@ -504,10 +544,15 @@ def parse_takeout_watch_history(
             if not (is_yt_music or has_music_channel or has_music_title or has_artist_channel_match):
                 continue
 
-            # Extract artist and clean track title
+            # Extract artist and clean track title (on - Topic channels, keep bilingual 'Title - Romaji' intact)
             artist = ""
             track_title = title
-            if dash_artist and not is_yt_music:
+            is_topic_channel = bool(channel_name and _TOPIC_CHANNEL_RE.search(channel_name))
+            if (
+                dash_artist
+                and not is_yt_music
+                and (not is_topic_channel or _channel_matches_title_artist(channel_name, dash_artist))
+            ):
                 artist = dash_artist
                 track_title = dash_track
             if not artist and channel_name:
@@ -601,7 +646,7 @@ def build_weighted_theory_stations(
     max_weighted_seeds_per_station: int = 12,
     max_known_items: int = 5000,
 ) -> tuple[list[StationConfig], dict[str, list[str]]]:
-    """Classify weighted YouTube history into the 5 DNA stations and build known_video_ids/track_keys."""
+    """Classify weighted YouTube history into the 6 DNA stations and build known_video_ids/track_keys/familiar_artists."""
     now = reference_time or datetime.now(UTC)
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
@@ -614,6 +659,11 @@ def build_weighted_theory_stations(
     artist_display_name: dict[str, str] = {}
     artist_top_track: dict[str, Counter[str]] = defaultdict(Counter)
     artist_liked_bonus: Counter[str] = Counter()
+
+    # Global per-artist counters for Known-Artist Suppression (>=5 plays or >=3 distinct tracks)
+    global_artist_plays: Counter[str] = Counter()
+    global_artist_tracks: dict[str, set[str]] = defaultdict(set)
+    global_artist_min_days: dict[str, float] = {}
 
     # Track frequency x recency weights for known_video_ids and known_track_keys
     vid_counts: Counter[str] = Counter()
@@ -635,6 +685,11 @@ def build_weighted_theory_stations(
         days_ago = max(0.0, (now - dt).total_seconds() / 86400.0) if dt is not None else 30.0
         increment = 3 if rec.get("source") == "ytmusic_liked" else 1
 
+        global_artist_plays[a_norm] += increment
+        prev_g_days = global_artist_min_days.get(a_norm)
+        if prev_g_days is None or days_ago < prev_g_days:
+            global_artist_min_days[a_norm] = days_ago
+
         vid = str(rec.get("video_id") or "").strip()
         if vid:
             vid_counts[vid] += increment
@@ -649,6 +704,7 @@ def build_weighted_theory_stations(
             if prev_key_days is None or days_ago < prev_key_days:
                 key_min_days[t_key] = days_ago
             artist_top_track[a_norm][title] += 1
+            global_artist_tracks[a_norm].add(t_key)
 
         st_id = classify_entry_to_station(artist, title)
         if st_id not in station_by_id:
@@ -665,18 +721,29 @@ def build_weighted_theory_stations(
 
     # Compute raw weights via log1p(play_count) * exp(-days_ago / 120.0) and normalize 0.0-1.0 per station
     for st in stations:
+        if st.station_id in _WESTERN_ONLY_STATION_IDS:
+            st.seed_artists = [a for a in st.seed_artists if not is_japanese_artist_or_text(a)]
+            st.spotify_anchor_seeds = [
+                s
+                for s in st.spotify_anchor_seeds
+                if not is_japanese_artist_or_text(*(s.split(" - ", 1) if " - " in s else (s, "")))
+            ]
+
         counts = artist_counts.get(st.station_id)
         if not counts:
             continue
 
         scored_entries: list[dict[str, Any]] = []
         for a_norm, play_count in counts.items():
+            disp_artist = artist_display_name[a_norm]
+            top_title = artist_top_track[a_norm].most_common(1)[0][0] if artist_top_track[a_norm] else ""
+            if st.station_id in _WESTERN_ONLY_STATION_IDS and is_japanese_artist_or_text(disp_artist, top_title):
+                continue
             days_ago = artist_min_days[st.station_id].get(a_norm, 30.0)
             raw_w = compute_recency_frequency_weight(play_count, days_ago)
-            top_title = artist_top_track[a_norm].most_common(1)[0][0] if artist_top_track[a_norm] else ""
             scored_entries.append(
                 {
-                    "artist": artist_display_name[a_norm],
+                    "artist": disp_artist,
                     "top_title": top_title,
                     "play_count": int(play_count),
                     "days_ago": round(float(days_ago), 1),
@@ -717,9 +784,22 @@ def build_weighted_theory_stations(
         key=lambda k: compute_recency_frequency_weight(key_counts[k], key_min_days.get(k, 30.0)),
         reverse=True,
     )
+    familiar_candidates = [
+        a_norm
+        for a_norm, plays in global_artist_plays.items()
+        if plays >= 5 or len(global_artist_tracks.get(a_norm, set())) >= 3
+    ]
+    sorted_familiar_artists = sorted(
+        familiar_candidates,
+        key=lambda a: compute_recency_frequency_weight(
+            global_artist_plays[a], global_artist_min_days.get(a, 30.0)
+        ),
+        reverse=True,
+    )
     history_index = {
         "known_video_ids": sorted_known_vids[:max_known_items],
         "known_track_keys": sorted_known_keys[:max_known_items],
+        "known_familiar_artists": sorted_familiar_artists[:max_known_items],
     }
     return stations, history_index
 
@@ -837,17 +917,18 @@ def build_stations_from_history(
 
 
 def _select_stations_for_count(all_five: list[StationConfig], num_stations: int) -> list[StationConfig]:
-    """Return all 5 canonical stations when num_stations>=5, or a balanced subset including EDM & Indie."""
-    n = max(2, min(5, int(num_stations)))
+    """Return all 6 canonical stations when num_stations>=6, or a balanced subset when slicing."""
+    n = max(2, min(6, int(num_stations)))
     if n >= len(all_five):
         return list(all_five)
-    # Prioritize edm_dance_party & indie_groove_cult when slicing to <5 so fallback seeds stay covered
+    # Prioritize edm_dance_party & indie_groove_cult when slicing to <6 so fallback seeds stay covered
     priority_order = [
         "edm_dance_party",
         "indie_groove_cult",
         "us_hiphop_bouncy",
         "melodic_rap_alt",
         "japan_hiphop_street",
+        "jpop_citypop_groove",
     ]
     by_id = {s.station_id: s for s in all_five}
     ordered = [by_id[sid] for sid in priority_order if sid in by_id]
@@ -861,13 +942,13 @@ def generate_stations_yaml(
     output_path: Path | str = Path("config/stations.yaml"),
     browser_auth_path: Path | str = Path("config/browser.json"),
     takeout_path: Path | str = Path("data/watch-history.json"),
-    num_stations: int = 5,
+    num_stations: int = 6,
     offline: bool = False,
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
     reference_time: datetime | None = None,
     calibrate_db_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Read available history sources, build weighted 5-station config, and optionally calibrate SQLite MIR profiles."""
+    """Read available history sources, build weighted 6-station config, and optionally calibrate SQLite MIR profiles."""
     records: list[dict[str, Any]] = []
     sources_used: list[str] = []
     warnings: list[str] = []
@@ -931,11 +1012,16 @@ def generate_stations_yaml(
         "theory_profile": str(profile_path),
     }
     out = Path(output_path)
+    has_history_idx = bool(
+        history_index["known_video_ids"]
+        or history_index["known_track_keys"]
+        or history_index.get("known_familiar_artists")
+    )
     save_stations_yaml(
         out,
         stations,
         meta=meta,
-        history_index=history_index if (history_index["known_video_ids"] or history_index["known_track_keys"]) else None,
+        history_index=history_index if has_history_idx else None,
     )
 
     calibrated_stations = 0
@@ -961,6 +1047,7 @@ def generate_stations_yaml(
         "calibrated_stations": calibrated_stations,
         "known_video_ids_count": len(history_index["known_video_ids"]),
         "known_track_keys_count": len(history_index["known_track_keys"]),
+        "known_familiar_artists_count": len(history_index.get("known_familiar_artists", [])),
         "sources_used": meta["sources_used"],
         "fallback_used": fallback_used,
         "warnings": warnings,
@@ -969,7 +1056,7 @@ def generate_stations_yaml(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Auto-generate config/stations.yaml from YouTube / YouTube Music history (5-station Theory DNA)."
+        description="Auto-generate config/stations.yaml from YouTube / YouTube Music history (6-station Theory DNA)."
     )
     parser.add_argument(
         "--output",
@@ -989,9 +1076,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stations",
         type=int,
-        default=5,
-        choices=[2, 3, 4, 5],
-        help="Number of stations to generate (2-5, default: 5)",
+        default=6,
+        choices=[2, 3, 4, 5, 6],
+        help="Number of stations to generate (2-6, default: 6)",
     )
     parser.add_argument(
         "--offline",

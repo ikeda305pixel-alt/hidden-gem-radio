@@ -18,6 +18,7 @@ from src.digger.history_importer import generate_stations_yaml
 from src.digger.pool import CandidatePoolDigger
 from src.models import (
     StationConfig,
+    load_familiar_artists,
     load_history_index,
     load_stations_yaml,
     normalize_artist,
@@ -52,7 +53,7 @@ class FeedbackRequest(BaseModel):
 class ImportHistoryRequest(BaseModel):
     browser_auth_path: str = "config/browser.json"
     takeout_path: str = "data/watch-history.json"
-    num_stations: int = Field(default=5, ge=2, le=5)
+    num_stations: int = Field(default=6, ge=2, le=6)
     offline: bool = False
 
 
@@ -132,6 +133,7 @@ class RadioRuntime:
         self.bandits: dict[str, ContextualBanditRecommender] = {}
         self.known_video_ids: set[str] = set()
         self.known_track_keys: set[str] = set()
+        self.known_familiar_artists: set[str] = set()
         self.reload_stations()
 
     @property
@@ -174,11 +176,12 @@ class RadioRuntime:
                 output_path=self.stations_path,
                 browser_auth_path=self.browser_auth_path,
                 takeout_path=PROJECT_ROOT / "data/watch-history.json",
-                num_stations=5,
+                num_stations=6,
                 offline=True,
             )
         station_list = load_stations_yaml(self.stations_path)
         self.known_video_ids, self.known_track_keys = load_history_index(self.stations_path)
+        self.known_familiar_artists = load_familiar_artists(self.stations_path)
         self.stations = {s.station_id: s for s in station_list}
         self.bandits = {
             s.station_id: ContextualBanditRecommender(
@@ -259,13 +262,14 @@ class RadioRuntime:
                             "skipped_duplicate_dig": True,
                         }
                 try:
-                    # Pass known history sets when digger supports them (keeps test mock compatibility)
+                    # Pass known history & familiar artist sets when digger supports them (keeps test mock compatibility)
                     try:
                         return self.digger.dig_station(
                             station,
                             target_pool_size=target_pool_size,
                             known_video_ids=self.known_video_ids,
                             known_track_keys=self.known_track_keys,
+                            known_familiar_artists=self.known_familiar_artists,
                         )
                     except TypeError:
                         return self.digger.dig_station(station, target_pool_size=target_pool_size)
@@ -371,7 +375,7 @@ class RadioRuntime:
             seen_artists=self.db.get_seen_artists(station.station_id),
             max_popularity_views=station.max_popularity_views,
             limit=count,
-            recent_artists=self.db.get_recent_played_artists(station.station_id, limit=5),
+            recent_artists=self.db.get_recent_played_artists(station.station_id, limit=6),
         )
         return [item.to_queue_dict() for item in ranked]
 

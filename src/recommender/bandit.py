@@ -730,8 +730,8 @@ class ContextualBanditRecommender:
             scored.append((rc, float(mir_crossover[idx])))
 
         # Stage 3 Re-Ranking:
-        # 1. Recent 5-track artist cooldown (avoid repeating any artist in recent_artists[:5] or current batch)
-        recent_set = {normalize_artist(a) for a in (recent_artists or [])[:5] if a}
+        # 1. Recent 6-track artist cooldown + strict unique-artist-per-batch spacing (never >2 even in tiny pools)
+        recent_set = {normalize_artist(a) for a in (recent_artists or [])[:6] if a}
 
         exploit_pool = sorted(scored, key=lambda pair: pair[0].score, reverse=True)
         # Exploration crossover pool: co-occurring / cult-chic crossover gems
@@ -743,34 +743,42 @@ class ContextualBanditRecommender:
 
         selected: list[RankedCandidate] = []
         used_track_ids: set[str] = set()
-        used_artists: set[str] = set(recent_set)
+        batch_artist_counts: dict[str, int] = {}
 
-        def _pick_from(pool: list[tuple[RankedCandidate, float]], allow_recent_artist: bool) -> RankedCandidate | None:
+        def _pick_from(
+            pool: list[tuple[RankedCandidate, float]],
+            *,
+            allow_recent_artist: bool,
+            max_in_batch: int = 1,
+        ) -> RankedCandidate | None:
             for cand, _cross in pool:
                 if cand.track.track_id in used_track_ids:
                     continue
                 a_norm = normalize_artist(cand.track.artist)
-                if not allow_recent_artist and a_norm in used_artists:
+                if batch_artist_counts.get(a_norm, 0) >= max_in_batch:
+                    continue
+                if not allow_recent_artist and a_norm in recent_set:
                     continue
                 used_track_ids.add(cand.track.track_id)
-                used_artists.add(a_norm)
+                batch_artist_counts[a_norm] = batch_artist_counts.get(a_norm, 0) + 1
                 return cand
             return None
 
-        # 80% Exploit + 20% Explore slot pattern (slot indices 4, 9, ... are exploration crossover slots;
-        # for 3-track batches, if limit >= 5 slot #5 is explore; if pool has strong crossover gem on slot #3
-        # when n_updates > 0 we keep exploit top-1 strictly highest score!)
+        # 80% Exploit + 20% Explore slot pattern (slot indices 4, 9, ... are exploration crossover slots)
         for slot in range(limit):
             is_explore_slot = (slot % 5) == 4
             primary_pool = explore_pool if is_explore_slot else exploit_pool
             secondary_pool = exploit_pool if is_explore_slot else explore_pool
 
-            chosen = _pick_from(primary_pool, allow_recent_artist=False)
+            chosen = _pick_from(primary_pool, allow_recent_artist=False, max_in_batch=1)
             if chosen is None:
-                chosen = _pick_from(secondary_pool, allow_recent_artist=False)
+                chosen = _pick_from(secondary_pool, allow_recent_artist=False, max_in_batch=1)
             if chosen is None:
-                # Only relax artist cooldown when all remaining unique candidates belong to recent artists
-                chosen = _pick_from(primary_pool, allow_recent_artist=True)
+                # Relax recent-history cooldown while still forbidding duplicate artist within the same batch
+                chosen = _pick_from(primary_pool, allow_recent_artist=True, max_in_batch=1)
+            if chosen is None:
+                # Final emergency fallback for tiny single-artist pools (still hard-capped at <=2)
+                chosen = _pick_from(primary_pool, allow_recent_artist=True, max_in_batch=2)
             if chosen is None:
                 break
             if is_explore_slot:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,24 +18,310 @@ _PAREN_NOISE_RE = re.compile(
     r"hd|hq|4k|lyrics?|audio|mv|music\s*video|remaster(?:ed)?(?:\s*\d{4})?)[\)\]\}]",
     re.IGNORECASE,
 )
+_JP_SCRIPT_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\u3400-\u4dbf]")
+_FURIGANA_PAREN_RE = re.compile(
+    r"(?<=[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\u3400-\u4dbf])"
+    r"\s*[\(\[\{【][\u3040-\u309f\u30a0-\u30ffー・\s]+[\)\]\}】]\s*"
+)
+_BILINGUAL_SUFFIX_RE = re.compile(
+    r"(?:\s+[-–—|]\s+|\s*/\s*)([A-Za-z0-9\s'’\".,!?&~()\-]+)$"
+)
+_BILINGUAL_PAREN_SUFFIX_RE = re.compile(
+    r"\s*\(([A-Za-z0-9\s'’\".,!?&\-]+)\)\s*$"
+)
+_VERSION_KEEP_RE = re.compile(
+    r"\b(?:remix|mix|ver\.?|version|live|inst\.?|instrumental|acoustic|cover|"
+    r"edit|dub|vip|bootleg|flip|rework|feat\.?|ft\.?|prod\.?)\b",
+    re.IGNORECASE,
+)
+_ARTIST_SPLIT_RE = re.compile(
+    r"\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|\bwith\b|\bx\b|×|/)\s*",
+    re.IGNORECASE,
+)
+
+# Canonicalize Japanese <-> English/Romaji artist aliases so history and official ATV metadata match.
+JP_EN_ARTIST_ALIASES: dict[str, str] = {
+    "サザンオールスターズ": "southern all stars",
+    "サザン": "southern all stars",
+    "southern all stars": "southern all stars",
+    "桑田佳祐": "keisuke kuwata",
+    "kuwata keisuke": "keisuke kuwata",
+    "keisuke kuwata": "keisuke kuwata",
+    "山下達郎": "tatsuro yamashita",
+    "yamashita tatsuro": "tatsuro yamashita",
+    "tatsuro yamashita": "tatsuro yamashita",
+    "竹内まりや": "mariya takeuchi",
+    "takeuchi mariya": "mariya takeuchi",
+    "mariya takeuchi": "mariya takeuchi",
+    "大貫妙子": "taeko onuki",
+    "onuki taeko": "taeko onuki",
+    "taeko onuki": "taeko onuki",
+    "角松敏生": "toshiki kadomatsu",
+    "kadomatsu toshiki": "toshiki kadomatsu",
+    "toshiki kadomatsu": "toshiki kadomatsu",
+    "松原みき": "miki matsubara",
+    "matsubara miki": "miki matsubara",
+    "miki matsubara": "miki matsubara",
+    "杏里": "anri",
+    "大橋純子": "junko ohashi",
+    "八神純子": "junko yagami",
+    "菊池桃子": "momoko kikuchi",
+    "杉山清貴": "kiyotaka sugiyama",
+    "松任谷由実": "yumi matsutoya",
+    "荒井由実": "yumi matsutoya",
+    "yumi arai": "yumi matsutoya",
+    "大滝詠一": "eiichi ohtaki",
+    "大瀧詠一": "eiichi ohtaki",
+    "細野晴臣": "haruomi hosono",
+    "坂本龍一": "ryuichi sakamoto",
+    "高橋幸宏": "yukihiro takahashi",
+    "佐藤博": "hiroshi sato",
+    "吉田美奈子": "minako yoshida",
+    "松下誠": "makoto matsushita",
+    "高中正義": "masayoshi takanaka",
+    "流線形": "ryusenkei",
+    "一十三十一": "hitomitoi",
+    "キリンジ": "kirinji",
+    "オリジナル ラヴ": "original love",
+    "オリジナルラブ": "original love",
+    "フィッシュマンズ": "fishmans",
+    "坂本慎太郎": "shintaro sakamoto",
+    "青葉市子": "ichiko aoba",
+    "藤井風": "fujii kaze",
+    "藤井 風": "fujii kaze",
+    "kaze fujii": "fujii kaze",
+    "fujii kaze": "fujii kaze",
+    "星野源": "gen hoshino",
+    "星野 源": "gen hoshino",
+    "hoshino gen": "gen hoshino",
+    "gen hoshino": "gen hoshino",
+    "宇多田ヒカル": "hikaru utada",
+    "utada hikaru": "hikaru utada",
+    "hikaru utada": "hikaru utada",
+    "米津玄師": "kenshi yonezu",
+    "yonezu kenshi": "kenshi yonezu",
+    "kenshi yonezu": "kenshi yonezu",
+    "椎名林檎": "shiina ringo",
+    "ringo sheena": "shiina ringo",
+    "sheena ringo": "shiina ringo",
+    "東京事変": "tokyo incidents",
+    "official髭男dism": "official hige dandism",
+    "スピッツ": "spitz",
+    "サカナクション": "sakanaction",
+    "あいみょん": "aimyon",
+    "ずっと真夜中でいいのに": "zutomayo",
+    "ヨルシカ": "yorushika",
+    "ちゃんみな": "chanmina",
+    "千葉雄喜": "yuki chiba",
+    "ellow bucks": "yellow bucks",
+    "変態紳士クラブ": "hentai shinshi club",
+    "舐達麻": "namedaruma",
+}
+
+KNOWN_JAPANESE_ARTISTS_NORM: frozenset[str] = frozenset(
+    {
+        *JP_EN_ARTIST_ALIASES.values(),
+        # J-Pop / City Pop / J-Groove / J-Rock (Latin-script names)
+        "imase",
+        "vaundy",
+        "suchmos",
+        "nulbarich",
+        "kroi",
+        "lucky kilimanjaro",
+        "sirup",
+        "kan sano",
+        "tendre",
+        "iri",
+        "chelmico",
+        "tofubeats",
+        "piper",
+        "casiopea",
+        "t square",
+        "yellow magic orchestra",
+        "ymo",
+        "omega tribe",
+        "1986 omega tribe",
+        "sugar babe",
+        "tin pan alley",
+        "pizzicato five",
+        "cornelius",
+        "cero",
+        "yogee new waves",
+        "never young beach",
+        "toconoma",
+        "ovall",
+        "lamp",
+        "king gnu",
+        "millennium parade",
+        "yoasobi",
+        "mrs green apple",
+        "back number",
+        "mr children",
+        "bump of chicken",
+        "radwimps",
+        "one ok rock",
+        "perfume",
+        "capsule",
+        "ado",
+        "yama",
+        "creepy nuts",
+        # Japanese Hip-Hop (Latin-script names)
+        "bad hop",
+        "yzerr",
+        "t pablow",
+        "benjazzy",
+        "bark",
+        "vingo",
+        "tiji jojo",
+        "yellow pato",
+        "g kid",
+        "kandytown",
+        "keiju",
+        "io",
+        "ryohu",
+        "gottz",
+        "mud",
+        "jjj",
+        "febb",
+        "kid fresino",
+        "flashbacks",
+        "awich",
+        "jp the wavy",
+        "lex",
+        "lana",
+        "watson",
+        "ralph",
+        "jumadiba",
+        "kzm",
+        "eyden",
+        "bonbero",
+        "hideyoshi",
+        "ozworld",
+        "aklo",
+        "salu",
+        "kohh",
+        "zorn",
+        "anarchy",
+        "ak 69",
+        "zeebra",
+        "kreva",
+        "rhymester",
+        "buddha brand",
+        "seeda",
+        "norikiyo",
+        "issugi",
+        "5lack",
+        "punpee",
+        "stuts",
+        "bim",
+        "vava",
+        "omsb",
+        "campanella",
+        "tohji",
+        "gummyboy",
+        "elle teresa",
+        "sky hi",
+        "yellow bucks",
+        "dj ryow",
+        "red eye",
+        "mc tyson",
+        "jin dogg",
+        "wilywnka",
+        "vigorman",
+        "basi",
+        "chico carlito",
+        "sweet william",
+        "daichi yamamoto",
+        "skaai",
+        "dodo",
+        "kaneee",
+        "kohjiya",
+    }
+)
 
 
-def normalize_text(value: str) -> str:
-    """Normalize text for platform-agnostic deduplication."""
-    cleaned = _PAREN_NOISE_RE.sub("", value or "")
+def _normalize_basic(value: str) -> str:
+    """Lowercase NFKC alphanumeric normalization."""
+    cleaned = unicodedata.normalize("NFKC", value or "")
+    cleaned = _PAREN_NOISE_RE.sub("", cleaned)
     cleaned = cleaned.lower().strip()
     cleaned = _NON_ALNUM_RE.sub(" ", cleaned)
     return _WHITESPACE_RE.sub(" ", cleaned).strip()
 
 
+def normalize_text(value: str) -> str:
+    """Normalize text for platform-agnostic deduplication."""
+    return _normalize_basic(value)
+
+
 def normalize_artist(artist: str) -> str:
-    """Normalize artist name for deduplication and 30-day BAD artist exclusion."""
-    return normalize_text(artist)
+    """Normalize artist name for deduplication, JP<->EN alias matching, and suppression."""
+    norm = _normalize_basic(artist)
+    return JP_EN_ARTIST_ALIASES.get(norm, norm)
+
+
+def split_normalized_artists(artist: str) -> set[str]:
+    """Return normalized full artist plus individual collaboration tokens."""
+    out: set[str] = set()
+    full = normalize_artist(artist)
+    if full:
+        out.add(full)
+    for part in _ARTIST_SPLIT_RE.split(unicodedata.normalize("NFKC", artist or "")):
+        norm_part = normalize_artist(part)
+        if norm_part:
+            out.add(norm_part)
+    return out
+
+
+def contains_japanese_script(text: str) -> bool:
+    """Return True if text contains Hiragana, Katakana, or Kanji characters."""
+    return bool(_JP_SCRIPT_RE.search(unicodedata.normalize("NFKC", text or "")))
+
+
+def is_japanese_artist_or_text(artist: str, title: str = "") -> bool:
+    """Return True if artist or title is Japanese (script or known Latin-script JP artist)."""
+    if contains_japanese_script(artist) or contains_japanese_script(title):
+        return True
+    tokens = split_normalized_artists(artist)
+    return bool(tokens & KNOWN_JAPANESE_ARTISTS_NORM)
+
+
+def normalize_title_for_key(title: str) -> str:
+    """Normalize track title, stripping furigana and bilingual romaji suffixes on JP titles."""
+    cleaned = unicodedata.normalize("NFKC", title or "").strip()
+    cleaned = _PAREN_NOISE_RE.sub("", cleaned).strip()
+    if _JP_SCRIPT_RE.search(cleaned):
+        without_furigana = _FURIGANA_PAREN_RE.sub("", cleaned).strip()
+        if without_furigana:
+            cleaned = without_furigana
+        m_suffix = _BILINGUAL_SUFFIX_RE.search(cleaned)
+        if m_suffix:
+            rhs = m_suffix.group(1).strip()
+            lhs = cleaned[: m_suffix.start()].strip()
+            if (
+                lhs
+                and _JP_SCRIPT_RE.search(lhs)
+                and re.search(r"[A-Za-z]", rhs)
+                and not _VERSION_KEEP_RE.search(rhs)
+            ):
+                cleaned = lhs
+        m_paren = _BILINGUAL_PAREN_SUFFIX_RE.search(cleaned)
+        if m_paren:
+            rhs = m_paren.group(1).strip()
+            lhs = cleaned[: m_paren.start()].strip()
+            if (
+                lhs
+                and _JP_SCRIPT_RE.search(lhs)
+                and re.search(r"[A-Za-z]", rhs)
+                and not _VERSION_KEEP_RE.search(rhs)
+            ):
+                cleaned = lhs
+    return _normalize_basic(cleaned)
 
 
 def normalize_track_key(artist: str, title: str) -> str:
     """Create canonical platform-agnostic key from normalized (artist, title)."""
-    return f"{normalize_artist(artist)}::{normalize_text(title)}"
+    return f"{normalize_artist(artist)}::{normalize_title_for_key(title)}"
 
 
 def make_track_id(
@@ -332,8 +619,34 @@ def load_history_index(path: Path) -> tuple[set[str], set[str]]:
     if not isinstance(idx, dict):
         return set(), set()
     vids = {str(v).strip() for v in idx.get("known_video_ids", []) if str(v).strip()}
-    keys = {str(k).strip() for k in idx.get("known_track_keys", []) if str(k).strip()}
+    keys: set[str] = set()
+    for raw_key in idx.get("known_track_keys", []):
+        k = str(raw_key).strip()
+        if not k:
+            continue
+        keys.add(k)
+        if "::" in k:
+            art_part, ttl_part = k.split("::", 1)
+            keys.add(normalize_track_key(art_part, ttl_part))
     return vids, keys
+
+
+def load_familiar_artists(path: Path) -> set[str]:
+    """Load normalized known_familiar_artists from stations.yaml history_index section."""
+    if not path.exists():
+        return set()
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        return set()
+    idx = raw.get("history_index") or {}
+    if not isinstance(idx, dict):
+        return set()
+    familiar: set[str] = set()
+    for item in idx.get("known_familiar_artists", []):
+        norm = normalize_artist(str(item))
+        if norm:
+            familiar.add(norm)
+    return familiar
 
 
 def save_stations_yaml(

@@ -1,5 +1,5 @@
 meta:
-  generated_at: '2026-11-26T06:07:23.104976+00:00'
+  generated_at: '2026-11-26T13:42:36.382554+00:00'
   sources_used:
   - default_seed_fallback
   records_imported: 0
@@ -262,7 +262,6 @@ stations:
   - Hozier
   - Dominic Fike
   - Surfaces
-  - imase
   - Earth Wind & Fire
   max_popularity_views: 500000000
   exploration_rate: 1.0
@@ -302,7 +301,6 @@ stations:
   - Bastille - Good Grief
   - WALK THE MOON - Shut Up and Dance
   - Engelwood - One Step Ahead
-  - imase - NIGHT DANCER
   - Nicky Youre - Sunroof
   - Nicky Youre - Shut Me Up
   - Eagles Of Death Metal - Miss Alissa
@@ -349,3 +347,65 @@ stations:
   - Bon Entendeur - Le temps est bon
   - Vendredi sur Mer - Le Lac
   - Therapie TAXI - Hit Sale
+- station_id: jpop_citypop_groove
+  name: J-Pop, City Pop & Groove
+  seed_tags:
+  - city pop
+  - j-pop
+  - japanese groove
+  - aor
+  - japanese boogie
+  - shibuya-kei
+  seed_artists:
+  - Southern All Stars
+  - Keisuke Kuwata
+  - Tatsuro Yamashita
+  - Mariya Takeuchi
+  - Toshiki Kadomatsu
+  - Taeko Onuki
+  - Anri
+  - Miki Matsubara
+  - imase
+  - Fujii Kaze
+  - Vaundy
+  - Suchmos
+  - Nulbarich
+  - Kroi
+  - SIRUP
+  - Original Love
+  - KIRINJI
+  max_popularity_views: 500000000
+  exploration_rate: 1.0
+  target_theory_vector:
+    T1: 0.86
+    T2: 0.82
+    T3: 0.9
+    T4: 0.84
+    T5: 0.85
+  bpm_zones:
+  - 95-128
+  - 130-165
+  theory_archetypes:
+  - royal_road_secondary_dom
+  - slash_chord_groove
+  - dorian_dual_axis
+  - absent_tonic_funk
+  spotify_anchor_seeds:
+  - Southern All Stars - 希望の轍
+  - Southern All Stars - 栞のテーマ
+  - Keisuke Kuwata - 波乗りジョニー
+  - Tatsuro Yamashita - Sparkle
+  - Mariya Takeuchi - Plastic Love
+  - Toshiki Kadomatsu - If You...
+  - Taeko Onuki - 4:00A.M.
+  - Anri - Shyness Boy
+  - Miki Matsubara - 真夜中のドア
+  - imase - NIGHT DANCER
+  - Fujii Kaze - きらり
+  - Vaundy - 踊り子
+  - Suchmos - STAY TUNE
+  - Nulbarich - NEW ERA
+  - Kroi - Balmy Life
+  - SIRUP - LOOP
+  - Original Love - 接吻
+  - KIRINJI - エイリアンズ

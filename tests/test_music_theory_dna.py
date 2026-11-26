@@ -32,6 +32,7 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
         "edm_dance_party",
         "melodic_rap_alt",
         "indie_groove_cult",
+        "jpop_citypop_groove",
     ]
 
     by_id = {s.station_id: s for s in stations}
@@ -49,6 +50,9 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
     }
     assert by_id["indie_groove_cult"].target_theory_vector == {
         "T1": 0.88, "T2": 0.86, "T3": 0.85, "T4": 0.80, "T5": 0.86,
+    }
+    assert by_id["jpop_citypop_groove"].target_theory_vector == {
+        "T1": 0.86, "T2": 0.82, "T3": 0.90, "T4": 0.84, "T5": 0.85,
     }
     for st in stations:
         assert st.bpm_zones

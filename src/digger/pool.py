@@ -26,9 +26,16 @@ from typing import Any
 
 from src.adapters.deezer import DeezerClient
 from src.adapters.youtube import YouTubeMusicAdapter
-from src.db import RadioDatabase
+from src.db import WESTERN_ONLY_STATION_IDS, RadioDatabase
 from src.digger.listenbrainz import ListenBrainzClient
-from src.models import StationConfig, TrackEntity, normalize_artist
+from src.models import (
+    StationConfig,
+    TrackEntity,
+    is_japanese_artist_or_text,
+    normalize_artist,
+    normalize_track_key,
+    split_normalized_artists,
+)
 from src.recommender.audio_mir import AudioMIRExtractor
 
 logger = logging.getLogger(__name__)
@@ -91,11 +98,14 @@ class CandidatePoolDigger:
         plan: list[tuple[str, str, str, str | None]] = []
         seen_keys: set[tuple[str, str]] = set()
         default_arch = station.theory_archetypes[0] if station.theory_archetypes else None
+        western_only = station.station_id in WESTERN_ONLY_STATION_IDS
 
         def _add(artist: str, title: str, label: str, arch: str | None) -> None:
             a = artist.strip()
             t = title.strip()
             if not a:
+                return
+            if western_only and is_japanese_artist_or_text(a, t):
                 return
             k = (a.lower(), t.lower())
             if k in seen_keys:
@@ -142,18 +152,39 @@ class CandidatePoolDigger:
         max_lb_resolves: int = 16,
         known_video_ids: set[str] | None = None,
         known_track_keys: set[str] | None = None,
+        known_familiar_artists: set[str] | None = None,
         max_seeds: int = 8,
         max_alt_searches_per_dig: int = 12,
+        max_tracks_per_artist: int = 2,
     ) -> dict[str, Any]:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
         _ = max_lb_resolves  # Preserved for signature compatibility
         blocked_artists = self.db.get_blocked_artists_30d()
         blacklisted_vids = set(self.db.get_blacklisted_video_ids())
         known_vids = set(known_video_ids or set())
-        skip_keys = set(known_track_keys or set())
+        skip_keys: set[str] = set()
+        for raw_k in known_track_keys or set():
+            skip_keys.add(raw_k)
+            if "::" in raw_k:
+                art_p, ttl_p = raw_k.split("::", 1)
+                skip_keys.add(normalize_track_key(art_p, ttl_p))
+
         embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
+        western_only = station.station_id in WESTERN_ONLY_STATION_IDS
+        max_per_artist = max(0, int(max_tracks_per_artist))
 
         seed_plan = self._build_station_seed_plan(station, max_seeds=max_seeds)
+
+        # Known-Artist Suppression: exclude heavy-rotation familiar artists AND this station's seed artists themselves
+        suppressed_artists: set[str] = set()
+        for fam in known_familiar_artists or set():
+            suppressed_artists.update(split_normalized_artists(str(fam)))
+        for s_art in station.seed_artists:
+            suppressed_artists.update(split_normalized_artists(s_art))
+        for q_art, _q_ttl, _q_lbl, _q_arch in seed_plan:
+            suppressed_artists.update(split_normalized_artists(q_art))
+        for w_item in station.weighted_seeds:
+            suppressed_artists.update(split_normalized_artists(str(w_item.get("artist") or "")))
 
         # Resolve official seed songs (and artist browseIds) via filter="songs"
         resolved_seeds: list[tuple[str, str, str | None, str | None]] = []
@@ -176,13 +207,24 @@ class CandidatePoolDigger:
         skipped_popular = 0
         skipped_blocked = 0
         skipped_known = 0
+        skipped_familiar_artist = 0
+        skipped_language_mismatch = 0
 
         def _ingest(tracks: list[TrackEntity], seed_artist_key: str, label: str) -> None:
-            nonlocal skipped_popular, skipped_blocked, skipped_known
+            nonlocal skipped_popular, skipped_blocked, skipped_known, skipped_familiar_artist, skipped_language_mismatch
             for tr in tracks:
                 if not tr.video_id:
                     continue
-                if tr.video_id in known_vids or tr.video_id in seen_seed_vids or tr.canonical_key in skip_keys:
+                if western_only and is_japanese_artist_or_text(tr.artist, tr.title):
+                    skipped_language_mismatch += 1
+                    continue
+                dyn_key = normalize_track_key(tr.artist, tr.title)
+                if (
+                    tr.video_id in known_vids
+                    or tr.video_id in seen_seed_vids
+                    or tr.canonical_key in skip_keys
+                    or dyn_key in skip_keys
+                ):
                     skipped_known += 1
                     continue
                 # If already blacklisted (e.g. legacy yt_error_150), only retain when embed_check_enabled
@@ -190,8 +232,12 @@ class CandidatePoolDigger:
                 if tr.video_id in blacklisted_vids and not embed_check_enabled:
                     skipped_known += 1
                     continue
-                if normalize_artist(tr.artist) in blocked_artists:
+                cand_tokens = split_normalized_artists(tr.artist)
+                if cand_tokens & blocked_artists:
                     skipped_blocked += 1
+                    continue
+                if cand_tokens & suppressed_artists:
+                    skipped_familiar_artist += 1
                     continue
                 if tr.view_count is not None and tr.view_count > station.max_popularity_views:
                     skipped_popular += 1
@@ -243,10 +289,26 @@ class CandidatePoolDigger:
             reverse=True,
         )
 
+        # Initialize per-artist pool counts from existing unheard eligible candidates in SQLite
+        existing_unheard = self.db.get_eligible_candidates(
+            station.station_id,
+            station.max_popularity_views,
+            exclude_track_ids=known_vids,
+            include_heard_fallback=False,
+            exclude_canonical_keys=skip_keys,
+        )
+        existing_pool_track_ids = {t.track_id for t in existing_unheard}
+        artist_pool_counts: dict[str, int] = {}
+        for t in existing_unheard:
+            an = normalize_artist(t.artist)
+            if an:
+                artist_pool_counts[an] = artist_pool_counts.get(an, 0) + 1
+
         added = 0
         cooccurring_count = 0
         mir_enriched_count = 0
         skipped_unembeddable = 0
+        skipped_artist_cap = 0
         replaced_omv = 0
         replaced_lyric = 0
         alt_searches_used = 0
@@ -259,6 +321,17 @@ class CandidatePoolDigger:
             if added >= target_pool_size:
                 break
             if track.canonical_key in persisted_keys:
+                continue
+
+            cand_a_norm = normalize_artist(track.artist)
+            is_new_to_pool = track.track_id not in existing_pool_track_ids
+            if (
+                max_per_artist > 0
+                and is_new_to_pool
+                and cand_a_norm
+                and artist_pool_counts.get(cand_a_norm, 0) >= max_per_artist
+            ):
+                skipped_artist_cap += 1
                 continue
 
             replacement_tag = ""
@@ -291,6 +364,9 @@ class CandidatePoolDigger:
                 alt_track, alt_kind = alt_result
                 if not alt_track.video_id or alt_track.video_id in persisted_vids:
                     skipped_unembeddable += 1
+                    continue
+                if western_only and is_japanese_artist_or_text(alt_track.artist, alt_track.title):
+                    skipped_language_mismatch += 1
                     continue
 
                 track = TrackEntity(
@@ -350,6 +426,9 @@ class CandidatePoolDigger:
                 mir_enriched_count += 1
 
             self.db.upsert_track(station.station_id, track)
+            if is_new_to_pool and cand_a_norm:
+                artist_pool_counts[cand_a_norm] = artist_pool_counts.get(cand_a_norm, 0) + 1
+                existing_pool_track_ids.add(track.track_id)
             persisted_vids.add(track.video_id)
             persisted_keys.add(track.canonical_key)
             added += 1
@@ -368,6 +447,9 @@ class CandidatePoolDigger:
             "skipped_popular": skipped_popular,
             "skipped_blocked_30d": skipped_blocked,
             "skipped_known_history": skipped_known,
+            "skipped_familiar_artist": skipped_familiar_artist,
+            "skipped_artist_cap": skipped_artist_cap,
+            "skipped_language_mismatch": skipped_language_mismatch,
             "skipped_unembeddable": skipped_unembeddable,
             "replaced_omv": replaced_omv,
             "replaced_lyric": replaced_lyric,

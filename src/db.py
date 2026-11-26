@@ -11,10 +11,24 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from src.models import LEGACY_STATION_ID_MAP, TrackEntity, normalize_artist
+from src.models import (
+    LEGACY_STATION_ID_MAP,
+    TrackEntity,
+    is_japanese_artist_or_text,
+    normalize_artist,
+    normalize_track_key,
+)
 
 THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60
 VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
+WESTERN_ONLY_STATION_IDS = frozenset(
+    {
+        "us_hiphop_bouncy",
+        "edm_dance_party",
+        "melodic_rap_alt",
+        "indie_groove_cult",
+    }
+)
 
 
 DEFAULT_PLAYLISTS: tuple[tuple[str, str], ...] = (
@@ -666,7 +680,7 @@ class RadioDatabase:
                 """,
                 (cutoff,),
             ).fetchall()
-            return {str(r["artist_norm"]) for r in rows}
+            return {normalize_artist(str(r["artist_norm"])) for r in rows if r["artist_norm"]}
 
     def get_seen_artists(self, station_id: str | None = None) -> set[str]:
         """Return normalized artist names that already received playback feedback."""
@@ -678,7 +692,7 @@ class RadioDatabase:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT DISTINCT artist_norm FROM feedback_events").fetchall()
-            return {str(r["artist_norm"]) for r in rows}
+            return {normalize_artist(str(r["artist_norm"])) for r in rows if r["artist_norm"]}
 
     def get_recently_heard_track_ids(self, station_id: str, limit: int = 200) -> set[str]:
         """Return track IDs already played/rated on this station to prioritize unheard tracks."""
@@ -724,8 +738,26 @@ class RadioDatabase:
         rejected_ids = self.get_skipped_or_bad_track_ids(station_id) if include_heard_fallback else set()
         excluded = set(exclude_track_ids or set())
         excluded_keys = set(exclude_canonical_keys or set())
+        western_only = station_id in WESTERN_ONLY_STATION_IDS
 
         with self._connect() as conn:
+            heard_keys: set[str] = set()
+            rejected_keys: set[str] = set()
+            if heard_ids:
+                ph = ",".join("?" for _ in heard_ids)
+                h_rows = conn.execute(
+                    f"SELECT artist, title FROM tracks WHERE track_id IN ({ph})",
+                    tuple(heard_ids),
+                ).fetchall()
+                heard_keys = {normalize_track_key(str(r["artist"]), str(r["title"])) for r in h_rows}
+            if rejected_ids:
+                ph_r = ",".join("?" for _ in rejected_ids)
+                r_rows = conn.execute(
+                    f"SELECT artist, title FROM tracks WHERE track_id IN ({ph_r})",
+                    tuple(rejected_ids),
+                ).fetchall()
+                rejected_keys = {normalize_track_key(str(r["artist"]), str(r["title"])) for r in r_rows}
+
             rows = conn.execute(
                 """
                 SELECT t.*
@@ -749,17 +781,43 @@ class RadioDatabase:
                 continue
             if track.video_id and track.video_id in blacklisted_vids:
                 continue
-            if excluded_keys and track.canonical_key in excluded_keys:
+            if western_only and is_japanese_artist_or_text(track.artist, track.title):
+                continue
+            dyn_key = normalize_track_key(track.artist, track.title)
+            if excluded_keys and (track.canonical_key in excluded_keys or dyn_key in excluded_keys):
                 continue
             if normalize_artist(track.artist) in blocked_artists:
                 continue
-            if track.track_id not in heard_ids:
+            if track.track_id not in heard_ids and dyn_key not in heard_keys:
                 unheard.append(track)
-            elif include_heard_fallback and track.track_id not in rejected_ids:
+            elif include_heard_fallback and track.track_id not in rejected_ids and dyn_key not in rejected_keys:
                 heard_non_bad.append(track)
 
         # Prefer strictly unheard candidates; fall back to previously liked/completed tracks only if exhausted
         return unheard if unheard else heard_non_bad
+
+    def get_unheard_artist_counts(
+        self,
+        station_id: str,
+        max_popularity_views: int,
+        *,
+        exclude_track_ids: set[str] | None = None,
+        exclude_canonical_keys: set[str] | None = None,
+    ) -> dict[str, int]:
+        """Count unheard eligible candidate tracks per normalized artist in a station's pool."""
+        counts: dict[str, int] = {}
+        cands = self.get_eligible_candidates(
+            station_id,
+            max_popularity_views,
+            exclude_track_ids=exclude_track_ids,
+            include_heard_fallback=False,
+            exclude_canonical_keys=exclude_canonical_keys,
+        )
+        for tr in cands:
+            a_norm = normalize_artist(tr.artist)
+            if a_norm:
+                counts[a_norm] = counts.get(a_norm, 0) + 1
+        return counts
 
     def count_playable_candidates(
         self,

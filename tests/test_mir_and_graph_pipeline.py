@@ -360,7 +360,7 @@ def test_stage1_graph_digger_blocks_ai_slop_ugc_and_boosts_cooccurrence(tmp_path
 def test_calibration_bounded_slow_learning_station_isolation_and_reset_tracks(tmp_path: Path) -> None:
     db = RadioDatabase(tmp_path / "radio.db")
     stations = default_theory_stations()
-    assert len(stations) == 5
+    assert len(stations) == 6
 
     # Deterministic synthetic per-track Deezer/MIR vectors so calibration measures real variance & centroids
     class DeterministicMIR(AudioMIRExtractor):
@@ -501,7 +501,14 @@ def test_calibrate_profile_cli_and_web_ui_mir_indicators(tmp_path: Path) -> None
     rc = cal_cli_main(["--db", str(db_path), "--takeout", str(tmp_path / "none.json"), "--offline"])
     assert rc == 0
     db = RadioDatabase(db_path)
-    for sid in ("us_hiphop_bouncy", "japan_hiphop_street", "edm_dance_party", "melodic_rap_alt", "indie_groove_cult"):
+    for sid in (
+        "us_hiphop_bouncy",
+        "japan_hiphop_street",
+        "edm_dance_party",
+        "melodic_rap_alt",
+        "indie_groove_cult",
+        "jpop_citypop_groove",
+    ):
         prof = db.get_station_profile(sid)
         assert prof is not None and len(prof["centroid"]) == MIR_DIM
 
