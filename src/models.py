@@ -12,10 +12,151 @@ import yaml
 
 _NON_ALNUM_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
+_JP_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
 _PAREN_NOISE_RE = re.compile(
-    r"\s*[\(\[\{](?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|"
-    r"hd|hq|4k|lyrics?|audio|mv|music\s*video|remaster(?:ed)?(?:\s*\d{4})?)[\)\]\}]",
+    r"\s*[\(\[\{（【](?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|"
+    r"hd|hq|4k|lyrics?|audio|mv|music\s*video|remaster(?:ed)?(?:\s*\d{4})?)[\)\]\}）】]",
     re.IGNORECASE,
+)
+_FURIGANA_PAREN_RE = re.compile(r"[\(（][\u3040-\u30ffー・\s]{1,20}[\)）]")
+_JP_ROMANIZED_SUBTITLE_RE = re.compile(r"\s*[-–—/|]\s*[A-Za-z0-9'\"!?.,&\s]{2,}$")
+
+# Canonical JP <-> EN artist alias table to prevent bilingual duplicate/known-history leaks
+_ARTIST_ALIAS_MAP: dict[str, str] = {
+    "サザンオールスターズ": "southern all stars",
+    "southern all stars": "southern all stars",
+    "桑田佳祐": "keisuke kuwata",
+    "桑田 佳祐": "keisuke kuwata",
+    "keisuke kuwata": "keisuke kuwata",
+    "山下達郎": "tatsuro yamashita",
+    "山下 達郎": "tatsuro yamashita",
+    "tatsuro yamashita": "tatsuro yamashita",
+    "藤井風": "fujii kaze",
+    "藤井 風": "fujii kaze",
+    "fujii kaze": "fujii kaze",
+    "星野源": "hoshino gen",
+    "星野 源": "hoshino gen",
+    "hoshino gen": "hoshino gen",
+    "gen hoshino": "hoshino gen",
+    "宇多田ヒカル": "hikaru utada",
+    "宇多田 ヒカル": "hikaru utada",
+    "hikaru utada": "hikaru utada",
+    "utada hikaru": "hikaru utada",
+    "米津玄師": "kenshi yonezu",
+    "米津 玄師": "kenshi yonezu",
+    "kenshi yonezu": "kenshi yonezu",
+    "official髭男dism": "official higedandism",
+    "official higedandism": "official higedandism",
+    "椎名林檎": "sheena ringo",
+    "sheena ringo": "sheena ringo",
+    "竹内まりや": "mariya takeuchi",
+    "mariya takeuchi": "mariya takeuchi",
+    "松任谷由実": "yumi matsutoya",
+    "yumi matsutoya": "yumi matsutoya",
+    "松原みき": "miki matsubara",
+    "miki matsubara": "miki matsubara",
+    "角松敏生": "toshiki kadomatsu",
+    "toshiki kadomatsu": "toshiki kadomatsu",
+    "サカナクション": "sakanaction",
+    "sakanaction": "sakanaction",
+    "ちゃんみな": "chanmina",
+    "chanmina": "chanmina",
+    "千葉雄喜": "kohh",
+    "yuki chiba": "kohh",
+    "kohh": "kohh",
+}
+
+# Known Japanese artists using Romanized/English stage names (for western_only hard gate)
+_JAPANESE_ENGLISH_ARTISTS: frozenset[str] = frozenset(
+    {
+        "southern all stars",
+        "keisuke kuwata",
+        "tatsuro yamashita",
+        "fujii kaze",
+        "imase",
+        "vaundy",
+        "suchmos",
+        "king gnu",
+        "hoshino gen",
+        "gen hoshino",
+        "hikaru utada",
+        "utada hikaru",
+        "bad hop",
+        "yzerr",
+        "t pablow",
+        "zorn",
+        "awich",
+        "creepy nuts",
+        "official higedandism",
+        "kenshi yonezu",
+        "yoasobi",
+        "ado",
+        "mrs green apple",
+        "back number",
+        "radwimps",
+        "bump of chicken",
+        "spitz",
+        "mr children",
+        "perfume",
+        "sakanaction",
+        "sheena ringo",
+        "tokyo incidents",
+        "yumi matsutoya",
+        "mariya takeuchi",
+        "miki matsubara",
+        "toshiki kadomatsu",
+        "anri",
+        "taeko onuki",
+        "meiko nakahara",
+        "junko ohashi",
+        "takako mamiya",
+        "casiopea",
+        "omega tribe",
+        "kroi",
+        "nulbarich",
+        "sirup",
+        "lucky kilimanjaro",
+        "stuts",
+        "punpee",
+        "kid fresino",
+        "jjj",
+        "keiju",
+        "kandytown",
+        "yellow bucks",
+        "chanmina",
+        "lex",
+        "tohji",
+        "jp the wavy",
+        "kohh",
+        "yuki chiba",
+        "aimyon",
+        "yuuri",
+        "natori",
+        "tani yuuki",
+        "one ok rock",
+        "asian kung fu generation",
+        "rip slyme",
+        "m flo",
+        "teriyaki boyz",
+        "daoko",
+        "iri",
+        "atarashii gakko",
+        "ak 69",
+        "anarchy",
+        "norikiyo",
+        "salu",
+        "5lack",
+        "bim",
+        "kzm",
+        "ralph",
+        "watson",
+        "ozworld",
+        "jin dogg",
+        "guca owl",
+        "eyden",
+        "bonbero",
+        "kohjiya",
+    }
 )
 
 
@@ -28,13 +169,52 @@ def normalize_text(value: str) -> str:
 
 
 def normalize_artist(artist: str) -> str:
-    """Normalize artist name for deduplication and 30-day BAD artist exclusion."""
-    return normalize_text(artist)
+    """Normalize artist name with JP/EN canonical alias folding."""
+    base = normalize_text(artist)
+    if not base:
+        return ""
+    if base in _ARTIST_ALIAS_MAP:
+        return _ARTIST_ALIAS_MAP[base]
+    compact = base.replace(" ", "")
+    if compact in _ARTIST_ALIAS_MAP:
+        return _ARTIST_ALIAS_MAP[compact]
+    return base
+
+
+def normalize_title_for_key(title: str) -> str:
+    """Normalize track title removing furigana parentheticals and romanized English subtitles on JP titles."""
+    text = str(title or "").strip()
+    if not text:
+        return ""
+    text = _PAREN_NOISE_RE.sub("", text)
+    text = _FURIGANA_PAREN_RE.sub("", text)
+    if _JP_SCRIPT_RE.search(text):
+        stripped = _JP_ROMANIZED_SUBTITLE_RE.sub("", text).strip()
+        if stripped and _JP_SCRIPT_RE.search(stripped):
+            text = stripped
+    return normalize_text(text)
 
 
 def normalize_track_key(artist: str, title: str) -> str:
     """Create canonical platform-agnostic key from normalized (artist, title)."""
-    return f"{normalize_artist(artist)}::{normalize_text(title)}"
+    return f"{normalize_artist(artist)}::{normalize_title_for_key(title)}"
+
+
+def is_japanese_music_entity(artist: str, title: str = "") -> bool:
+    """Return True if artist or title is Japanese (Japanese script or known Romanized JP artist)."""
+    if _JP_SCRIPT_RE.search(artist or "") or _JP_SCRIPT_RE.search(title or ""):
+        return True
+    a_norm = normalize_artist(artist)
+    if not a_norm:
+        return False
+    if a_norm in _JAPANESE_ENGLISH_ARTISTS:
+        return True
+    # Also check individual tokens in collab strings (e.g. "imase & Punpee")
+    for part in re.split(r"\s*(?:feat\.?|ft\.?|&|,|\s+x\s+|×|\bwith\b)\s*", artist or "", flags=re.IGNORECASE):
+        p_norm = normalize_artist(part)
+        if p_norm and p_norm in _JAPANESE_ENGLISH_ARTISTS:
+            return True
+    return False
 
 
 def make_track_id(
@@ -55,12 +235,13 @@ def make_track_id(
 
 
 LEGACY_STATION_ID_MAP: dict[str, str] = {
-    "indie_groove_hooks": "indie_groove_cult",
+    "indie_groove_hooks": "pes_passion_groove",
+    "indie_groove_cult": "pes_passion_groove",
 }
 
 
 def normalize_station_id(station_id: str) -> str:
-    """Map deprecated station IDs (e.g. indie_groove_hooks) to their canonical successor."""
+    """Map deprecated station IDs (e.g. indie_groove_hooks / indie_groove_cult) to their canonical successor."""
     clean = str(station_id or "").strip()
     return LEGACY_STATION_ID_MAP.get(clean, clean)
 
@@ -75,6 +256,8 @@ class StationConfig:
     seed_artists: list[str]
     max_popularity_views: int = 500_000_000
     exploration_rate: float = 1.0
+    vibe: str = ""
+    region_policy: str = "any"  # "western_only" | "japanese_only" | "any"
     target_theory_vector: dict[str, float] = field(default_factory=dict)
     bpm_zones: list[str] = field(default_factory=list)
     theory_archetypes: list[str] = field(default_factory=list)
@@ -93,6 +276,10 @@ class StationConfig:
             "max_popularity_views": int(self.max_popularity_views),
             "exploration_rate": float(self.exploration_rate),
         }
+        if self.vibe:
+            payload["vibe"] = self.vibe
+        if self.region_policy and self.region_policy != "any":
+            payload["region_policy"] = self.region_policy
         if self.target_theory_vector:
             payload["target_theory_vector"] = {
                 str(k): round(float(v), 4) for k, v in self.target_theory_vector.items()
@@ -134,6 +321,8 @@ class StationConfig:
             seed_artists=[str(a).strip() for a in data.get("seed_artists", []) if str(a).strip()],
             max_popularity_views=max_views,
             exploration_rate=float(data.get("exploration_rate", 1.0)),
+            vibe=str(data.get("vibe") or "").strip(),
+            region_policy=str(data.get("region_policy") or "any").strip().lower(),
             target_theory_vector=target_vec,
             bpm_zones=[str(z).strip() for z in data.get("bpm_zones", []) if str(z).strip()],
             theory_archetypes=[str(a).strip() for a in data.get("theory_archetypes", []) if str(a).strip()],
@@ -334,6 +523,23 @@ def load_history_index(path: Path) -> tuple[set[str], set[str]]:
     vids = {str(v).strip() for v in idx.get("known_video_ids", []) if str(v).strip()}
     keys = {str(k).strip() for k in idx.get("known_track_keys", []) if str(k).strip()}
     return vids, keys
+
+
+def load_known_familiar_artists(path: Path) -> set[str]:
+    """Load normalized known_familiar_artists from stations.yaml history_index section."""
+    if not path.exists():
+        return set()
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        return set()
+    idx = raw.get("history_index") or {}
+    if not isinstance(idx, dict):
+        return set()
+    return {
+        normalize_artist(str(a))
+        for a in idx.get("known_familiar_artists", [])
+        if str(a).strip() and normalize_artist(str(a))
+    }
 
 
 def save_stations_yaml(

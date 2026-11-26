@@ -80,7 +80,7 @@ def test_playlists_crud_good_save_and_50_chunk_youtube_watch_urls(tmp_path: Path
     )
     db: RadioDatabase = app.state.runtime.db
     db.upsert_track(
-        "indie_groove_cult",
+        "pes_passion_groove",
         TrackEntity.build(
             artist="Royel Otis",
             title="Hidden Gem Groove",
@@ -104,7 +104,7 @@ def test_playlists_crud_good_save_and_50_chunk_youtube_watch_urls(tmp_path: Path
     fb = client.post(
         "/feedback",
         json={
-            "station_id": "indie_groove_cult",
+            "station_id": "pes_passion_groove",
             "video_id": "GEM_YT_001",
             "event_type": "GOOD",
             "playlist_id": custom_pid,
@@ -120,7 +120,7 @@ def test_playlists_crud_good_save_and_50_chunk_youtube_watch_urls(tmp_path: Path
             "video_id": "GEM_YT_001",
             "artist": "Royel Otis",
             "title": "Hidden Gem Groove",
-            "station_id": "indie_groove_cult",
+            "station_id": "pes_passion_groove",
         },
     )
     assert add_res.status_code == 200

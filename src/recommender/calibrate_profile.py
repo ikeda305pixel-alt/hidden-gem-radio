@@ -40,6 +40,12 @@ WEIGHT_CULT_ANCHORS = 0.20
 
 # Deterministic acoustic anchor offsets for offline fallback calibration when Deezer/ffmpeg are unavailable
 _STATION_OFFLINE_PRIORS: dict[str, list[float]] = {
+    "pes_passion_groove": [
+        0.52, 0.72, 0.64, 0.48, 0.60, 0.68, 0.60, 0.68, 0.48, 0.24, 0.68, 0.64, 0.70, 0.82, 0.88, 0.88,
+    ],
+    "parisian_chic_disco": [
+        0.48, 0.70, 0.62, 0.46, 0.62, 0.70, 0.56, 0.72, 0.44, 0.20, 0.62, 0.62, 0.70, 0.82, 0.86, 0.90,
+    ],
     "us_hiphop_bouncy": [
         0.52, 0.78, 0.76, 0.78, 0.44, 0.48, 0.46, 0.46, 0.44, 0.28, 0.78, 0.62, 0.65, 0.80, 0.90, 0.55,
     ],
@@ -52,8 +58,8 @@ _STATION_OFFLINE_PRIORS: dict[str, list[float]] = {
     "melodic_rap_alt": [
         0.64, 0.66, 0.54, 0.56, 0.54, 0.58, 0.58, 0.64, 0.48, 0.24, 0.72, 0.70, 0.65, 0.80, 0.90, 0.62,
     ],
-    "indie_groove_cult": [
-        0.50, 0.70, 0.62, 0.48, 0.60, 0.68, 0.58, 0.68, 0.46, 0.22, 0.66, 0.64, 0.70, 0.82, 0.88, 0.86,
+    "jpop_citypop_groove": [
+        0.48, 0.68, 0.60, 0.46, 0.62, 0.68, 0.60, 0.70, 0.44, 0.20, 0.64, 0.68, 0.68, 0.80, 0.86, 0.74,
     ],
 }
 
@@ -106,12 +112,14 @@ def _collect_youtube_station_top_tracks(
     *,
     reference_time: datetime | None = None,
     max_per_station: int = 30,
+    max_tracks_per_artist: int = 2,
 ) -> dict[str, list[tuple[str, str, float]]]:
-    """Group watch history records by station and return top 30 (artist, title, weight) per station."""
+    """Group watch history records by station and return top (artist, title, weight) capped at 2 tracks/artist."""
     from src.digger.history_importer import (
         classify_entry_to_station,
         compute_recency_frequency_weight,
     )
+    from src.models import normalize_artist
 
     now = reference_time or datetime.now(UTC)
     if now.tzinfo is None:
@@ -124,7 +132,7 @@ def _collect_youtube_station_top_tracks(
         if not artist or not title:
             continue
         st_id = classify_entry_to_station(artist, title)
-        key = (artist.lower(), title.lower())
+        key = (normalize_artist(artist) or artist.lower(), title.lower())
         bucket = per_station.setdefault(st_id, {})
 
         played_raw = str(rec.get("played_at") or rec.get("time") or "").strip()
@@ -146,6 +154,7 @@ def _collect_youtube_station_top_tracks(
             bucket[key]["count"] += inc
             bucket[key]["min_days"] = min(bucket[key]["min_days"], days_ago)
 
+    cap = max(1, int(max_tracks_per_artist))
     result: dict[str, list[tuple[str, str, float]]] = {}
     for st_id, entries in per_station.items():
         scored = [
@@ -157,7 +166,17 @@ def _collect_youtube_station_top_tracks(
             for item in entries.values()
         ]
         scored.sort(key=lambda x: x[2], reverse=True)
-        result[st_id] = scored[:max_per_station]
+        capped: list[tuple[str, str, float]] = []
+        artist_seen: dict[str, int] = {}
+        for art, ttl, w in scored:
+            a_norm = normalize_artist(art) or art.lower()
+            if artist_seen.get(a_norm, 0) >= cap:
+                continue
+            artist_seen[a_norm] = artist_seen.get(a_norm, 0) + 1
+            capped.append((art, ttl, w))
+            if len(capped) >= max_per_station:
+                break
+        result[st_id] = capped
     return result
 
 
@@ -276,12 +295,20 @@ def calibrate_all_stations(
             counts: dict[str, int],
             source_vecs: list[np.ndarray],
             source_weights: list[float],
+            artist_cap_tracker: dict[str, int],
+            max_per_artist: int = 2,
         ) -> None:
+            from src.models import normalize_artist
+
             group_vecs: list[np.ndarray] = []
             group_raw_w: list[float] = []
             for artist, title, item_w in items:
                 if not artist:
                     continue
+                a_norm = normalize_artist(artist) or artist.lower()
+                if artist_cap_tracker.get(a_norm, 0) >= max_per_artist:
+                    continue
+                artist_cap_tracker[a_norm] = artist_cap_tracker.get(a_norm, 0) + 1
                 dummy = TrackEntity.build(
                     artist=artist,
                     title=title or artist,
@@ -310,11 +337,14 @@ def calibrate_all_stations(
             source_vecs: list[np.ndarray] = []
             source_weights: list[float] = []
             counts = {"youtube": 0, "spotify": 0, "cult_anchors": 0}
+            station_artist_cap: dict[str, int] = {}
 
             # Source 1: YouTube history top tracks (45%)
             yt_items = yt_by_station.get(st.station_id, [])
             if yt_items:
-                _extract_group(yt_items, WEIGHT_YOUTUBE, "youtube", counts, source_vecs, source_weights)
+                _extract_group(
+                    yt_items, WEIGHT_YOUTUBE, "youtube", counts, source_vecs, source_weights, station_artist_cap
+                )
 
             # Source 2: Spotify curated favorites (35%)
             sp_items = [
@@ -322,13 +352,17 @@ def calibrate_all_stations(
                 for seed in st.spotify_anchor_seeds[:max_spotify_per_station]
             ]
             if sp_items:
-                _extract_group(sp_items, WEIGHT_SPOTIFY, "spotify", counts, source_vecs, source_weights)
+                _extract_group(
+                    sp_items, WEIGHT_SPOTIFY, "spotify", counts, source_vecs, source_weights, station_artist_cap
+                )
 
             # Source 3: PES 2011 / Emily in Paris anchors (20%)
             cult_list = [*st.pes_anchors, *st.emily_anchors]
             cult_items = [(*_parse_seed_pair(seed), 1.0) for seed in cult_list]
             if cult_items:
-                _extract_group(cult_items, WEIGHT_CULT_ANCHORS, "cult_anchors", counts, source_vecs, source_weights)
+                _extract_group(
+                    cult_items, WEIGHT_CULT_ANCHORS, "cult_anchors", counts, source_vecs, source_weights, station_artist_cap
+                )
 
             if source_vecs:
                 centroid, axis_weights = _compute_weighted_mean_and_consistency(source_vecs, source_weights)

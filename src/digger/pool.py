@@ -142,18 +142,37 @@ class CandidatePoolDigger:
         max_lb_resolves: int = 16,
         known_video_ids: set[str] | None = None,
         known_track_keys: set[str] | None = None,
+        known_familiar_artists: set[str] | None = None,
         max_seeds: int = 8,
         max_alt_searches_per_dig: int = 12,
+        max_tracks_per_artist_in_pool: int = 2,
     ) -> dict[str, Any]:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
+        from src.models import is_japanese_music_entity
+
         _ = max_lb_resolves  # Preserved for signature compatibility
         blocked_artists = self.db.get_blocked_artists_30d()
         blacklisted_vids = set(self.db.get_blacklisted_video_ids())
         known_vids = set(known_video_ids or set())
         skip_keys = set(known_track_keys or set())
+        familiar_artists = {
+            normalize_artist(a) for a in (known_familiar_artists or set()) if normalize_artist(a)
+        }
+        is_western_only = station.region_policy == "western_only"
         embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
+        pool_artist_cap = max(1, int(max_tracks_per_artist_in_pool))
+        pool_artist_counts = self.db.count_unheard_by_artist(
+            station.station_id,
+            station.max_popularity_views,
+        )
 
         seed_plan = self._build_station_seed_plan(station, max_seeds=max_seeds)
+        if is_western_only:
+            seed_plan = [
+                row
+                for row in seed_plan
+                if not is_japanese_music_entity(row[0], row[1])
+            ]
 
         # Resolve official seed songs (and artist browseIds) via filter="songs"
         resolved_seeds: list[tuple[str, str, str | None, str | None]] = []
@@ -176,9 +195,12 @@ class CandidatePoolDigger:
         skipped_popular = 0
         skipped_blocked = 0
         skipped_known = 0
+        skipped_region_mismatch = 0
+        skipped_familiar_artist = 0
+        skipped_artist_cap = 0
 
         def _ingest(tracks: list[TrackEntity], seed_artist_key: str, label: str) -> None:
-            nonlocal skipped_popular, skipped_blocked, skipped_known
+            nonlocal skipped_popular, skipped_blocked, skipped_known, skipped_region_mismatch, skipped_familiar_artist
             for tr in tracks:
                 if not tr.video_id:
                     continue
@@ -190,8 +212,15 @@ class CandidatePoolDigger:
                 if tr.video_id in blacklisted_vids and not embed_check_enabled:
                     skipped_known += 1
                     continue
-                if normalize_artist(tr.artist) in blocked_artists:
+                a_norm = normalize_artist(tr.artist)
+                if a_norm in blocked_artists:
                     skipped_blocked += 1
+                    continue
+                if is_western_only and is_japanese_music_entity(tr.artist, tr.title):
+                    skipped_region_mismatch += 1
+                    continue
+                if a_norm and a_norm in familiar_artists:
+                    skipped_familiar_artist += 1
                     continue
                 if tr.view_count is not None and tr.view_count > station.max_popularity_views:
                     skipped_popular += 1
@@ -259,6 +288,10 @@ class CandidatePoolDigger:
             if added >= target_pool_size:
                 break
             if track.canonical_key in persisted_keys:
+                continue
+            a_norm = normalize_artist(track.artist)
+            if a_norm and pool_artist_counts.get(a_norm, 0) >= pool_artist_cap:
+                skipped_artist_cap += 1
                 continue
 
             replacement_tag = ""
@@ -352,6 +385,8 @@ class CandidatePoolDigger:
             self.db.upsert_track(station.station_id, track)
             persisted_vids.add(track.video_id)
             persisted_keys.add(track.canonical_key)
+            if a_norm:
+                pool_artist_counts[a_norm] = pool_artist_counts.get(a_norm, 0) + 1
             added += 1
 
         total_playable = self.db.count_playable_candidates(
@@ -368,6 +403,9 @@ class CandidatePoolDigger:
             "skipped_popular": skipped_popular,
             "skipped_blocked_30d": skipped_blocked,
             "skipped_known_history": skipped_known,
+            "skipped_region_mismatch": skipped_region_mismatch,
+            "skipped_familiar_artist": skipped_familiar_artist,
+            "skipped_artist_cap": skipped_artist_cap,
             "skipped_unembeddable": skipped_unembeddable,
             "replaced_omv": replaced_omv,
             "replaced_lyric": replaced_lyric,

@@ -599,8 +599,9 @@ class ContextualBanditRecommender:
         hour: int | None = None,
         limit: int = 3,
         recent_artists: list[str] | None = None,
+        recent_mir_vectors: list[list[float]] | None = None,
     ) -> list[RankedCandidate]:
-        """Stage 2 Precision Scoring + Stage 3 Re-Ranking (5-track artist cooldown + 80/20 exploit/explore)."""
+        """Stage 2 Precision Scoring + Stage 3 Re-Ranking (5-track artist cooldown + MMR diversity + 80/20 exploit/explore)."""
         if not candidates:
             return []
 
@@ -693,6 +694,29 @@ class ContextualBanditRecommender:
         explore_scores = w_base * base_explore + w_theory * theory_explore + w_mir * mir_crossover
         total_scores = w_base * base_total + w_theory * theory_total + w_mir * mir_total
 
+        # Stage 3 MMR Diversity Penalty against recent 5 played 16-dim MIR vectors:
+        # mmr = 0.75 * relevance - 0.25 * max_sim_to_recent_5
+        recent_vecs: list[np.ndarray] = []
+        for rv in (recent_mir_vectors or [])[:5]:
+            arr = np.asarray(rv, dtype=np.float64).ravel()
+            if arr.shape[0] >= MIR_DIM:
+                arr = arr[:MIR_DIM]
+            elif arr.shape[0] >= 12:
+                arr = np.pad(arr, (0, MIR_DIM - arr.shape[0]), constant_values=0.5)
+            else:
+                continue
+            norm = float(np.linalg.norm(arr))
+            if norm > 1e-9:
+                recent_vecs.append(arr / norm)
+
+        if recent_vecs:
+            cand_norms = np.maximum(1e-9, np.linalg.norm(X_mir, axis=1, keepdims=True))
+            X_mir_unit = X_mir / cand_norms
+            recent_mat = np.vstack(recent_vecs)  # shape: (R, 16)
+            sim_mat = np.clip(X_mir_unit @ recent_mat.T, 0.0, 1.0)
+            max_sim = np.max(sim_mat, axis=1)
+            total_scores = 0.75 * total_scores - 0.25 * max_sim
+
         scored: list[tuple[RankedCandidate, float]] = []
         seed_tag_set = set(self.seed_tags)
         for idx, track in enumerate(candidates):
@@ -757,9 +781,7 @@ class ContextualBanditRecommender:
                 return cand
             return None
 
-        # 80% Exploit + 20% Explore slot pattern (slot indices 4, 9, ... are exploration crossover slots;
-        # for 3-track batches, if limit >= 5 slot #5 is explore; if pool has strong crossover gem on slot #3
-        # when n_updates > 0 we keep exploit top-1 strictly highest score!)
+        # 80% Exploit + 20% Explore slot pattern
         for slot in range(limit):
             is_explore_slot = (slot % 5) == 4
             primary_pool = explore_pool if is_explore_slot else exploit_pool

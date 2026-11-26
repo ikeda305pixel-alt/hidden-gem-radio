@@ -453,6 +453,15 @@
         padding: 10px 8px;
       }
     }
+
+    .station-vibe {
+      margin-top: 8px;
+      font-size: 0.84rem;
+      color: var(--muted);
+      line-height: 1.4;
+      padding: 0 2px;
+      min-height: 1.2em;
+    }
   </style>
 </head>
 <body>
@@ -465,9 +474,10 @@
       <div class="status-pill" id="statusPill">局を読み込み中...</div>
     </header>
 
-    <!-- 5 Deep Music Theory DNA Stations -->
+    <!-- 7 Thematic Deep Music Theory DNA Stations -->
     <section class="card" aria-label="局切替">
       <div class="station-row" id="stationRow"></div>
+      <div class="station-vibe" id="stationVibe"></div>
     </section>
 
     <!-- Now Playing + YouTube IFrame + Theory DNA + Controls -->
@@ -594,6 +604,7 @@
     const el = {
       statusPill: document.getElementById("statusPill"),
       stationRow: document.getElementById("stationRow"),
+      stationVibe: document.getElementById("stationVibe"),
       stationLabel: document.getElementById("stationLabel"),
       trackTitle: document.getElementById("trackTitle"),
       trackArtist: document.getElementById("trackArtist"),
@@ -801,6 +812,10 @@
         btn.onclick = () => switchStation(st.station_id);
         el.stationRow.appendChild(btn);
       }
+      if (el.stationVibe) {
+        const active = state.stations.find((s) => s.station_id === state.activeStationId);
+        el.stationVibe.textContent = active && active.vibe ? active.vibe : "";
+      }
     }
 
     function renderQueue() {
@@ -898,10 +913,36 @@
       }
     }
 
-    async function fetchJson(url, options) {
-      const res = await fetch(url, options);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.json();
+    async function fetchJson(url, options = {}, timeoutMs = 8000) {
+      const hasAbort = typeof AbortController !== "undefined";
+      const controller = hasAbort ? new AbortController() : null;
+      const fetchOptions = controller ? { ...options, signal: controller.signal } : options;
+      let timerId = null;
+      try {
+        const fetchPromise = Promise.resolve(fetch(url, fetchOptions));
+        const res =
+          timeoutMs > 0
+            ? await Promise.race([
+                fetchPromise,
+                new Promise((_, reject) => {
+                  timerId = setTimeout(() => {
+                    if (controller) {
+                      try {
+                        controller.abort();
+                      } catch (_) {}
+                    }
+                    reject(new Error(`Request timeout (${timeoutMs}ms)`));
+                  }, timeoutMs);
+                }),
+              ])
+            : await fetchPromise;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+      } finally {
+        if (timerId !== null) {
+          clearTimeout(timerId);
+        }
+      }
     }
 
     // [M2 / Bug #5 / Audit #11] Share in-flight prefetch Promise with callerEpoch & empty-batch cooldown guards
@@ -989,8 +1030,11 @@
           armPlaybackWatchdog(track);
         }
         ensurePrefetchQueue(3);
-      } else if (!state.circuitBroken) {
-        scheduleQueueRetry();
+      } else {
+        stopPlayerSafely();
+        if (!state.circuitBroken) {
+          scheduleQueueRetry();
+        }
       }
     }
 
@@ -1031,18 +1075,22 @@
       if (!eventType) return;
       state.implicitFeedbackSentVideoId = vid;
       try {
-        await fetchJson("/feedback", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            station_id: stationId,
-            track_id: track.track_id,
-            video_id: vid,
-            event_type: eventType,
-            listen_seconds: listenSeconds,
-            duration_seconds: durationSeconds || null,
-          }),
-        });
+        await fetchJson(
+          "/feedback",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              station_id: stationId,
+              track_id: track.track_id,
+              video_id: vid,
+              event_type: eventType,
+              listen_seconds: listenSeconds,
+              duration_seconds: durationSeconds || null,
+            }),
+          },
+          5500
+        );
         if (state.activeStationId === stationId) {
           refreshTheoryProfile();
         }
@@ -1203,7 +1251,7 @@
       }
     }
 
-    async function sendFeedback(eventType, extra = {}) {
+    async function sendFeedback(eventType, extra = {}, timeoutMs = 5500) {
       if (!state.currentTrack || !state.activeStationId) return null;
       let listenSeconds = null;
       let durationSeconds = state.currentTrack.duration_seconds || null;
@@ -1212,19 +1260,23 @@
         const ytDur = Number(state.player.getDuration() || 0);
         if (ytDur > 0) durationSeconds = ytDur;
       }
-      return fetchJson("/feedback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          station_id: state.activeStationId,
-          track_id: state.currentTrack.track_id,
-          video_id: state.currentTrack.video_id,
-          event_type: eventType,
-          listen_seconds: listenSeconds,
-          duration_seconds: durationSeconds,
-          ...extra,
-        }),
-      });
+      return fetchJson(
+        "/feedback",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            station_id: state.activeStationId,
+            track_id: state.currentTrack.track_id,
+            video_id: state.currentTrack.video_id,
+            event_type: eventType,
+            listen_seconds: listenSeconds,
+            duration_seconds: durationSeconds,
+            ...extra,
+          }),
+        },
+        timeoutMs
+      );
     }
 
     async function addTrackToLocalPlaylist(playlistId, track) {
@@ -1306,15 +1358,58 @@
               ) {
                 armPlaybackWatchdog(state.currentTrack);
               }
-            } else if (event.data === YT.PlayerState.PAUSED || event.data === YT.PlayerState.CUED) {
+            } else if (event.data === YT.PlayerState.PAUSED) {
               clearPlaybackWatchdog();
               updatePlayMuteButton();
-              if ("mediaSession" in navigator && event.data === YT.PlayerState.PAUSED) {
+              if ("mediaSession" in navigator) {
                 navigator.mediaSession.playbackState = "paused";
+              }
+            } else if (event.data === YT.PlayerState.CUED) {
+              if (state.hasUserPlaybackStarted && state.currentTrack && !state.circuitBroken) {
+                // Android Brave/mobile often stalls in CUED after loadVideoById; force playVideo() and keep watchdog armed
+                if (state.player && state.playerReady && typeof state.player.playVideo === "function") {
+                  try {
+                    state.player.playVideo();
+                  } catch (_) {}
+                }
+                if (
+                  state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
+                  state.watchdogTimerId === null
+                ) {
+                  armPlaybackWatchdog(state.currentTrack);
+                }
+                updatePlayMuteButton();
+              } else {
+                clearPlaybackWatchdog();
+                updatePlayMuteButton();
               }
             } else if (event.data === YT.PlayerState.ENDED) {
               clearPlaybackWatchdog();
-              await sendImplicitPlaybackFeedback(false);
+              resetEmptyBatchCooldown();
+              const endedTrack = state.currentTrack;
+              const endedStationId = state.activeStationId;
+              const endedEpoch = state.prefetchEpoch;
+              try {
+                await sendImplicitPlaybackFeedback(false, endedTrack, endedStationId);
+              } catch (_) {}
+              if (state.activeStationId !== endedStationId || state.prefetchEpoch !== endedEpoch) {
+                return;
+              }
+              if (!state.queue.length) {
+                await ensurePrefetchQueue(3);
+              }
+              if (state.activeStationId !== endedStationId || state.prefetchEpoch !== endedEpoch) {
+                return;
+              }
+              if (!state.queue.length) {
+                // 1-track inventory recovery: clear currentTrack so /batch exclude does not block heard_fallback
+                state.currentTrack = null;
+                resetEmptyBatchCooldown();
+                await ensurePrefetchQueue(3);
+              }
+              if (state.activeStationId !== endedStationId || state.prefetchEpoch !== endedEpoch) {
+                return;
+              }
               await playNextFromQueue();
             }
           },
@@ -1419,27 +1514,41 @@
       }
     });
 
-    // BAD (-1.0 theory reward + block artist + invalidate in-flight prefetch + instant skip)
+    // BAD (-1.0 theory reward + block artist + invalidate in-flight prefetch + instant stop & skip)
     el.btnBad.addEventListener("click", async () => {
-      if (!state.currentTrack) return;
-      clearPlaybackWatchdog();
-      const badArtistNorm = normalizeArtistName(state.currentTrack.artist);
-      if (badArtistNorm) {
-        state.blockedArtists.add(badArtistNorm);
-      }
-      state.prefetchEpoch += 1;
-      state.prefetchPromise = null;
-      resetEmptyBatchCooldown();
-      state.queue = state.queue.filter(
-        (item) => !state.blockedArtists.has(normalizeArtistName(item.artist))
-      );
-      renderQueue();
+      if (!state.currentTrack || state.skippingInProgress) return;
+      state.skippingInProgress = true;
+      const stationAtBad = state.activeStationId;
       try {
-        await sendFeedback("BAD");
-        refreshTheoryProfile();
-      } catch (_) {}
-      setStatus("👎 安定MIR学習反映 · 次曲へ");
-      await playNextFromQueue();
+        clearPlaybackWatchdog();
+        stopPlayerSafely();
+        state.hasUserPlaybackStarted = true;
+        const badArtistNorm = normalizeArtistName(state.currentTrack.artist);
+        if (badArtistNorm) {
+          state.blockedArtists.add(badArtistNorm);
+        }
+        state.prefetchEpoch += 1;
+        const epochAtBad = state.prefetchEpoch;
+        state.prefetchPromise = null;
+        resetEmptyBatchCooldown();
+        state.queue = state.queue.filter(
+          (item) => !state.blockedArtists.has(normalizeArtistName(item.artist))
+        );
+        renderQueue();
+        try {
+          await sendFeedback("BAD", {}, 5500);
+          if (state.activeStationId === stationAtBad) {
+            refreshTheoryProfile();
+          }
+        } catch (_) {}
+        if (state.activeStationId !== stationAtBad || state.prefetchEpoch !== epochAtBad) {
+          return;
+        }
+        setStatus("👎 安定MIR学習反映 · 次曲へ");
+        await playNextFromQueue();
+      } finally {
+        state.skippingInProgress = false;
+      }
     });
 
     el.btnDigMore.addEventListener("click", async () => {

@@ -253,14 +253,14 @@ def test_legacy_indie_groove_hooks_auto_migrates_db_yaml_and_pkl(tmp_path: Path)
     )
     runtime = app.state.runtime
 
-    assert "indie_groove_cult" in runtime.stations
+    assert "pes_passion_groove" in runtime.stations
     assert "indie_groove_hooks" not in runtime.stations
-    assert runtime.stations["indie_groove_cult"].max_popularity_views == 500_000_000
-    assert (model_dir / "bandit_indie_groove_cult.pkl").exists()
-    assert runtime.bandits["indie_groove_cult"].n_updates == 1
-    assert runtime.db.count_feedback("indie_groove_cult") == 1
+    assert runtime.stations["pes_passion_groove"].max_popularity_views == 500_000_000
+    assert (model_dir / "bandit_pes_passion_groove.pkl").exists()
+    assert runtime.bandits["pes_passion_groove"].n_updates == 1
+    assert runtime.db.count_feedback("pes_passion_groove") == 1
     assert runtime.db.count_feedback("indie_groove_hooks") == 0
-    cands = runtime.db.get_eligible_candidates("indie_groove_cult", 500_000_000, include_heard_fallback=True)
+    cands = runtime.db.get_eligible_candidates("pes_passion_groove", 500_000_000, include_heard_fallback=True)
     assert any(c.video_id == "VID_OBER_01" for c in cands)
 
 

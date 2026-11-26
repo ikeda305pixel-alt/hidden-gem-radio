@@ -169,25 +169,41 @@ _MELODIC_RAP_ALT_KW_RE = re.compile(
     r"\b(?:emo\s*rap|melodic\s*rap|alt-?pop|pop\s*punk|sad\s*trap|emo|heartbreak|soundcloud\s*rap)\b",
     re.IGNORECASE,
 )
-_INDIE_GROOVE_ARTISTS = {
+_PES_PASSION_ARTISTS = {
     "royel otis", "oberhofer", "foster the people", "fitz and the tantrums", "hozier",
-    "imase", "earth wind fire", "surfaces", "dominic fike", "dope lemon", "phoenix",
-    "bastille", "walk the moon", "tame impala", "parcels", "vulfpeck", "khruangbin",
-    "two door cinema club", "vampire weekend", "mgmt", "jungle", "l imperatrice",
-    "fujii kaze", "藤井風", "vaundy", "official髭男dism", "星野源", "suchmos",
-    "nulbarich", "kroi", "lucky kilimanjaro", "sirup", "bruno mars", "silk sonic",
-    "mac demarco", "men i trust", "clairo", "rex orange county", "still woozy",
-    "glass animals", "metronomy", "the 1975", "arctic monkeys", "cage the elephant",
-    "the strokes", "the shins", "phoebe bridgers", "dice", "rancid eddie",
-    "the rare occasions", "borns", "børns", "architecture in helsinki", "the royal concept",
-    "milky chance", "engelwood", "nicky youre", "eagles of death metal", "tally hall",
-    "george ezra", "tai verdes", "mkto", "toploader", "the weeknd", "robin thicke",
-    "miley cyrus", "charlie puth", "ashley park", "charlie faron", "ali danel",
-    "dopamoon", "black lodge collective", "yael naim", "toto", "fall out boy",
-    "benson boone", "journey", "the temper trap", "passion pit", "crystal castles",
-    "fever ray", "keane", "azymuth", "balkan beat box", "black blood", "nina zilli",
-    "babasonicos", "babasónicos", "kid francescoli", "french 79", "bon entendeur",
-    "vendredi sur mer", "therapie taxi",
+    "earth wind fire", "surfaces", "dominic fike", "dope lemon", "phoenix",
+    "bastille", "walk the moon", "tame impala", "vulfpeck", "khruangbin",
+    "two door cinema club", "vampire weekend", "mgmt", "jungle",
+    "bruno mars", "silk sonic", "mac demarco", "men i trust", "clairo",
+    "rex orange county", "still woozy", "glass animals", "the 1975",
+    "arctic monkeys", "cage the elephant", "the strokes", "the shins",
+    "phoebe bridgers", "dice", "rancid eddie", "the rare occasions", "borns", "børns",
+    "architecture in helsinki", "the royal concept", "milky chance", "nicky youre",
+    "eagles of death metal", "tally hall", "george ezra", "tai verdes", "mkto",
+    "toploader", "the weeknd", "robin thicke", "miley cyrus", "charlie puth",
+    "toto", "fall out boy", "benson boone", "journey", "the temper trap",
+    "passion pit", "crystal castles", "fever ray", "keane", "azymuth",
+    "balkan beat box", "black blood", "nina zilli", "babasonicos", "babasónicos",
+}
+_PARISIAN_CHIC_ARTISTS = {
+    "l imperatrice", "kid francescoli", "french 79", "charlie faron", "ali danel",
+    "dopamoon", "engelwood", "bon entendeur", "vendredi sur mer", "therapie taxi",
+    "ashley park", "black lodge collective", "yael naim", "parcels", "metronomy",
+    "polo pan", "claire laffut", "angele", "stromae", "m83", "air", "sebastien tellier",
+    "feist", "caravan palace", "paradis", "lewis ofman",
+}
+_PARISIAN_CHIC_KW_RE = re.compile(
+    r"\b(?:french\s*pop|french\s*house|nu-?disco|parisian|emily\s*in\s*paris|chanson)\b",
+    re.IGNORECASE,
+)
+_JPOP_CITYPOP_ARTISTS = {
+    "southern all stars", "keisuke kuwata", "tatsuro yamashita", "imase",
+    "fujii kaze", "vaundy", "official higedandism", "hoshino gen", "suchmos",
+    "nulbarich", "kroi", "lucky kilimanjaro", "sirup", "king gnu", "hikaru utada",
+    "kenshi yonezu", "yoasobi", "ado", "sakanaction", "sheena ringo",
+    "mariya takeuchi", "yumi matsutoya", "miki matsubara", "toshiki kadomatsu",
+    "anri", "taeko onuki", "spitz", "mr children", "mrs green apple", "back number",
+    "aimyon", "iri", "daoko", "natori", "perfume", "radwimps", "bump of chicken",
 }
 
 
@@ -201,7 +217,7 @@ def compute_recency_frequency_weight(play_count: int, days_ago: float) -> float:
 def default_theory_stations(
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
 ) -> list[StationConfig]:
-    """Load the 5 MIR + Collaborative Graph stations from config/music_theory_profile.yaml."""
+    """Load the 7 thematic MIR + Collaborative Graph stations from config/music_theory_profile.yaml."""
     profile = load_music_theory_profile(profile_path)
     raw_stations = profile.get("stations") or []
     stations = [StationConfig.from_dict(item) for item in raw_stations if isinstance(item, dict)]
@@ -211,40 +227,48 @@ def default_theory_stations(
 
 
 def default_fallback_stations() -> list[StationConfig]:
-    """Fallback stations prioritizing the 5 canonical stations."""
+    """Fallback stations prioritizing the 7 canonical stations."""
     profile_stations = load_music_theory_profile(DEFAULT_THEORY_PROFILE_PATH).get("stations") or []
     if profile_stations:
         return [StationConfig.from_dict(item) for item in profile_stations if isinstance(item, dict)]
     return [
         StationConfig(
+            station_id="pes_passion_groove",
+            name="PES パッション",
+            vibe="疾走・異国グルーヴ・青臭い高揚",
+            region_policy="western_only",
+            seed_tags=["indie pop", "folktronica", "indietronica"],
+            seed_artists=["Phoenix", "Royel Otis", "Oberhofer"],
+            max_popularity_views=500_000_000,
+            exploration_rate=1.0,
+        ),
+        StationConfig(
+            station_id="parisian_chic_disco",
+            name="フランスおしゃん",
+            vibe="パリ街歩き・甘くて洒脱・軽やか",
+            region_policy="western_only",
+            seed_tags=["nu-disco", "french pop", "french house"],
+            seed_artists=["L'Imperatrice", "Kid Francescoli", "French 79"],
+            max_popularity_views=500_000_000,
+            exploration_rate=1.0,
+        ),
+        StationConfig(
             station_id="edm_dance_party",
-            name="EDM, UKG & Dance Party",
+            name="ブチ上げ ダンス",
+            vibe="解放感・フェス・4つ打ち＆跳ねUKG",
+            region_policy="western_only",
             seed_tags=["melodic progressive house", "uk garage", "dance pop"],
             seed_artists=["Avicii", "Calvin Harris"],
             max_popularity_views=500_000_000,
             exploration_rate=0.9,
         ),
-        StationConfig(
-            station_id="indie_groove_cult",
-            name="Indie Groove, PES Cult & Parisian Chic",
-            seed_tags=["indie pop", "nu-disco", "french pop"],
-            seed_artists=["Oberhofer", "Royel Otis", "L'Imperatrice"],
-            max_popularity_views=500_000_000,
-            exploration_rate=1.0,
-        ),
-        StationConfig(
-            station_id="us_hiphop_bouncy",
-            name="US Hip-Hop & Bouncy Rap",
-            seed_tags=["hip hop", "bouncy rap", "trap"],
-            seed_artists=["bbno$", "Migos"],
-            max_popularity_views=500_000_000,
-            exploration_rate=0.95,
-        ),
     ]
 
 
 def _artist_lookup_variants(name: str) -> set[str]:
-    """Generate normalized lookup variants including ¥->y and $->s transliteration."""
+    """Generate normalized lookup variants including ¥->y, $->s, and diacritic-stripped ASCII."""
+    import unicodedata
+
     raw = str(name or "").strip()
     if not raw:
         return set()
@@ -256,6 +280,12 @@ def _artist_lookup_variants(name: str) -> set[str]:
     t_norm = normalize_artist(translit)
     if t_norm:
         variants.add(t_norm)
+    decomposed = "".join(
+        ch for ch in unicodedata.normalize("NFKD", translit) if not unicodedata.combining(ch)
+    )
+    d_norm = normalize_artist(decomposed)
+    if d_norm:
+        variants.add(d_norm)
     return variants
 
 
@@ -277,40 +307,52 @@ def classify_entry_to_station(
     title: str,
     tags: list[str] | None = None,
 ) -> str:
-    """Route a YouTube/YTMusic watch entry into one of the 5 canonical stations."""
+    """Route a YouTube/YTMusic watch entry into one of the 7 canonical thematic stations.
+
+    Enforces a strict Western/Japanese hard gate so Japanese artists never leak into Western stations.
+    """
+    from src.models import is_japanese_music_entity
+
     candidate_norms: set[str] = set()
     for token in _split_artist_tokens(artist):
         candidate_norms.update(_artist_lookup_variants(token))
-    a_norm = normalize_artist(artist)
     combined = " ".join([artist or "", title or "", *(tags or [])])
 
-    # Step 1: Explicit artist lexicon match FIRST (before generic keyword checks like "remix")
+    # Step 1: Japanese hard gate FIRST (JP Hip-Hop -> japan_hiphop_street, other JP -> jpop_citypop_groove)
     jp_substrings = ("bad hop", "yzerr", "zorn", "awich", "creepy nuts", "舐達麻", "yellow bucks")
     if (candidate_norms & _JP_HIPHOP_ARTISTS) or any(
         k in norm for norm in candidate_norms for k in jp_substrings
     ):
         return "japan_hiphop_street"
+    if candidate_norms & _JPOP_CITYPOP_ARTISTS:
+        return "jpop_citypop_groove"
+    if is_japanese_music_entity(artist, title):
+        if _JP_HIPHOP_KW_RE.search(combined):
+            return "japan_hiphop_street"
+        return "jpop_citypop_groove"
+
+    # Step 2: Explicit Western artist lexicons
+    if candidate_norms & _PARISIAN_CHIC_ARTISTS:
+        return "parisian_chic_disco"
     if candidate_norms & _MELODIC_RAP_ALT_ARTISTS:
         return "melodic_rap_alt"
     if candidate_norms & _US_HIPHOP_ARTISTS:
         return "us_hiphop_bouncy"
     if candidate_norms & _EDM_ARTISTS:
         return "edm_dance_party"
-    if candidate_norms & _INDIE_GROOVE_ARTISTS:
-        return "indie_groove_cult"
+    if candidate_norms & _PES_PASSION_ARTISTS:
+        return "pes_passion_groove"
 
-    # Step 2: Keyword / script fallback when artist is not in explicit lexicons
-    if _JP_SCRIPT_RE.search(combined) and _JP_HIPHOP_KW_RE.search(combined):
-        return "japan_hiphop_street"
+    # Step 3: Keyword fallback for Western tracks
+    if _PARISIAN_CHIC_KW_RE.search(combined):
+        return "parisian_chic_disco"
     if _MELODIC_RAP_ALT_KW_RE.search(combined):
         return "melodic_rap_alt"
     if _EDM_KW_RE.search(combined):
         return "edm_dance_party"
     if _US_HIPHOP_KW_RE.search(combined):
         return "us_hiphop_bouncy"
-    if a_norm in _INDIE_GROOVE_ARTISTS:
-        return "indie_groove_cult"
-    return "indie_groove_cult"
+    return "pes_passion_groove"
 
 
 def _extract_video_id(url: str) -> str | None:
@@ -608,12 +650,14 @@ def build_weighted_theory_stations(
     stations = default_theory_stations(profile_path=profile_path)
     station_by_id = {s.station_id: s for s in stations}
 
-    # Aggregate artist play counts, most recent play age (days_ago), and top track per artist per station
+    # Aggregate artist play counts, unique titles, most recent play age (days_ago), and top track per station
     artist_counts: dict[str, Counter[str]] = defaultdict(Counter)
     artist_min_days: dict[str, dict[str, float]] = defaultdict(dict)
     artist_display_name: dict[str, str] = {}
     artist_top_track: dict[str, Counter[str]] = defaultdict(Counter)
     artist_liked_bonus: Counter[str] = Counter()
+    global_artist_plays: Counter[str] = Counter()
+    global_artist_titles: dict[str, set[str]] = defaultdict(set)
 
     # Track frequency x recency weights for known_video_ids and known_track_keys
     vid_counts: Counter[str] = Counter()
@@ -634,6 +678,7 @@ def build_weighted_theory_stations(
         dt = _parse_iso_timestamp(rec.get("played_at") or rec.get("time"))
         days_ago = max(0.0, (now - dt).total_seconds() / 86400.0) if dt is not None else 30.0
         increment = 3 if rec.get("source") == "ytmusic_liked" else 1
+        global_artist_plays[a_norm] += 1
 
         vid = str(rec.get("video_id") or "").strip()
         if vid:
@@ -649,6 +694,7 @@ def build_weighted_theory_stations(
             if prev_key_days is None or days_ago < prev_key_days:
                 key_min_days[t_key] = days_ago
             artist_top_track[a_norm][title] += 1
+            global_artist_titles[a_norm].add(t_key)
 
         st_id = classify_entry_to_station(artist, title)
         if st_id not in station_by_id:
@@ -717,9 +763,19 @@ def build_weighted_theory_stations(
         key=lambda k: compute_recency_frequency_weight(key_counts[k], key_min_days.get(k, 30.0)),
         reverse=True,
     )
+    known_familiar_artists = sorted(
+        [
+            a_norm
+            for a_norm, plays in global_artist_plays.items()
+            if plays >= 5 or len(global_artist_titles.get(a_norm, set())) >= 3
+        ],
+        key=lambda a: (global_artist_plays[a], len(global_artist_titles.get(a, set()))),
+        reverse=True,
+    )
     history_index = {
         "known_video_ids": sorted_known_vids[:max_known_items],
         "known_track_keys": sorted_known_keys[:max_known_items],
+        "known_familiar_artists": known_familiar_artists[:500],
     }
     return stations, history_index
 
@@ -836,24 +892,25 @@ def build_stations_from_history(
     return stations[:4]
 
 
-def _select_stations_for_count(all_five: list[StationConfig], num_stations: int) -> list[StationConfig]:
-    """Return all 5 canonical stations when num_stations>=5, or a balanced subset including EDM & Indie."""
-    n = max(2, min(5, int(num_stations)))
-    if n >= len(all_five):
-        return list(all_five)
-    # Prioritize edm_dance_party & indie_groove_cult when slicing to <5 so fallback seeds stay covered
+def _select_stations_for_count(all_stations: list[StationConfig], num_stations: int) -> list[StationConfig]:
+    """Return all 7 canonical stations when num_stations>=7, or a history-prioritized subset."""
+    n = max(2, min(len(all_stations), int(num_stations)))
+    if n >= len(all_stations):
+        return list(all_stations)
     priority_order = [
+        "pes_passion_groove",
+        "parisian_chic_disco",
         "edm_dance_party",
-        "indie_groove_cult",
         "us_hiphop_bouncy",
         "melodic_rap_alt",
         "japan_hiphop_street",
+        "jpop_citypop_groove",
     ]
-    by_id = {s.station_id: s for s in all_five}
-    ordered = [by_id[sid] for sid in priority_order if sid in by_id]
-    for st in all_five:
-        if st not in ordered:
-            ordered.append(st)
+    rank_map = {sid: idx for idx, sid in enumerate(priority_order)}
+    ordered = sorted(
+        all_stations,
+        key=lambda st: (0 if st.weighted_seeds else 1, rank_map.get(st.station_id, 99)),
+    )
     return ordered[:n]
 
 
@@ -861,13 +918,13 @@ def generate_stations_yaml(
     output_path: Path | str = Path("config/stations.yaml"),
     browser_auth_path: Path | str = Path("config/browser.json"),
     takeout_path: Path | str = Path("data/watch-history.json"),
-    num_stations: int = 5,
+    num_stations: int = 7,
     offline: bool = False,
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
     reference_time: datetime | None = None,
     calibrate_db_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Read available history sources, build weighted 5-station config, and optionally calibrate SQLite MIR profiles."""
+    """Read available history sources, build weighted 7-station config, and optionally calibrate SQLite MIR profiles."""
     records: list[dict[str, Any]] = []
     sources_used: list[str] = []
     warnings: list[str] = []
@@ -921,7 +978,7 @@ def generate_stations_yaml(
         finally:
             lb_client.close()
 
-    stations = _select_stations_for_count(all_five=all_stations, num_stations=num_stations)
+    stations = _select_stations_for_count(all_stations=all_stations, num_stations=num_stations)
 
     meta = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -931,11 +988,16 @@ def generate_stations_yaml(
         "theory_profile": str(profile_path),
     }
     out = Path(output_path)
+    has_history_idx = bool(
+        history_index["known_video_ids"]
+        or history_index["known_track_keys"]
+        or history_index["known_familiar_artists"]
+    )
     save_stations_yaml(
         out,
         stations,
         meta=meta,
-        history_index=history_index if (history_index["known_video_ids"] or history_index["known_track_keys"]) else None,
+        history_index=history_index if has_history_idx else None,
     )
 
     calibrated_stations = 0

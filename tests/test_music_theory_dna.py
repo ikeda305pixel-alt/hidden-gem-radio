@@ -27,11 +27,13 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
 
     stations = default_theory_stations()
     assert [s.station_id for s in stations] == [
+        "pes_passion_groove",
+        "parisian_chic_disco",
         "us_hiphop_bouncy",
         "japan_hiphop_street",
         "edm_dance_party",
         "melodic_rap_alt",
-        "indie_groove_cult",
+        "jpop_citypop_groove",
     ]
 
     by_id = {s.station_id: s for s in stations}
@@ -47,15 +49,23 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
     assert by_id["melodic_rap_alt"].target_theory_vector == {
         "T1": 0.78, "T2": 0.62, "T3": 0.70, "T4": 0.96, "T5": 0.84,
     }
-    assert by_id["indie_groove_cult"].target_theory_vector == {
-        "T1": 0.88, "T2": 0.86, "T3": 0.85, "T4": 0.80, "T5": 0.86,
+    assert by_id["pes_passion_groove"].target_theory_vector == {
+        "T1": 0.88, "T2": 0.86, "T3": 0.85, "T4": 0.82, "T5": 0.88,
+    }
+    assert by_id["parisian_chic_disco"].target_theory_vector == {
+        "T1": 0.90, "T2": 0.84, "T3": 0.84, "T4": 0.78, "T5": 0.84,
+    }
+    assert by_id["jpop_citypop_groove"].target_theory_vector == {
+        "T1": 0.86, "T2": 0.80, "T3": 0.88, "T4": 0.82, "T5": 0.84,
     }
     for st in stations:
         assert st.bpm_zones
         assert st.theory_archetypes
         assert st.spotify_anchor_seeds
-    assert len(by_id["indie_groove_cult"].pes_anchors) == 12
-    assert len(by_id["indie_groove_cult"].emily_anchors) == 7
+        assert st.vibe
+        assert st.region_policy in {"western_only", "japanese_only"}
+    assert len(by_id["pes_passion_groove"].pes_anchors) == 12
+    assert len(by_id["parisian_chic_disco"].emily_anchors) == 7
 
 
 def test_theory_feature_extractor_produces_10_dim_vector_and_merges_dsp_signal() -> None:

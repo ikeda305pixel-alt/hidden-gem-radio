@@ -87,8 +87,148 @@ archetypes:
     weights: {T1: 0.90, T2: 0.94, T3: 0.82, T4: 0.82, T5: 0.88}
 
 stations:
+  - station_id: pes_passion_groove
+    name: PES パッション
+    vibe: 疾走・異国グルーヴ・青臭い高揚
+    region_policy: western_only
+    target_theory_vector:
+      T1: 0.88
+      T2: 0.86
+      T3: 0.85
+      T4: 0.82
+      T5: 0.88
+    bpm_zones:
+      - "108-130"
+      - "160-172"
+    theory_archetypes:
+      - dorian_dual_axis
+      - slash_chord_groove
+      - absent_tonic_funk
+    seed_tags:
+      - indie pop
+      - folktronica
+      - indietronica
+      - funk pop
+    seed_artists:
+      - Phoenix
+      - The Temper Trap
+      - Royel Otis
+      - Oberhofer
+      - Fitz and The Tantrums
+      - Azymuth
+      - Balkan Beat Box
+      - DOPE LEMON
+      - Foster The People
+      - Vampire Weekend
+      - Passion Pit
+      - Dominic Fike
+      - Surfaces
+    spotify_anchor_seeds:
+      - "Royel Otis - Oysters In My Pocket"
+      - "Oberhofer - Gold"
+      - "DOPE LEMON - Marinade"
+      - "DICE - Stop Sign"
+      - "Rancid Eddie - Dry"
+      - "The Rare Occasions - Origami"
+      - "BØRNS - Electric Love"
+      - "Phoenix - Girlfriend"
+      - "Architecture In Helsinki - Escapee"
+      - "The Royal Concept - On Our Way"
+      - "Foster The People - Pumped Up Kicks"
+      - "Fitz and The Tantrums - Out of My League"
+      - "Fitz and The Tantrums - I Just Wanna Shine"
+      - "Hozier - Too Sweet"
+      - "Dominic Fike - 3 Nights"
+      - "Surfaces - Sunday Best"
+      - "Milky Chance - Stolen Dance"
+      - "Bastille - Pompeii"
+      - "WALK THE MOON - Shut Up and Dance"
+      - "Nicky Youre - Sunroof"
+      - "Eagles Of Death Metal - Miss Alissa"
+      - "Tally Hall - The Bidding"
+      - "George Ezra - Paradise"
+      - "Earth Wind & Fire - September"
+    pes_anchors:
+      - "Phoenix - Armistice"
+      - "The Temper Trap - Sweet Disposition"
+      - "Passion Pit - The Reeling"
+      - "Vampire Weekend - Cousins"
+      - "Crystal Castles - Celestica"
+      - "Fever Ray - When I Grow Up"
+      - "Keane ft. K'Naan - Stop for a Minute"
+      - "Azymuth - Roda Piao"
+      - "Balkan Beat Box - Marcha de la Vida"
+      - "Black Blood - A.I.E. (A Mwana)"
+      - "Nina Zilli - 50mila"
+      - "Babasónicos - Microdancing"
+    emily_anchors: []
+    discovery_queries: []
+    max_popularity_views: 500000000
+    exploration_rate: 1.0
+
+  - station_id: parisian_chic_disco
+    name: フランスおしゃん
+    vibe: パリ街歩き・甘くて洒脱・軽やか
+    region_policy: western_only
+    target_theory_vector:
+      T1: 0.90
+      T2: 0.84
+      T3: 0.84
+      T4: 0.78
+      T5: 0.84
+    bpm_zones:
+      - "102-124"
+    theory_archetypes:
+      - absent_tonic_funk
+      - dorian_dual_axis
+      - slash_chord_groove
+    seed_tags:
+      - nu-disco
+      - french pop
+      - french house
+      - synth pop
+    seed_artists:
+      - "L'Imperatrice"
+      - Kid Francescoli
+      - French 79
+      - Charlie Faron
+      - Ali Danel
+      - DOPAMOON
+      - Engelwood
+      - Bon Entendeur
+      - Vendredi sur Mer
+      - Therapie TAXI
+      - Parcels
+      - Metronomy
+    spotify_anchor_seeds:
+      - "L'Imperatrice - Paris"
+      - "L'Imperatrice - Matahari"
+      - "Kid Francescoli - Moon (And It Went Like)"
+      - "French 79 & Kid Francescoli - Lovin' Feeling"
+      - "Charlie Faron - Claire"
+      - "Ali Danel - La nuit qui vient"
+      - "DOPAMOON & Lydia Kepinski - Reine de l'attitude"
+      - "Engelwood - One Step Ahead"
+      - "Ashley Park - Mon Soleil"
+      - "Black Lodge Collective - Funky Sax Action"
+      - "Yael Naim - New Soul"
+    pes_anchors: []
+    emily_anchors:
+      - "L'Imperatrice - Paris"
+      - "L'Imperatrice - Matahari"
+      - "Kid Francescoli - Moon (And It Went Like)"
+      - "French 79 & Kid Francescoli - Lovin' Feeling"
+      - "Bon Entendeur - Le temps est bon"
+      - "Vendredi sur Mer - Le Lac"
+      - "Therapie TAXI - Hit Sale"
+    discovery_queries: []
+    max_popularity_views: 500000000
+    exploration_rate: 1.0
+
   - station_id: us_hiphop_bouncy
-    name: US Hip-Hop & Bouncy Rap
+    name: US バウンス
+    vibe: 首振り・跳ねるビート・軽快ラップ
+    region_policy: western_only
     target_theory_vector:
       T1: 0.55
       T2: 0.90
@@ -110,14 +250,14 @@ stations:
     seed_artists:
       - "bbno$"
       - KYLE
-      - Migos
-      - J. Cole
-      - Lil Durk
       - Macklemore
+      - DJ Shadow
+      - J. Cole
+      - Migos
+      - Lil Durk
       - Lupe Fiasco
       - Drake
       - Eminem
-      - DJ Shadow
       - Social House
       - Paul Russell
     spotify_anchor_seeds:
@@ -152,7 +292,9 @@ stations:
     exploration_rate: 0.95
 
   - station_id: japan_hiphop_street
-    name: Japan Hip-Hop & Street
+    name: 邦ラップ ストリート
+    vibe: 国内シーン・哀愁と気合い・現場感
+    region_policy: japanese_only
     target_theory_vector:
       T1: 0.65
       T2: 0.75
@@ -184,6 +326,9 @@ stations:
       - "¥ellow Bucks"
     spotify_anchor_seeds:
       - "BAD HOP - Hood Gospel"
+      - "ZORN - My Life"
+      - "STUTS - 夜を使いはたして"
+      - "JJJ - Babe"
     pes_anchors:
       - "Jabberloop x Soft Lipa - Dental Driller"
     emily_anchors: []
@@ -192,7 +337,9 @@ stations:
     exploration_rate: 1.0
 
   - station_id: edm_dance_party
-    name: EDM, UKG & Dance Party
+    name: ブチ上げ ダンス
+    vibe: 解放感・フェス・4つ打ち＆跳ねUKG
+    region_policy: western_only
     target_theory_vector:
       T1: 0.92
       T2: 0.88
@@ -213,16 +360,16 @@ stations:
       - house
     seed_artists:
       - Avicii
-      - David Guetta
-      - Calvin Harris
       - Chrystal
       - NOTION
-      - SAINt JHN
-      - Tiesto
-      - Gryffin
-      - Major Lazer
-      - Jax Jones
       - Bakermat
+      - Tiesto
+      - Major Lazer
+      - David Guetta
+      - Calvin Harris
+      - SAINt JHN
+      - Gryffin
+      - Jax Jones
       - Snakehips
       - Diplo
     spotify_anchor_seeds:
@@ -246,21 +393,10 @@ stations:
       - "Diplo & MO - Get It Right"
       - "Snakehips - All My Friends"
       - "Black Eyed Peas - I Gotta Feeling"
-      - "Black Eyed Peas - The Time (Dirty Bit)"
       - "DJ Snake - Taki Taki"
       - "Daddy Yankee - Con Calma"
       - "Flo Rida - Club Can't Handle Me"
-      - "Flo Rida - I Don't Like It, I Love It"
-      - "Katy Perry - Last Friday Night"
-      - "Ellie Goulding - Burn"
-      - "Ellie Goulding - Lights"
       - "Dua Lipa - New Rules"
-      - "Justin Bieber - Sorry"
-      - "Justin Bieber - What Do You Mean?"
-      - "Mike Perry - All Star"
-      - "Sam Smith & Kim Petras - Unholy"
-      - "Chris Brown - Yeah 3x"
-      - "Rihanna - Only Girl (In The World)"
     pes_anchors:
       - "Data - Aerius Light"
       - "The xx - Crystalized (Rory Phillips Remix)"
@@ -271,7 +407,9 @@ stations:
     exploration_rate: 0.9
 
   - station_id: melodic_rap_alt
-    name: Melodic Rap & Alt-Pop
+    name: エモ切な メロディック
+    vibe: 深夜・明るいのに泣ける・中毒メロ
+    region_policy: western_only
     target_theory_vector:
       T1: 0.78
       T2: 0.62
@@ -292,14 +430,14 @@ stations:
     seed_artists:
       - Lil Peep
       - Juice WRLD
+      - blackbear
+      - Twenty One Pilots
       - Post Malone
       - The Kid LAROI
       - 24kGoldn
-      - blackbear
       - iann dior
       - mgk
       - Jeremy Zucker
-      - Twenty One Pilots
       - Sub Urban
       - Imagine Dragons
     spotify_anchor_seeds:
@@ -324,8 +462,6 @@ stations:
       - "Halsey - Walls Could Talk"
       - "Imagine Dragons - Demons"
       - "Imagine Dragons - Radioactive"
-      - "Imagine Dragons - Bad Liar"
-      - "Imagine Dragons - Natural"
       - "ari hicks - Good Boy"
       - "margø - guts"
       - "Papithbk - Losing Interest"
@@ -335,113 +471,53 @@ stations:
     max_popularity_views: 500000000
     exploration_rate: 1.05
 
-  - station_id: indie_groove_cult
-    name: Indie Groove, PES Cult & Parisian Chic
+  - station_id: jpop_citypop_groove
+    name: 邦楽シティ＆グルーヴ
+    vibe: お洒落J-POP・海沿い・大人の余裕
+    region_policy: japanese_only
     target_theory_vector:
-      T1: 0.88
-      T2: 0.86
-      T3: 0.85
-      T4: 0.80
-      T5: 0.86
+      T1: 0.86
+      T2: 0.80
+      T3: 0.88
+      T4: 0.82
+      T5: 0.84
     bpm_zones:
-      - "100-125"
-      - "160-172"
+      - "98-124"
     theory_archetypes:
-      - dorian_dual_axis
       - royal_road_secondary_dom
       - slash_chord_groove
       - absent_tonic_funk
     seed_tags:
-      - indie pop
-      - folktronica
-      - nu-disco
-      - french pop
-      - funk pop
-      - indietronica
+      - city pop
+      - j-pop
+      - japanese funk
+      - japanese groove
     seed_artists:
-      - Royel Otis
-      - Oberhofer
-      - DOPE LEMON
-      - Phoenix
-      - "L'Imperatrice"
-      - Kid Francescoli
-      - French 79
-      - Foster The People
-      - Fitz and The Tantrums
-      - Hozier
-      - Dominic Fike
-      - Surfaces
+      - サザンオールスターズ
+      - 桑田佳祐
       - imase
-      - Earth Wind & Fire
+      - Suchmos
+      - Fujii Kaze
+      - Nulbarich
+      - Kroi
+      - SIRUP
+      - Lucky Kilimanjaro
+      - Vaundy
+      - 星野源
+      - 山下達郎
     spotify_anchor_seeds:
-      - "Royel Otis - Oysters In My Pocket"
-      - "Oberhofer - Gold"
-      - "DOPE LEMON - Marinade"
-      - "DICE - Stop Sign"
-      - "Rancid Eddie - Dry"
-      - "The Rare Occasions - Origami"
-      - "BØRNS - Electric Love"
-      - "Phoenix - Girlfriend"
-      - "Architecture In Helsinki - Escapee"
-      - "The Royal Concept - On Our Way"
-      - "Foster The People - Pumped Up Kicks"
-      - "Fitz and The Tantrums - Out of My League"
-      - "Fitz and The Tantrums - I Just Wanna Shine"
-      - "Hozier - Too Sweet"
-      - "Dominic Fike - 3 Nights"
-      - "Surfaces - Sunday Best"
-      - "Milky Chance - Stolen Dance"
-      - "Bastille - Pompeii"
-      - "Bastille - Good Grief"
-      - "WALK THE MOON - Shut Up and Dance"
-      - "Engelwood - One Step Ahead"
+      - "サザンオールスターズ - 栞のテーマ"
+      - "桑田佳祐 - 波乗りジョニー"
       - "imase - NIGHT DANCER"
-      - "Nicky Youre - Sunroof"
-      - "Nicky Youre - Shut Me Up"
-      - "Eagles Of Death Metal - Miss Alissa"
-      - "Tally Hall - The Bidding"
-      - "George Ezra - Paradise"
-      - "George Ezra - Dance All Over Me"
-      - "Tai Verdes - AOK"
-      - "MKTO - Classic"
-      - "Toploader - Dancing in the Moonlight"
-      - "Earth Wind & Fire - September"
-      - "The Weeknd - Can't Feel My Face"
-      - "Robin Thicke - Blurred Lines"
-      - "Miley Cyrus - Flowers"
-      - "Charlie Puth - I Don't Think That I Like Her"
-      - "Ashley Park - Mon Soleil"
-      - "Charlie Faron - Claire"
-      - "Ali Danel - La nuit qui vient"
-      - "DOPAMOON & Lydia Kepinski - Reine de l'attitude"
-      - "Black Lodge Collective - Funky Sax Action"
-      - "Yael Naim - New Soul"
-      - "La La Land Cast - Another Day Of Sun"
-      - "TOTO - Africa"
-      - "Fall Out Boy - Uma Thurman"
-      - "Benson Boone - Beautiful Things"
-      - "Journey - Any Way You Want It"
-    pes_anchors:
-      - "Phoenix - Armistice"
-      - "The Temper Trap - Sweet Disposition"
-      - "Passion Pit - The Reeling"
-      - "Vampire Weekend - Cousins"
-      - "Crystal Castles - Celestica"
-      - "Fever Ray - When I Grow Up"
-      - "Keane ft. K'Naan - Stop for a Minute"
-      - "Azymuth - Roda Piao"
-      - "Balkan Beat Box - Marcha de la Vida"
-      - "Black Blood - A.I.E. (A Mwana)"
-      - "Nina Zilli - 50mila"
-      - "Babasónicos - Microdancing"
-    emily_anchors:
-      - "L'Imperatrice - Paris"
-      - "L'Imperatrice - Matahari"
-      - "Kid Francescoli - Moon (And It Went Like)"
-      - "French 79 & Kid Francescoli - Lovin' Feeling"
-      - "Bon Entendeur - Le temps est bon"
-      - "Vendredi sur Mer - Le Lac"
-      - "Therapie TAXI - Hit Sale"
+      - "Suchmos - STAY TUNE"
+      - "Fujii Kaze - きらり"
+      - "Nulbarich - NEW ERA"
+      - "Kroi - Balmy Life"
+      - "SIRUP - LOOP"
+      - "Lucky Kilimanjaro - ひとりの夜を抜け"
+      - "星野源 - 恋"
+    pes_anchors: []
+    emily_anchors: []
     discovery_queries: []
     max_popularity_views: 500000000
     exploration_rate: 1.0

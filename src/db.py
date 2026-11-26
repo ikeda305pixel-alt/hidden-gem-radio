@@ -802,6 +802,50 @@ class RadioDatabase:
             ).fetchall()
             return [str(r["artist_norm"]) for r in rows if r["artist_norm"]]
 
+    def get_recent_played_mir_vectors(self, station_id: str, limit: int = 5) -> list[list[float]]:
+        """Return 16-dim MIR vectors of the most recent N played/rated tracks on this station (for MMR)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.mir_vector_json
+                FROM feedback_events fe
+                INNER JOIN tracks t ON t.track_id = fe.track_id
+                WHERE fe.station_id = ?
+                  AND t.mir_vector_json IS NOT NULL
+                  AND t.mir_vector_json != ''
+                ORDER BY fe.created_at DESC, fe.id DESC
+                LIMIT ?
+                """,
+                (station_id, max(1, int(limit))),
+            ).fetchall()
+        vectors: list[list[float]] = []
+        for row in rows:
+            try:
+                parsed = json.loads(row["mir_vector_json"])
+                if isinstance(parsed, list) and len(parsed) >= 12:
+                    vectors.append([float(x) for x in parsed])
+            except (ValueError, TypeError):
+                continue
+        return vectors
+
+    def count_unheard_by_artist(
+        self,
+        station_id: str,
+        max_popularity_views: int,
+    ) -> dict[str, int]:
+        """Return count of currently unheard playable tracks per normalized artist in this station."""
+        unheard = self.get_eligible_candidates(
+            station_id,
+            max_popularity_views,
+            include_heard_fallback=False,
+        )
+        counts: dict[str, int] = {}
+        for tr in unheard:
+            a_norm = normalize_artist(tr.artist)
+            if a_norm:
+                counts[a_norm] = counts.get(a_norm, 0) + 1
+        return counts
+
     def get_audio_feature_cache(
         self,
         *,

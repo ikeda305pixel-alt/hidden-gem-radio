@@ -214,8 +214,28 @@ def _is_official_lyric_channel(item: dict[str, Any], target_artist: str) -> bool
     return False
 
 
-def is_slop_or_unofficial(item: dict[str, Any]) -> bool:
-    """Reject unavailable, UGC/unverified, and AI slop / slowed / nightcore / type beat / cover items."""
+_WATCH_UGC_REJECT_RE = re.compile(
+    r"(?:\b(?:cover|live|concert|lyrics?|lyric\s*video|karaoke|slowed|reverb|nightcore|"
+    r"sped\s*up|spedup|1\s*hour|loop|ai\s*generated|suno|udio|type\s*beat|free\s*beat|"
+    r"reaction|tutorial|podcast|vlog|interview|shorts?|full\s*album|bootleg|mashup|"
+    r"instrumental|acapella|bass\s*boosted|8\s*bit|8d\s*audio|unboxing|gameplay|"
+    r"walkthrough|trailer|news|recipe|cooking|fan\s*made|fanmade|unofficial)\b|"
+    r"(?:歌ってみた|弾いてみた|カバー|歌詞動画|和訳|実況|解説|ニュース|切り抜き|まとめ|生配信|作業用bgm|耐久))",
+    re.IGNORECASE,
+)
+
+
+def is_slop_or_unofficial(
+    item: dict[str, Any],
+    *,
+    allow_verified_watch_ugc: bool = False,
+) -> bool:
+    """Reject unavailable, UGC/unverified, and AI slop / slowed / nightcore / type beat / cover items.
+
+    When allow_verified_watch_ugc=True (watch-playlist radio & artist radioId expansion),
+    MUSIC_VIDEO_TYPE_UGC items that carry a verified artist browseId (artists[0].id) and pass
+    strict non-slop / non-cover / non-live / non-lyric / non-noise checks are rescued.
+    """
     if item.get("isAvailable") is False:
         return True
     video_type = str(item.get("videoType") or "")
@@ -227,18 +247,33 @@ def is_slop_or_unofficial(item: dict[str, Any]) -> bool:
         )
         if not is_allowed_result:
             return True
+
+    raw_title = str(item.get("title") or "")
+    artist = _extract_artist_name(item, raw_title)
+    artists = item.get("artists") or []
+    first_artist_id = (
+        str(artists[0].get("id") or "").strip()
+        if artists and isinstance(artists[0], dict)
+        else ""
+    )
+
     if video_type:
-        if video_type not in _ALLOWED_OFFICIAL_VIDEO_TYPES:
+        if video_type in _ALLOWED_OFFICIAL_VIDEO_TYPES:
+            pass
+        elif allow_verified_watch_ugc and video_type == "MUSIC_VIDEO_TYPE_UGC":
+            if not first_artist_id:
+                return True
+            if _WATCH_UGC_REJECT_RE.search(raw_title) or _WATCH_UGC_REJECT_RE.search(artist):
+                return True
+        else:
             return True
     else:
         # When videoType is absent, require official song metadata (album or verified artist browse ID)
         has_album = bool(item.get("album"))
-        artists = item.get("artists") or []
         has_artist_id = any(isinstance(a, dict) and bool(a.get("id")) for a in artists)
         if not (has_album or has_artist_id):
             return True
-    raw_title = str(item.get("title") or "")
-    artist = _extract_artist_name(item, raw_title)
+
     return bool(_SLOP_TITLE_RE.search(raw_title) or _SLOP_TITLE_RE.search(artist))
 
 
@@ -844,14 +879,17 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
 
         entities: list[TrackEntity] = []
         for item in (watch or {}).get("tracks", []) or []:
-            if not isinstance(item, dict) or is_slop_or_unofficial(item):
+            if not isinstance(item, dict) or is_slop_or_unofficial(item, allow_verified_watch_ugc=True):
                 continue
             vid = item.get("videoId")
             raw_title = str(item.get("title") or "").strip()
             if not vid or not raw_title or str(vid) == platform_track_id:
                 continue
             duration = parse_duration_seconds(item.get("duration_seconds"), item.get("length"))
-            if duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+            if str(item.get("videoType") or "") == "MUSIC_VIDEO_TYPE_UGC":
+                if duration is None or not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                    continue
+            elif duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                 continue
 
             artist = _extract_artist_name(item, raw_title)
@@ -886,7 +924,11 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         deep_cut_start: int = 2,
         deep_cut_end: int = 15,
     ) -> list[TrackEntity]:
-        """Follow ytmusic.get_artist(browseId) -> related real artists -> songs #3..#15 hidden gems."""
+        """Follow ytmusic.get_artist(browseId) -> related real artists -> songs #3..#15 hidden gems.
+
+        When get_artist(browseId) returns no 'related' section, falls back to artist_data['radioId']
+        via get_watch_playlist(playlistId=radioId) to recover related artist tracks.
+        """
         if not artist_browse_id or not hasattr(self._yt, "get_artist"):
             return []
         try:
@@ -927,14 +969,17 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             # Prioritize deep cuts (#3..#15) first, then fall back to top tracks only if artist has few songs
             prioritized = raw_songs[deep_cut_start:deep_cut_end] + raw_songs[:deep_cut_start]
             for item in prioritized:
-                if not isinstance(item, dict) or is_slop_or_unofficial(item):
+                if not isinstance(item, dict) or is_slop_or_unofficial(item, allow_verified_watch_ugc=True):
                     continue
                 vid = item.get("videoId")
                 raw_title = str(item.get("title") or "").strip()
                 if not vid or not raw_title or str(vid) in seen_vids:
                     continue
                 duration = parse_duration_seconds(item.get("duration_seconds"), item.get("duration") or item.get("length"))
-                if duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                if str(item.get("videoType") or "") == "MUSIC_VIDEO_TYPE_UGC":
+                    if duration is None or not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                        continue
+                elif duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                     continue
 
                 seen_vids.add(str(vid))
@@ -961,4 +1006,51 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                         discovery_sources=[src_label],
                     )
                 )
+
+        # Fallback when get_artist() omits 'related': expand via artist radioId watch playlist
+        if not entities:
+            radio_id = str(artist_data.get("radioId") or "").strip()
+            if radio_id and hasattr(self._yt, "get_watch_playlist"):
+                try:
+                    radio_watch = self._yt.get_watch_playlist(playlistId=radio_id, limit=25) or {}
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("ytmusicapi get_watch_playlist(playlistId=%s) failed: %s", radio_id, exc)
+                    radio_watch = {}
+                for item in radio_watch.get("tracks") or []:
+                    if not isinstance(item, dict) or is_slop_or_unofficial(item, allow_verified_watch_ugc=True):
+                        continue
+                    vid = item.get("videoId")
+                    raw_title = str(item.get("title") or "").strip()
+                    if not vid or not raw_title or str(vid) in seen_vids:
+                        continue
+                    duration = parse_duration_seconds(item.get("duration_seconds"), item.get("length"))
+                    if str(item.get("videoType") or "") == "MUSIC_VIDEO_TYPE_UGC":
+                        if duration is None or not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                            continue
+                    elif duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                        continue
+
+                    seen_vids.add(str(vid))
+                    artist = _extract_artist_name(item, raw_title)
+                    title = _clean_video_title(raw_title, artist)
+                    year_raw = item.get("year")
+                    release_year = (
+                        int(year_raw) if isinstance(year_raw, (int, str)) and str(year_raw).isdigit() else None
+                    )
+                    src_label = f"{seed_label or artist_browse_id} アーティストラジオ"
+                    entities.append(
+                        TrackEntity.build(
+                            artist=artist,
+                            title=title,
+                            tags=[],
+                            release_year=release_year,
+                            view_count=parse_view_count(item.get("views")),
+                            duration_seconds=duration,
+                            video_id=str(vid),
+                            source="artist_radio",
+                            seed_artist=seed_label,
+                            seed_archetype=seed_archetype,
+                            discovery_sources=[src_label],
+                        )
+                    )
         return entities

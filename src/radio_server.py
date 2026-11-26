@@ -19,6 +19,7 @@ from src.digger.pool import CandidatePoolDigger
 from src.models import (
     StationConfig,
     load_history_index,
+    load_known_familiar_artists,
     load_stations_yaml,
     normalize_artist,
 )
@@ -52,7 +53,7 @@ class FeedbackRequest(BaseModel):
 class ImportHistoryRequest(BaseModel):
     browser_auth_path: str = "config/browser.json"
     takeout_path: str = "data/watch-history.json"
-    num_stations: int = Field(default=5, ge=2, le=5)
+    num_stations: int = Field(default=7, ge=2, le=7)
     offline: bool = False
 
 
@@ -128,10 +129,13 @@ class RadioRuntime:
         self._dig_state_lock = threading.Lock()
         self._dig_locks: dict[str, threading.Lock] = {}
         self._digging_stations: dict[str, set[object]] = {}
+        self._bg_dig_semaphore = threading.Semaphore(2)
+        self._active_station_id: str | None = None
         self.stations: dict[str, StationConfig] = {}
         self.bandits: dict[str, ContextualBanditRecommender] = {}
         self.known_video_ids: set[str] = set()
         self.known_track_keys: set[str] = set()
+        self.known_familiar_artists: set[str] = set()
         self.reload_stations()
 
     @property
@@ -174,11 +178,12 @@ class RadioRuntime:
                 output_path=self.stations_path,
                 browser_auth_path=self.browser_auth_path,
                 takeout_path=PROJECT_ROOT / "data/watch-history.json",
-                num_stations=5,
+                num_stations=7,
                 offline=True,
             )
         station_list = load_stations_yaml(self.stations_path)
         self.known_video_ids, self.known_track_keys = load_history_index(self.stations_path)
+        self.known_familiar_artists = load_known_familiar_artists(self.stations_path)
         self.stations = {s.station_id: s for s in station_list}
         self.bandits = {
             s.station_id: ContextualBanditRecommender(
@@ -240,10 +245,15 @@ class RadioRuntime:
         target_pool_size: int = 60,
         skip_if_unheard_gte: int = 0,
         owner_token: object | None = None,
+        is_background: bool = False,
     ) -> dict[str, Any] | None:
-        """Serialize digging per station and guarantee ownership-scoped token cleanup."""
+        """Serialize digging per station, cap background concurrency at 2, and guarantee token cleanup."""
         my_token = owner_token
+        sem_acquired = False
         try:
+            if is_background:
+                self._bg_dig_semaphore.acquire()
+                sem_acquired = True
             lock = self._get_station_dig_lock(station.station_id)
             with lock:
                 if my_token is None:
@@ -259,20 +269,31 @@ class RadioRuntime:
                             "skipped_duplicate_dig": True,
                         }
                 try:
-                    # Pass known history sets when digger supports them (keeps test mock compatibility)
+                    # Pass known history sets & familiar artists when digger supports them (keeps test mock compatibility)
                     try:
                         return self.digger.dig_station(
                             station,
                             target_pool_size=target_pool_size,
                             known_video_ids=self.known_video_ids,
                             known_track_keys=self.known_track_keys,
+                            known_familiar_artists=self.known_familiar_artists,
                         )
                     except TypeError:
-                        return self.digger.dig_station(station, target_pool_size=target_pool_size)
+                        try:
+                            return self.digger.dig_station(
+                                station,
+                                target_pool_size=target_pool_size,
+                                known_video_ids=self.known_video_ids,
+                                known_track_keys=self.known_track_keys,
+                            )
+                        except TypeError:
+                            return self.digger.dig_station(station, target_pool_size=target_pool_size)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Auto-digging failed for %s: %s", station.station_id, exc)
                     return None
         finally:
+            if sem_acquired:
+                self._bg_dig_semaphore.release()
             if my_token is not None:
                 self._release_dig_token(station.station_id, my_token)
 
@@ -295,6 +316,7 @@ class RadioRuntime:
                 target_pool_size=target_pool_size,
                 skip_if_unheard_gte=min_unheard,
                 owner_token=token,
+                is_background=True,
             )
 
         try:
@@ -314,8 +336,11 @@ class RadioRuntime:
         station_id: str,
         count: int = 3,
         exclude_ids: set[str] | None = None,
+        *,
+        allow_sync_dig: bool = False,
     ) -> list[dict[str, Any]]:
         station = self.get_station(station_id)
+        self._active_station_id = station.station_id
         min_unheard_threshold = max(count, LOW_POOL_BG_DIG_THRESHOLD)
         effective_exclude_ids = set(exclude_ids or set()) | self.known_video_ids
         required_bg_unheard = min_unheard_threshold + len(exclude_ids or ())
@@ -331,15 +356,15 @@ class RadioRuntime:
         )
 
         if self.auto_dig and len(unheard) < min_unheard_threshold:
-            if unheard:
-                # [M1 / Bug #2] Return immediately from existing unheard pool; replenish asynchronously
+            if unheard or not allow_sync_dig:
+                # [P0 Fix #2] Never block HTTP /batch or /next on network digging; replenish asynchronously
                 self._trigger_background_dig(
                     station,
                     target_pool_size=60,
                     min_unheard=required_bg_unheard,
                 )
             else:
-                # Cold empty or fully heard pool: serialize a single dig across concurrent callers
+                # Legacy synchronous cold-pool path (used only when allow_sync_dig=True, e.g. /queue/next)
                 self._run_station_dig(
                     station,
                     target_pool_size=60,
@@ -372,6 +397,7 @@ class RadioRuntime:
             max_popularity_views=station.max_popularity_views,
             limit=count,
             recent_artists=self.db.get_recent_played_artists(station.station_id, limit=5),
+            recent_mir_vectors=self.db.get_recent_played_mir_vectors(station.station_id, limit=5),
         )
         return [item.to_queue_dict() for item in ranked]
 
@@ -454,6 +480,7 @@ def create_app(
     @app.get("/stations")
     def list_stations() -> dict[str, Any]:
         payload = []
+        low_stations: list[StationConfig] = []
         for s in runtime.stations.values():
             bandit = runtime.bandits[s.station_id]
             entry = s.to_dict()
@@ -462,12 +489,19 @@ def create_app(
             entry["model_updates"] = bandit.n_updates
             entry["feedback_count"] = runtime.db.count_feedback(s.station_id)
             if runtime.auto_dig and cand_count < STARTUP_BG_DIG_THRESHOLD:
+                low_stations.append(s)
+            payload.append(entry)
+
+        # Prioritize currently active station first; background semaphore caps concurrent digs at 2
+        if low_stations:
+            active_id = runtime._active_station_id
+            low_stations.sort(key=lambda st: 0 if st.station_id == active_id else 1)
+            for s in low_stations[:2]:
                 runtime._trigger_background_dig(
                     s,
                     target_pool_size=60,
                     min_unheard=DIG_TARGET_UNHEARD,
                 )
-            payload.append(entry)
         return {"stations": payload}
 
     @app.post("/stations/import-history")
@@ -499,7 +533,12 @@ def create_app(
                 raise HTTPException(status_code=404, detail="No stations configured")
             station_id = next(iter(runtime.stations.keys()))
         exclude_set = {item.strip() for item in exclude.split(",") if item.strip()}
-        items = runtime.next_queue(station_id=station_id, count=count, exclude_ids=exclude_set)
+        items = runtime.next_queue(
+            station_id=station_id,
+            count=count,
+            exclude_ids=exclude_set,
+            allow_sync_dig=True,
+        )
         return {"station_id": station_id, "count": len(items), "items": items}
 
     @app.get("/api/stations/{station_id}/next")
