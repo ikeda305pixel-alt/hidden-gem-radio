@@ -562,6 +562,7 @@
       player: null,
       playerReady: false,
       consecutiveErrors: 0,
+      consecutiveEmbedSkips: 0,
       circuitBroken: false,
       hasUserPlaybackStarted: false,
       trackConfirmedPlayingVideoId: null,
@@ -580,7 +581,8 @@
       selectedYtPlaylistId: "",
     };
 
-    const MAX_CONSECUTIVE_ERRORS = 8;
+    const MAX_CONSECUTIVE_ERRORS = 4;
+    const MAX_CONSECUTIVE_EMBED_SKIPS = 10;
     const RETRY_BACKOFF_MS = 3000;
     const PLAYBACK_WATCHDOG_MS = 7000;
     const WATCHDOG_MIN_PLAY_SEC = 0.3;
@@ -655,8 +657,10 @@
       state.trackConfirmedPlayingVideoId = videoId;
       state.hasUserPlaybackStarted = true;
       state.consecutiveErrors = 0;
+      state.consecutiveEmbedSkips = 0;
       state.circuitBroken = false;
       clearPlaybackWatchdog();
+      updatePlayMuteButton();
     }
 
     function isEmptyBatchCooldownActive(stationId, epoch) {
@@ -824,13 +828,14 @@
           ? "自動スキップ停止中"
           : "再生可能な候補を取得中...";
         el.trackArtist.textContent = state.circuitBroken
-          ? "▶ 再生 または局切替で再開してください"
+          ? "▶ 再開・⏭ 次曲・または局切替で再開してください"
           : "自動で再試行します（手動は「候補を追加ディグ」）";
         el.discoveryRouteLine.textContent = "発掘ルート: 待機中";
         el.mirMetaLine.textContent = "実測BPM / 知名度スイートスポット: 待機中";
         el.reasonLine.textContent = "推薦理由: 候補プール待機中";
         el.theoryLine.textContent = "4レイヤー安定嗜好マッチ: 待機中";
         el.postGoodBar.classList.remove("visible");
+        updatePlayMuteButton();
         return;
       }
       el.trackTitle.textContent = track.title;
@@ -1051,6 +1056,14 @@
       const trackAtSkip = state.currentTrack;
       try {
         clearPlaybackWatchdog();
+        state.hasUserPlaybackStarted = true;
+        if (state.circuitBroken) {
+          state.circuitBroken = false;
+          state.consecutiveErrors = 0;
+          state.consecutiveEmbedSkips = 0;
+          resetEmptyBatchCooldown();
+          updatePlayMuteButton();
+        }
         await sendImplicitPlaybackFeedback(true, trackAtSkip, stationAtSkip);
         if (state.activeStationId !== stationAtSkip || state.prefetchEpoch !== epochAtSkip) {
           return;
@@ -1078,7 +1091,9 @@
 
       try {
         clearPlaybackWatchdog();
-        state.consecutiveErrors += 1;
+        const isEmbedRestricted =
+          ytErrorCode === 100 || ytErrorCode === 101 || ytErrorCode === 150;
+        let apiFailed = false;
 
         if (failedVideoId) {
           try {
@@ -1106,6 +1121,7 @@
               }
             }
           } catch (_) {
+            apiFailed = true;
             if (
               state.activeStationId !== stationAtFail ||
               state.prefetchEpoch !== epochAtFail ||
@@ -1124,15 +1140,34 @@
           return;
         }
 
-        if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          state.circuitBroken = true;
-          state.currentTrack = null;
-          clearRetryTimer();
-          renderNowPlaying(null);
-          setStatus("連続再生失敗のため自動スキップを停止しました（▶ 再生 または局切替で再開）");
+        if (isEmbedRestricted && !apiFailed) {
+          state.consecutiveEmbedSkips += 1;
+          if (state.consecutiveEmbedSkips >= MAX_CONSECUTIVE_EMBED_SKIPS) {
+            state.circuitBroken = true;
+            state.currentTrack = null;
+            clearRetryTimer();
+            renderNowPlaying(null);
+            updatePlayMuteButton();
+            setStatus("埋め込み制限曲が続いたため自動スキップを停止しました（▶ 再開・⏭ 次曲・または局切替で再開）");
+          } else {
+            setStatus(
+              `埋め込み制限のため次曲へスキップ (${state.consecutiveEmbedSkips}/${MAX_CONSECUTIVE_EMBED_SKIPS})`
+            );
+            await playNextFromQueue();
+          }
         } else {
-          setStatus("再生不可を自動スキップ（学習非汚染）");
-          await playNextFromQueue();
+          state.consecutiveErrors += 1;
+          if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+            state.circuitBroken = true;
+            state.currentTrack = null;
+            clearRetryTimer();
+            renderNowPlaying(null);
+            updatePlayMuteButton();
+            setStatus("連続再生失敗のため自動スキップを停止しました（▶ 再開・⏭ 次曲・または局切替で再開）");
+          } else {
+            setStatus("再生不可を自動スキップ（学習非汚染）");
+            await playNextFromQueue();
+          }
         }
       } finally {
         if (failedVideoId && state.handlingUnplayableVideoId === failedVideoId) {
@@ -1190,11 +1225,13 @@
       state.trackConfirmedPlayingVideoId = null;
       state.handlingUnplayableVideoId = null;
       state.consecutiveErrors = 0;
+      state.consecutiveEmbedSkips = 0;
       state.circuitBroken = false;
       state.blockedArtists = new Set();
       state.prefetchEpoch += 1;
       state.prefetchPromise = null;
       resetEmptyBatchCooldown();
+      updatePlayMuteButton();
       const st = state.stations.find((s) => s.station_id === stationId);
       el.stationLabel.textContent = st ? `ON AIR · ${st.name}` : "ON AIR";
       renderStations();
@@ -1259,6 +1296,10 @@
     };
 
     function updatePlayMuteButton() {
+      if (state.circuitBroken) {
+        el.btnPlayMute.textContent = "▶ 再開";
+        return;
+      }
       if (!state.player || !state.playerReady) return;
       const pState = state.player.getPlayerState();
       if (pState !== YT.PlayerState.PLAYING) {
@@ -1274,8 +1315,10 @@
       state.hasUserPlaybackStarted = true;
       if (state.circuitBroken || !state.currentTrack) {
         state.consecutiveErrors = 0;
+        state.consecutiveEmbedSkips = 0;
         state.circuitBroken = false;
         resetEmptyBatchCooldown();
+        updatePlayMuteButton();
         await playNextFromQueue();
         return;
       }
@@ -1283,6 +1326,7 @@
       const pState = state.player.getPlayerState();
       if (pState !== YT.PlayerState.PLAYING) {
         state.consecutiveErrors = 0;
+        state.consecutiveEmbedSkips = 0;
         state.circuitBroken = false;
         state.player.playVideo();
         const curSec = Number(state.player.getCurrentTime() || 0);

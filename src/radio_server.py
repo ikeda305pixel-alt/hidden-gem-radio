@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _PERMANENT_YT_UNPLAYABLE_CODES = frozenset({100, 101, 150})
 _TRANSIENT_YT_ERROR_CODES = frozenset({2, 5})
+LOW_POOL_BG_DIG_THRESHOLD = 10
+STARTUP_BG_DIG_THRESHOLD = 5
+DIG_TARGET_UNHEARD = 25
 
 
 class FeedbackRequest(BaseModel):
@@ -306,9 +309,10 @@ class RadioRuntime:
         exclude_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         station = self.get_station(station_id)
-        min_unheard_threshold = max(count, 5)
+        min_unheard_threshold = max(count, LOW_POOL_BG_DIG_THRESHOLD)
         effective_exclude_ids = set(exclude_ids or set()) | self.known_video_ids
-        required_db_unheard = min_unheard_threshold + len(exclude_ids or ())
+        required_bg_unheard = min_unheard_threshold + len(exclude_ids or ())
+        cold_skip_unheard = max(count, 5) + len(exclude_ids or ())
 
         # [M4] Judge depletion strictly on UNHEARD candidates
         unheard = self.db.get_eligible_candidates(
@@ -325,14 +329,14 @@ class RadioRuntime:
                 self._trigger_background_dig(
                     station,
                     target_pool_size=60,
-                    min_unheard=required_db_unheard,
+                    min_unheard=required_bg_unheard,
                 )
             else:
                 # Cold empty or fully heard pool: serialize a single dig across concurrent callers
                 self._run_station_dig(
                     station,
                     target_pool_size=60,
-                    skip_if_unheard_gte=required_db_unheard,
+                    skip_if_unheard_gte=cold_skip_unheard,
                 )
                 unheard = self.db.get_eligible_candidates(
                     station_id=station.station_id,
@@ -446,11 +450,18 @@ def create_app(
         for s in runtime.stations.values():
             bandit = runtime.bandits[s.station_id]
             entry = s.to_dict()
-            entry["candidate_count"] = runtime.db.count_playable_candidates(
+            cand_count = runtime.db.count_playable_candidates(
                 s.station_id, s.max_popularity_views
             )
+            entry["candidate_count"] = cand_count
             entry["model_updates"] = bandit.n_updates
             entry["feedback_count"] = runtime.db.count_feedback(s.station_id)
+            if runtime.auto_dig and cand_count < STARTUP_BG_DIG_THRESHOLD:
+                runtime._trigger_background_dig(
+                    s,
+                    target_pool_size=60,
+                    min_unheard=DIG_TARGET_UNHEARD,
+                )
             payload.append(entry)
         return {"stations": payload}
 
@@ -512,22 +523,26 @@ def create_app(
     def api_theory_profile(station_id: str | None = Query(default=None)) -> dict[str, Any]:
         return runtime.get_theory_profile(station_id=station_id)
 
-    @app.post("/api/tracks/{video_id}/unplayable")
-    def api_mark_track_unplayable(
+    def _handle_mark_track_unplayable(
         video_id: str,
         req: UnplayableRequest | None = None,
+        *,
+        station_id_override: str | None = None,
     ) -> dict[str, Any]:
         """Blacklist an unplayable/stalled video_id for 30 days WITHOUT polluting BAD bandit learning.
 
         Transient YT player errors (codes 2, 5) return a replacement without blacklisting.
-        Permanent YT errors (codes 100, 101, 150) also mark tracks.unplayable = 1.
+        Permanent YT errors (codes 100, 101, 150) also mark tracks.unplayable = 1 and immediately
+        trigger a non-blocking background dig if remaining playable inventory falls below 10.
         """
         clean_vid = sanitize_video_id(video_id)
         if clean_vid is None:
             raise HTTPException(status_code=400, detail="Invalid YouTube video_id format")
 
         body = req or UnplayableRequest()
+        target_station_id = station_id_override or body.station_id
         is_transient = body.yt_error_code in _TRANSIENT_YT_ERROR_CODES
+        is_permanent = body.yt_error_code in _PERMANENT_YT_UNPLAYABLE_CODES
         expires_at: float | None = None
 
         if not is_transient:
@@ -537,13 +552,26 @@ def create_app(
                 yt_error_code=body.yt_error_code,
                 ttl_days=body.ttl_days,
             )
-            if body.yt_error_code in _PERMANENT_YT_UNPLAYABLE_CODES:
+            if is_permanent:
                 runtime.db.mark_unplayable(video_id=clean_vid, track_id=body.track_id)
 
+        bg_dig_triggered = False
         replacement = None
-        if body.station_id and body.station_id in runtime.stations:
+        if target_station_id and target_station_id in runtime.stations:
+            station = runtime.stations[target_station_id]
+            if is_permanent and runtime.auto_dig:
+                remaining_playable = runtime.db.count_playable_candidates(
+                    station.station_id,
+                    station.max_popularity_views,
+                )
+                if remaining_playable < LOW_POOL_BG_DIG_THRESHOLD:
+                    bg_dig_triggered = runtime._trigger_background_dig(
+                        station,
+                        target_pool_size=60,
+                        min_unheard=DIG_TARGET_UNHEARD,
+                    )
             exclude = {x for x in (clean_vid, body.track_id) if x}
-            reps = runtime.next_queue(body.station_id, count=1, exclude_ids=exclude)
+            reps = runtime.next_queue(target_station_id, count=1, exclude_ids=exclude)
             replacement = reps[0] if reps else None
 
         return {
@@ -553,8 +581,24 @@ def create_app(
             "blacklisted_days": 0 if is_transient else body.ttl_days,
             "expires_at": expires_at,
             "bad_learning_polluted": False,
+            "background_dig_triggered": bg_dig_triggered,
             "replacement": replacement,
         }
+
+    @app.post("/api/tracks/{video_id}/unplayable")
+    def api_mark_track_unplayable(
+        video_id: str,
+        req: UnplayableRequest | None = None,
+    ) -> dict[str, Any]:
+        return _handle_mark_track_unplayable(video_id, req)
+
+    @app.post("/api/stations/{station_id}/tracks/{video_id}/unplayable")
+    def api_mark_station_track_unplayable(
+        station_id: str,
+        video_id: str,
+        req: UnplayableRequest | None = None,
+    ) -> dict[str, Any]:
+        return _handle_mark_track_unplayable(video_id, req, station_id_override=station_id)
 
     # --- Playlists & Hybrid YouTube Integration ---
     @app.get("/api/playlists")

@@ -142,7 +142,7 @@ class CandidatePoolDigger:
         max_lb_resolves: int = 16,
         known_video_ids: set[str] | None = None,
         known_track_keys: set[str] | None = None,
-        max_seeds: int = 6,
+        max_seeds: int = 8,
     ) -> dict[str, Any]:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
         _ = max_lb_resolves  # Preserved for signature compatibility
@@ -229,7 +229,7 @@ class CandidatePoolDigger:
                 )
                 _ingest(deep_cuts, artist_key, f"{seed_label} 関連アーティスト")
 
-        # Prioritize multi-seed co-occurring gems first, then persist up to target_pool_size
+        # Prioritize multi-seed co-occurring gems first, filtering out embed-disabled videos before DB insert
         ranked_graph = sorted(
             graph_candidates.items(),
             key=lambda kv: (len(seed_hit_sets[kv[0]]), kv[1].view_count or 0),
@@ -239,7 +239,22 @@ class CandidatePoolDigger:
         added = 0
         cooccurring_count = 0
         mir_enriched_count = 0
-        for vid_key, track in ranked_graph[:target_pool_size]:
+        skipped_unembeddable = 0
+        embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
+        for vid_key, track in ranked_graph:
+            if added >= target_pool_size:
+                break
+
+            if embed_check_enabled and not self.yt.is_video_embeddable(track.video_id):
+                self.db.blacklist_unplayable(
+                    track.video_id,
+                    reason="oembed_embed_disabled",
+                    yt_error_code=150,
+                    ttl_days=30,
+                )
+                skipped_unembeddable += 1
+                continue
+
             cooc = max(1, len(seed_hit_sets[vid_key]))
             sources = source_labels[vid_key]
             track.cooccurrence_count = cooc
@@ -284,6 +299,7 @@ class CandidatePoolDigger:
             "skipped_popular": skipped_popular,
             "skipped_blocked_30d": skipped_blocked,
             "skipped_known_history": skipped_known,
+            "skipped_unembeddable": skipped_unembeddable,
             "total_playable": total_playable,
         }
 

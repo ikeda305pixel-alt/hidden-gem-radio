@@ -378,12 +378,13 @@ vm.runInContext(
 
   api.state.currentTrack = { track_id: "t_bad_0", video_id: "VID_BAD_000", artist: "Bad 0", title: "Fail 0" };
   for (let i = 0; i < api.MAX_CONSECUTIVE_ERRORS; i += 1) {
-    await api.handleUnplayableSkip(api.state.currentTrack, "yt_error_150", 150);
+    await api.handleUnplayableSkip(api.state.currentTrack, "stall_watchdog_7s", null);
   }
   assert.strictEqual(api.state.circuitBroken, true, "Circuit breaker must trip at MAX_CONSECUTIVE_ERRORS");
   assert.strictEqual(api.state.consecutiveErrors, api.MAX_CONSECUTIVE_ERRORS, "consecutiveErrors must NOT reset on trip");
   assert.strictEqual(api.state.retryTimerId, null, "scheduleQueueRetry must NOT be scheduled when circuit broken");
   assert.strictEqual(api.state.currentTrack, null);
+  assert.strictEqual(api.el.btnPlayMute.textContent, "▶ 再開", "Play/Mute button must show ▶ 再開 when circuitBroken");
   assert.ok(api.el.statusPill.textContent.includes("連続再生失敗のため自動スキップを停止しました"));
 
   // Advancing time must NOT trigger any automatic retries

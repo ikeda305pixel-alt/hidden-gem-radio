@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 from ytmusicapi import YTMusic
 
 from src.adapters.base import MusicPlatformAdapter
@@ -14,6 +16,7 @@ from src.models import PlaybackResolution, TrackEntity, normalize_text
 
 logger = logging.getLogger(__name__)
 
+_OEMBED_ENDPOINT = "https://www.youtube.com/oembed"
 _VIEW_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*([KMB])?", re.IGNORECASE)
 _MIN_SONG_SECONDS = 60
 _MAX_SONG_SECONDS = 660  # Reject full album mixes / hour-long DJ sets & podcasts
@@ -145,11 +148,23 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         browser_auth_path: Path | str | None = None,
         client: YTMusic | None = None,
         project_root: Path | None = None,
+        http_client: httpx.Client | None = None,
+        check_embeddable: bool | None = None,
     ) -> None:
         self._songs_filter_enabled = True
         self._authenticated = False
         self._auth_source: str | None = None
         self._auth_error: str | None = None
+        self.embed_check_enabled = (
+            bool(check_embeddable)
+            if check_embeddable is not None
+            else (client is None or http_client is not None)
+        )
+        self._oembed_client: httpx.Client | None = http_client
+        self._embeddable_cache: dict[str, bool] = {}
+        self._embed_lock = threading.Lock()
+        self._embed_consecutive_net_errors = 0
+        self._embed_max_net_errors = 4
 
         if client is not None:
             self._yt = client
@@ -190,6 +205,60 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
     @property
     def auth_error(self) -> str | None:
         return self._auth_error
+
+    def is_video_embeddable(self, video_id: str, *, timeout: float = 4.0) -> bool:
+        """Check via lightweight auth-free YouTube oEmbed whether a video allows external IFrame embedding.
+
+        - HTTP 200 -> True (cached)
+        - HTTP 401 / 403 / 404 -> False (cached; embed disabled or unavailable)
+        - Timeout / 429 / 5xx / network error -> safe fallback True (not cached as False),
+          with a consecutive network-error circuit breaker to avoid slowing down digging during outages.
+        """
+        vid = str(video_id or "").strip()
+        if not vid:
+            return False
+
+        with self._embed_lock:
+            cached = self._embeddable_cache.get(vid)
+            if cached is not None:
+                return cached
+            if self._embed_consecutive_net_errors >= self._embed_max_net_errors:
+                return True
+            if self._oembed_client is None:
+                self._oembed_client = httpx.Client(timeout=timeout, follow_redirects=True)
+            client = self._oembed_client
+
+        try:
+            resp = client.get(
+                _OEMBED_ENDPOINT,
+                params={
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "format": "json",
+                },
+                timeout=timeout,
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            logger.debug("oEmbed check network fallback for %s: %s", vid, exc)
+            with self._embed_lock:
+                self._embed_consecutive_net_errors += 1
+            return True
+
+        status = resp.status_code
+        if status == 200:
+            with self._embed_lock:
+                self._embed_consecutive_net_errors = 0
+                self._embeddable_cache[vid] = True
+            return True
+        if status in {401, 403, 404}:
+            with self._embed_lock:
+                self._embed_consecutive_net_errors = 0
+                self._embeddable_cache[vid] = False
+            return False
+        if status == 429 or status >= 500:
+            with self._embed_lock:
+                self._embed_consecutive_net_errors += 1
+            return True
+        return True
 
     def list_user_playlists(self, limit: int = 50) -> dict[str, Any]:
         """List authenticated YouTube Music library playlists, or safely return unauthenticated fallback."""
