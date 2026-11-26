@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from src.models import TrackEntity, normalize_artist
 
 THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60
+VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
 
 
 DEFAULT_PLAYLISTS: tuple[tuple[str, str], ...] = (
@@ -22,9 +25,31 @@ DEFAULT_PLAYLISTS: tuple[tuple[str, str], ...] = (
 )
 
 
+def sanitize_video_id(raw: str | None) -> str | None:
+    """Extract and strictly validate a YouTube video_id against ^[A-Za-z0-9_-]{6,32}$."""
+    if not raw:
+        return None
+    candidate = str(raw).strip()
+    if not candidate:
+        return None
+    if "youtube.com" in candidate or "youtu.be" in candidate:
+        try:
+            parsed = urlparse(candidate)
+            qs = parse_qs(parsed.query)
+            if qs.get("v"):
+                candidate = str(qs["v"][0]).strip()
+            elif "youtu.be" in parsed.netloc and parsed.path.strip("/"):
+                candidate = parsed.path.strip("/").split("/")[0].strip()
+        except ValueError:
+            return None
+    if not VALID_VIDEO_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
 def build_youtube_watch_videos_urls(video_ids: list[str], chunk_size: int = 50) -> list[str]:
-    """Generate auth-free YouTube anonymous playlist URLs chunked in groups of 50 video IDs."""
-    cleaned = [vid.strip() for vid in video_ids if vid and vid.strip()]
+    """Generate auth-free YouTube anonymous playlist URLs chunked in groups of 50 sanitized video IDs."""
+    cleaned = [sanitized for vid in video_ids if (sanitized := sanitize_video_id(vid)) is not None]
     unique = list(dict.fromkeys(cleaned))
     if not unique:
         return []
@@ -314,10 +339,6 @@ class RadioDatabase:
                 """,
                 (video_id.strip(), reason, yt_error_code, ts, expires_at),
             )
-            conn.execute(
-                "UPDATE tracks SET unplayable = 1, updated_at = ? WHERE video_id = ?",
-                (ts, video_id.strip()),
-            )
         return expires_at
 
     def get_blacklisted_video_ids(self, now: float | None = None) -> set[str]:
@@ -573,10 +594,11 @@ class RadioDatabase:
         exclude_track_ids: set[str] | None = None,
         include_heard_fallback: bool = True,
         exclude_canonical_keys: set[str] | None = None,
+        now: float | None = None,
     ) -> list[TrackEntity]:
         """Return playable candidate tracks matching popularity cap, 30-day BAD artist filter, and blacklist."""
-        blocked_artists = self.get_blocked_artists_30d()
-        blacklisted_vids = self.get_blacklisted_video_ids()
+        blocked_artists = self.get_blocked_artists_30d(now=now)
+        blacklisted_vids = self.get_blacklisted_video_ids(now=now)
         heard_ids = self.get_recently_heard_track_ids(station_id)
         rejected_ids = self.get_skipped_or_bad_track_ids(station_id) if include_heard_fallback else set()
         excluded = set(exclude_track_ids or set())

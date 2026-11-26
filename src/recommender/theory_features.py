@@ -310,15 +310,26 @@ class TheoryFeatureExtractor:
                 for ax, delta in deltas.items():
                     t_scores[ax] += delta
 
-        # 3. Hook density sweet spot (2:00 - 4:30 => 120s - 270s) boosts T5 pulse_hook
+        # 3. Continuous duration/year/view_count micro-biases so tagless legacy DB rows differentiate smoothly
         if track.duration_seconds is not None:
-            dur = int(track.duration_seconds)
-            if 120 <= dur <= 270:
-                t_scores["T5"] += 0.14
-            elif 90 <= dur <= 330:
-                t_scores["T5"] += 0.05
-            else:
-                t_scores["T5"] -= 0.08
+            dur = float(max(0, int(track.duration_seconds)))
+            # Smooth Gaussian hook-density sweet spot centered at 195s (~3:15)
+            t_scores["T5"] += 0.18 * math.exp(-((dur - 195.0) / 85.0) ** 2) - 0.06
+            t_scores["T2"] += 0.04 * math.tanh((210.0 - dur) / 90.0)
+            t_scores["T4"] += 0.04 * math.tanh((dur - 180.0) / 90.0)
+
+        if track.release_year is not None:
+            yr_norm = math.tanh((float(track.release_year) - 2015.0) / 10.0)
+            t_scores["T1"] += 0.045 * yr_norm
+            t_scores["T3"] += 0.045 * yr_norm
+            t_scores["T4"] -= 0.035 * yr_norm
+
+        if track.view_count is not None:
+            log_v = math.log10(max(0, int(track.view_count)) + 1.0)
+            v_norm = math.tanh((log_v - 4.5) / 1.5)
+            t_scores["T1"] -= 0.03 * v_norm
+            t_scores["T2"] += 0.03 * v_norm
+            t_scores["T5"] += 0.035 * v_norm
 
         # 4. Clip and optionally merge real DSP audio signals
         t1_t5 = merge_audio_theory_signal([t_scores[ax] for ax in THEORY_AXIS_KEYS], audio_signal)

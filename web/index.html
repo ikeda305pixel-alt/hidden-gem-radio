@@ -557,8 +557,13 @@
       player: null,
       playerReady: false,
       consecutiveErrors: 0,
+      circuitBroken: false,
+      hasUserPlaybackStarted: false,
+      trackConfirmedPlayingVideoId: null,
+      handlingUnplayableVideoId: null,
       prefetchPromise: null,
       prefetchEpoch: 0,
+      emptyBatchCooldown: { stationId: null, epoch: -1, until: 0 },
       blockedArtists: new Set(),
       retryTimerId: null,
       watchdogTimerId: null,
@@ -574,6 +579,7 @@
     const RETRY_BACKOFF_MS = 3000;
     const PLAYBACK_WATCHDOG_MS = 7000;
     const WATCHDOG_MIN_PLAY_SEC = 0.3;
+    const EMPTY_BATCH_COOLDOWN_MS = 2500;
 
     const el = {
       statusPill: document.getElementById("statusPill"),
@@ -634,11 +640,33 @@
       }
     }
 
-    // 7-second stall watchdog: auto-skip 0:00/0:00 stalled videos without polluting BAD bandit weights
+    function confirmTrackPlayback(videoId) {
+      if (!videoId) return;
+      state.trackConfirmedPlayingVideoId = videoId;
+      state.hasUserPlaybackStarted = true;
+      state.consecutiveErrors = 0;
+      state.circuitBroken = false;
+      clearPlaybackWatchdog();
+    }
+
+    function isEmptyBatchCooldownActive(stationId, epoch) {
+      return (
+        state.emptyBatchCooldown.stationId === stationId &&
+        state.emptyBatchCooldown.epoch === epoch &&
+        Date.now() < state.emptyBatchCooldown.until
+      );
+    }
+
+    function resetEmptyBatchCooldown() {
+      state.emptyBatchCooldown = { stationId: null, epoch: -1, until: 0 };
+    }
+
+    // 7-second stall watchdog: auto-skip 0:00/0:00 stalled videos without false blacklisting
     function armPlaybackWatchdog(track) {
       clearPlaybackWatchdog();
       if (!track || !track.video_id) return;
       const expectedVideoId = track.video_id;
+      if (state.trackConfirmedPlayingVideoId === expectedVideoId) return;
 
       state.watchdogPollId = setInterval(() => {
         if (!state.player || !state.playerReady) return;
@@ -649,29 +677,47 @@
         const pState = state.player.getPlayerState();
         const curSec = Number(state.player.getCurrentTime() || 0);
         if (pState === YT.PlayerState.PLAYING && curSec > WATCHDOG_MIN_PLAY_SEC) {
-          state.consecutiveErrors = 0;
-          clearPlaybackWatchdog();
+          confirmTrackPlayback(expectedVideoId);
         }
       }, 500);
 
       state.watchdogTimerId = setTimeout(async () => {
         clearPlaybackWatchdog();
         if (!state.currentTrack || state.currentTrack.video_id !== expectedVideoId) return;
+        if (state.trackConfirmedPlayingVideoId === expectedVideoId) return;
+
         const pState = state.player && state.playerReady ? state.player.getPlayerState() : -1;
         const curSec = state.player && state.playerReady ? Number(state.player.getCurrentTime() || 0) : 0;
-        if (pState === YT.PlayerState.PLAYING && curSec > WATCHDOG_MIN_PLAY_SEC) return;
+        if (curSec > WATCHDOG_MIN_PLAY_SEC) {
+          confirmTrackPlayback(expectedVideoId);
+          return;
+        }
+        if (pState === YT.PlayerState.PAUSED) return;
+
+        const isUnstartedOrCued =
+          pState === YT.PlayerState.UNSTARTED ||
+          pState === YT.PlayerState.CUED ||
+          pState === -1;
+        // Do not falsely blacklist tracks blocked by browser autoplay policy or hidden background tab before first play
+        if (!state.hasUserPlaybackStarted && isUnstartedOrCued) {
+          setStatus("自動再生待機中（▶ 再生をタップして開始）");
+          return;
+        }
+        if (typeof document !== "undefined" && document.hidden && !state.hasUserPlaybackStarted && isUnstartedOrCued) {
+          return;
+        }
 
         await handleUnplayableSkip(state.currentTrack, "stall_watchdog_7s", null);
       }, PLAYBACK_WATCHDOG_MS);
     }
 
     function scheduleQueueRetry() {
-      if (state.retryTimerId !== null || !state.activeStationId) return;
+      if (state.circuitBroken || state.retryTimerId !== null || !state.activeStationId) return;
       const stationAtSchedule = state.activeStationId;
       setStatus("3秒後に次曲を再取得します...");
       state.retryTimerId = setTimeout(async () => {
         state.retryTimerId = null;
-        if (state.activeStationId !== stationAtSchedule || state.currentTrack) return;
+        if (state.circuitBroken || state.activeStationId !== stationAtSchedule || state.currentTrack) return;
         await playNextFromQueue();
       }, RETRY_BACKOFF_MS);
     }
@@ -703,15 +749,28 @@
       if (!("mediaSession" in navigator)) return;
       try {
         navigator.mediaSession.setActionHandler("play", () => {
-          if (state.player && state.playerReady) state.player.playVideo();
+          state.hasUserPlaybackStarted = true;
+          if (state.player && state.playerReady) {
+            state.player.playVideo();
+            const curSec = Number(state.player.getCurrentTime() || 0);
+            if (
+              state.currentTrack &&
+              state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
+              curSec <= WATCHDOG_MIN_PLAY_SEC
+            ) {
+              armPlaybackWatchdog(state.currentTrack);
+            }
+          }
         });
         navigator.mediaSession.setActionHandler("pause", () => {
+          clearPlaybackWatchdog();
           if (state.player && state.playerReady) state.player.pauseVideo();
         });
         navigator.mediaSession.setActionHandler("nexttrack", () => {
           playNextFromQueue();
         });
         navigator.mediaSession.setActionHandler("stop", () => {
+          clearPlaybackWatchdog();
           if (state.player && state.playerReady) state.player.pauseVideo();
         });
       } catch (_) {}
@@ -750,8 +809,12 @@
 
     function renderNowPlaying(track) {
       if (!track) {
-        el.trackTitle.textContent = "再生可能な候補を取得中...";
-        el.trackArtist.textContent = "自動で再試行します（手動は「候補を追加ディグ」）";
+        el.trackTitle.textContent = state.circuitBroken
+          ? "自動スキップ停止中"
+          : "再生可能な候補を取得中...";
+        el.trackArtist.textContent = state.circuitBroken
+          ? "▶ 再生 または局切替で再開してください"
+          : "自動で再試行します（手動は「候補を追加ディグ」）";
         el.reasonLine.textContent = "推薦理由: 候補プール待機中";
         el.theoryLine.textContent = "音楽理論DNA: 待機中";
         el.postGoodBar.classList.remove("visible");
@@ -803,19 +866,30 @@
       return res.json();
     }
 
-    // [M2 / Bug #5] Share in-flight prefetch Promise across awaits and guard station switches
+    // [M2 / Bug #5 / Audit #11] Share in-flight prefetch Promise with callerEpoch & empty-batch cooldown guards
     async function ensurePrefetchQueue(targetSize = 3) {
       const callerStationId = state.activeStationId;
+      const callerEpoch = state.prefetchEpoch;
       if (!callerStationId) return;
+      if (isEmptyBatchCooldownActive(callerStationId, callerEpoch)) return;
+
       while (state.prefetchPromise) {
         await state.prefetchPromise;
-        if (state.activeStationId !== callerStationId) return;
+        if (state.activeStationId !== callerStationId || state.prefetchEpoch !== callerEpoch) return;
         if (state.queue.length >= targetSize) return;
+        if (isEmptyBatchCooldownActive(callerStationId, callerEpoch)) return;
       }
-      if (state.activeStationId !== callerStationId || state.queue.length >= targetSize) return;
+      if (
+        state.activeStationId !== callerStationId ||
+        state.prefetchEpoch !== callerEpoch ||
+        state.queue.length >= targetSize ||
+        isEmptyBatchCooldownActive(callerStationId, callerEpoch)
+      ) {
+        return;
+      }
 
       const stationId = callerStationId;
-      const requestEpoch = state.prefetchEpoch;
+      const requestEpoch = callerEpoch;
       let currentPromise = null;
       currentPromise = (async () => {
         try {
@@ -828,13 +902,23 @@
             `/api/stations/${encodeURIComponent(stationId)}/batch?count=${need}&exclude=${encodeURIComponent(exclude)}`
           );
           if (state.activeStationId !== stationId || state.prefetchEpoch !== requestEpoch) return;
-          for (const item of data.items || []) {
-            const artistNorm = normalizeArtistName(item.artist);
-            if (artistNorm && state.blockedArtists.has(artistNorm)) {
-              continue;
-            }
-            if (!state.queue.some((q) => q.track_id === item.track_id)) {
-              state.queue.push(item);
+          const items = Array.isArray(data.items) ? data.items : [];
+          if (!items.length) {
+            state.emptyBatchCooldown = {
+              stationId,
+              epoch: requestEpoch,
+              until: Date.now() + EMPTY_BATCH_COOLDOWN_MS,
+            };
+          } else {
+            resetEmptyBatchCooldown();
+            for (const item of items) {
+              const artistNorm = normalizeArtistName(item.artist);
+              if (artistNorm && state.blockedArtists.has(artistNorm)) {
+                continue;
+              }
+              if (!state.queue.some((q) => q.track_id === item.track_id)) {
+                state.queue.push(item);
+              }
             }
           }
           renderQueue();
@@ -854,6 +938,7 @@
       clearPlaybackWatchdog();
       state.currentTrack = track;
       state.currentRatedGood = false;
+      state.trackConfirmedPlayingVideoId = null;
       renderNowPlaying(track);
       renderQueue();
 
@@ -865,7 +950,7 @@
           armPlaybackWatchdog(track);
         }
         ensurePrefetchQueue(3);
-      } else {
+      } else if (!state.circuitBroken) {
         scheduleQueueRetry();
       }
     }
@@ -879,35 +964,74 @@
     }
 
     async function handleUnplayableSkip(failedTrack, reason, ytErrorCode) {
-      clearPlaybackWatchdog();
-      state.consecutiveErrors += 1;
-      if (failedTrack && failedTrack.video_id) {
-        try {
-          const res = await fetchJson(`/api/tracks/${encodeURIComponent(failedTrack.video_id)}/unplayable`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              station_id: state.activeStationId,
-              track_id: failedTrack.track_id,
-              reason,
-              yt_error_code: ytErrorCode,
-            }),
-          });
-          if (res?.replacement && !state.queue.some((q) => q.track_id === res.replacement.track_id)) {
-            const artistNorm = normalizeArtistName(res.replacement.artist);
-            if (!artistNorm || !state.blockedArtists.has(artistNorm)) {
-              state.queue.unshift(res.replacement);
+      const failedVideoId = failedTrack?.video_id || null;
+      if (failedVideoId && state.handlingUnplayableVideoId === failedVideoId) return;
+      const stationAtFail = state.activeStationId;
+      const epochAtFail = state.prefetchEpoch;
+      if (failedVideoId) state.handlingUnplayableVideoId = failedVideoId;
+
+      try {
+        clearPlaybackWatchdog();
+        state.consecutiveErrors += 1;
+
+        if (failedVideoId) {
+          try {
+            const res = await fetchJson(`/api/tracks/${encodeURIComponent(failedVideoId)}/unplayable`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                station_id: stationAtFail,
+                track_id: failedTrack.track_id,
+                reason,
+                yt_error_code: ytErrorCode,
+              }),
+            });
+            if (
+              state.activeStationId !== stationAtFail ||
+              state.prefetchEpoch !== epochAtFail ||
+              state.currentTrack?.video_id !== failedVideoId
+            ) {
+              return;
+            }
+            if (res?.replacement && !state.queue.some((q) => q.track_id === res.replacement.track_id)) {
+              const artistNorm = normalizeArtistName(res.replacement.artist);
+              if (!artistNorm || !state.blockedArtists.has(artistNorm)) {
+                state.queue.unshift(res.replacement);
+              }
+            }
+          } catch (_) {
+            if (
+              state.activeStationId !== stationAtFail ||
+              state.prefetchEpoch !== epochAtFail ||
+              state.currentTrack?.video_id !== failedVideoId
+            ) {
+              return;
             }
           }
-        } catch (_) {}
-      }
-      if (state.consecutiveErrors <= MAX_CONSECUTIVE_ERRORS) {
-        setStatus("再生不可を自動スキップ（学習非汚染）");
-        await playNextFromQueue();
-      } else {
-        state.currentTrack = null;
-        state.consecutiveErrors = 0;
-        scheduleQueueRetry();
+        }
+
+        if (
+          state.activeStationId !== stationAtFail ||
+          state.prefetchEpoch !== epochAtFail ||
+          (failedVideoId && state.currentTrack?.video_id !== failedVideoId)
+        ) {
+          return;
+        }
+
+        if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          state.circuitBroken = true;
+          state.currentTrack = null;
+          clearRetryTimer();
+          renderNowPlaying(null);
+          setStatus("連続再生失敗のため自動スキップを停止しました（▶ 再生 または局切替で再開）");
+        } else {
+          setStatus("再生不可を自動スキップ（学習非汚染）");
+          await playNextFromQueue();
+        }
+      } finally {
+        if (failedVideoId && state.handlingUnplayableVideoId === failedVideoId) {
+          state.handlingUnplayableVideoId = null;
+        }
       }
     }
 
@@ -957,10 +1081,14 @@
       state.activeStationId = stationId;
       state.queue = [];
       state.currentTrack = null;
+      state.trackConfirmedPlayingVideoId = null;
+      state.handlingUnplayableVideoId = null;
       state.consecutiveErrors = 0;
+      state.circuitBroken = false;
       state.blockedArtists = new Set();
       state.prefetchEpoch += 1;
       state.prefetchPromise = null;
+      resetEmptyBatchCooldown();
       const st = state.stations.find((s) => s.station_id === stationId);
       el.stationLabel.textContent = st ? `ON AIR · ${st.name}` : "ON AIR";
       renderStations();
@@ -994,9 +1122,22 @@
             if (event.data === YT.PlayerState.PLAYING) {
               updatePlayMuteButton();
               if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
-            } else if (event.data === YT.PlayerState.PAUSED) {
+              const curSec = state.player && state.playerReady ? Number(state.player.getCurrentTime() || 0) : 0;
+              if (state.currentTrack && curSec > WATCHDOG_MIN_PLAY_SEC) {
+                confirmTrackPlayback(state.currentTrack.video_id);
+              } else if (
+                state.currentTrack &&
+                state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
+                state.watchdogTimerId === null
+              ) {
+                armPlaybackWatchdog(state.currentTrack);
+              }
+            } else if (event.data === YT.PlayerState.PAUSED || event.data === YT.PlayerState.CUED) {
+              clearPlaybackWatchdog();
               updatePlayMuteButton();
-              if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+              if ("mediaSession" in navigator && event.data === YT.PlayerState.PAUSED) {
+                navigator.mediaSession.playbackState = "paused";
+              }
             } else if (event.data === YT.PlayerState.ENDED) {
               clearPlaybackWatchdog();
               if (!state.currentRatedGood) {
@@ -1028,11 +1169,29 @@
       }
     }
 
-    el.btnPlayMute.addEventListener("click", () => {
+    el.btnPlayMute.addEventListener("click", async () => {
+      state.hasUserPlaybackStarted = true;
+      if (state.circuitBroken || !state.currentTrack) {
+        state.consecutiveErrors = 0;
+        state.circuitBroken = false;
+        resetEmptyBatchCooldown();
+        await playNextFromQueue();
+        return;
+      }
       if (!state.player || !state.playerReady) return;
       const pState = state.player.getPlayerState();
       if (pState !== YT.PlayerState.PLAYING) {
+        state.consecutiveErrors = 0;
+        state.circuitBroken = false;
         state.player.playVideo();
+        const curSec = Number(state.player.getCurrentTime() || 0);
+        if (
+          state.currentTrack &&
+          state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
+          curSec <= WATCHDOG_MIN_PLAY_SEC
+        ) {
+          armPlaybackWatchdog(state.currentTrack);
+        }
       } else if (state.player.isMuted()) {
         state.player.unMute();
       } else {
@@ -1063,7 +1222,12 @@
         });
         setStatus(`👍 DNA学習 & 保存完了 (更新 #${res?.model_updates ?? ""})`);
         await Promise.all([refreshTheoryProfile(), loadPlaylists()]);
-      } catch (_) {}
+      } catch (_) {
+        state.currentRatedGood = false;
+        el.btnGood.classList.remove("rated");
+        el.postGoodBar.classList.remove("visible");
+        setStatus("👍 送信に失敗しました（再タップで再試行できます）");
+      }
     });
 
     // BAD (-1.0 theory reward + block artist + invalidate in-flight prefetch + instant skip)
@@ -1076,6 +1240,7 @@
       }
       state.prefetchEpoch += 1;
       state.prefetchPromise = null;
+      resetEmptyBatchCooldown();
       state.queue = state.queue.filter(
         (item) => !state.blockedArtists.has(normalizeArtistName(item.artist))
       );
@@ -1090,6 +1255,7 @@
 
     el.btnDigMore.addEventListener("click", async () => {
       if (!state.activeStationId) return;
+      resetEmptyBatchCooldown();
       setStatus("新規候補をディグ中...");
       try {
         const res = await fetchJson(`/stations/${encodeURIComponent(state.activeStationId)}/dig`, { method: "POST" });

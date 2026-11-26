@@ -20,7 +20,7 @@ import logging
 import math
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -71,9 +71,23 @@ _NON_MUSIC_TITLE_RE = re.compile(
     r"(?:ニュース|速報|解説|講座|入門|第\d+回|実況|レビュー|開封|切り抜き|まとめ|生配信|雑談|料理|レシピ)",
     re.IGNORECASE,
 )
+_NON_MUSIC_CHANNEL_RE = re.compile(
+    r"(?:\b(?:tech|tips|gaming|gamer|podcast|news|channel|tv|clips|studio|academy|"
+    r"coding|programming|cooking|kitchen|vlog|review)\b|"
+    r"(?:実況|解説|ニュース|切り抜き|チャンネル|教室|料理|講座|速報))",
+    re.IGNORECASE,
+)
+_EPISODE_OR_NUMBERED_RE = re.compile(
+    r"(?:#\d+|\b(?:ep\.?|part|vol\.?)\s*\d+\b|第\d+回)",
+    re.IGNORECASE,
+)
+_COLLAB_SPLIT_RE = re.compile(
+    r"\s*(?:feat\.?|ft\.?|&|,|\s+x\s+|×|\bwith\b)\s*",
+    re.IGNORECASE,
+)
 _MUSIC_SIGNAL_TITLE_RE = re.compile(
     r"(?:\b(?:official\s*(?:(?:hd|4k|music|lyric|audio|visuali[sz]er)\s*)*(?:video|audio|mv|m/v|lyric|visuali[sz]er)|"
-    r"music\s*video|lyric\s*video|feat\.?|ft\.?|remix|acoustic|mv|full\s*song|topic|a\s+colors\s+show|boiler\s+room)\b|"
+    r"music\s*video|lyric\s*video|feat\.?|ft\.?|remix|acoustic|mv|full\s*song|topic|a\s+colors\s+show|boiler\s*room)\b|"
     r"\bM/V\b|"
     r"[\(\[\{]\s*(?:official\s*)?(?:audio|lyrics?|original\s+mix|remix|extended\s+mix|live\s+(?:on|at)\s+[^\)\]\}]*)\s*[\)\]\}])",
     re.IGNORECASE,
@@ -213,34 +227,71 @@ def default_fallback_stations() -> list[StationConfig]:
     ]
 
 
+def _artist_lookup_variants(name: str) -> set[str]:
+    """Generate normalized lookup variants including ¥->y and $->s transliteration."""
+    raw = str(name or "").strip()
+    if not raw:
+        return set()
+    variants: set[str] = set()
+    base = normalize_artist(raw)
+    if base:
+        variants.add(base)
+    translit = raw.replace("¥", "y").replace("￥", "y").replace("$", "s")
+    t_norm = normalize_artist(translit)
+    if t_norm:
+        variants.add(t_norm)
+    return variants
+
+
+def _split_artist_tokens(artist: str) -> list[str]:
+    """Split collaborative artist strings into full string + individual artist tokens."""
+    raw = str(artist or "").strip()
+    if not raw:
+        return []
+    tokens = [raw]
+    for part in _COLLAB_SPLIT_RE.split(raw):
+        cleaned = part.strip(" ()[]")
+        if cleaned and cleaned not in tokens:
+            tokens.append(cleaned)
+    return tokens
+
+
 def classify_entry_to_station(
     artist: str,
     title: str,
     tags: list[str] | None = None,
 ) -> str:
     """Route a YouTube/YTMusic watch entry into one of the 5 Deep Music Theory DNA stations."""
+    candidate_norms: set[str] = set()
+    for token in _split_artist_tokens(artist):
+        candidate_norms.update(_artist_lookup_variants(token))
     a_norm = normalize_artist(artist)
     combined = " ".join([artist or "", title or "", *(tags or [])])
 
-    # 1. Japan Hip-Hop & Street (check explicit JP rap artists or JP script + hip-hop signal)
-    if a_norm in _JP_HIPHOP_ARTISTS or any(k in a_norm for k in ("bad hop", "yzerr", "zorn", "awich", "creepy nuts", "舐達麻")):
+    # Step 1: Explicit artist lexicon match FIRST (before generic keyword checks like "remix")
+    jp_substrings = ("bad hop", "yzerr", "zorn", "awich", "creepy nuts", "舐達麻", "yellow bucks")
+    if (candidate_norms & _JP_HIPHOP_ARTISTS) or any(
+        k in norm for norm in candidate_norms for k in jp_substrings
+    ):
         return "japan_hiphop_street"
+    if candidate_norms & _MELODIC_RAP_ALT_ARTISTS:
+        return "melodic_rap_alt"
+    if candidate_norms & _US_HIPHOP_ARTISTS:
+        return "us_hiphop_bouncy"
+    if candidate_norms & _EDM_ARTISTS:
+        return "edm_dance_party"
+    if candidate_norms & _INDIE_GROOVE_ARTISTS:
+        return "indie_groove_hooks"
+
+    # Step 2: Keyword / script fallback when artist is not in explicit lexicons
     if _JP_SCRIPT_RE.search(combined) and _JP_HIPHOP_KW_RE.search(combined):
         return "japan_hiphop_street"
-
-    # 2. Melodic Rap & Alt-Pop (check before general US hip-hop so Juice WRLD / Peep / Post Malone route accurately)
-    if a_norm in _MELODIC_RAP_ALT_ARTISTS or _MELODIC_RAP_ALT_KW_RE.search(combined):
+    if _MELODIC_RAP_ALT_KW_RE.search(combined):
         return "melodic_rap_alt"
-
-    # 3. EDM & Dance Party (remix/UKG/house/DJ signals)
-    if a_norm in _EDM_ARTISTS or _EDM_KW_RE.search(combined):
+    if _EDM_KW_RE.search(combined):
         return "edm_dance_party"
-
-    # 4. US Hip-Hop & Bouncy Rap
-    if a_norm in _US_HIPHOP_ARTISTS or _US_HIPHOP_KW_RE.search(combined):
+    if _US_HIPHOP_KW_RE.search(combined):
         return "us_hiphop_bouncy"
-
-    # 5. Indie Groove & Feel-Good (explicit indie/funk/pop artists or default)
     if a_norm in _INDIE_GROOVE_ARTISTS:
         return "indie_groove_hooks"
     return "indie_groove_hooks"
@@ -311,6 +362,62 @@ def _channel_matches_title_artist(channel_name: str, title_artist: str) -> bool:
     return ch_norm == ar_norm or ar_norm in ch_norm or ch_norm in ar_norm
 
 
+def _iter_json_array_objects(path: Path, chunk_size: int = 131_072) -> Iterator[Any]:
+    """Stream items from a top-level JSON array in fixed chunks without loading the full file."""
+    decoder = json.JSONDecoder()
+    buf = ""
+    eof = False
+    started = False
+
+    with path.open("r", encoding="utf-8-sig") as fh:
+        while True:
+            while not started:
+                buf = buf.lstrip()
+                if buf:
+                    if buf[0] != "[":
+                        raise ValueError("Expected top-level JSON array")
+                    buf = buf[1:]
+                    started = True
+                    break
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    raise ValueError("Empty JSON file")
+                buf += chunk
+
+            buf = buf.lstrip()
+            while not buf and not eof:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    eof = True
+                else:
+                    buf += chunk
+                buf = buf.lstrip()
+
+            if not buf:
+                raise ValueError("Unterminated JSON array")
+
+            if buf[0] == "]":
+                return
+            if buf[0] == ",":
+                buf = buf[1:]
+                continue
+
+            while True:
+                try:
+                    obj, end_idx = decoder.raw_decode(buf)
+                    buf = buf[end_idx:]
+                    yield obj
+                    break
+                except json.JSONDecodeError as exc:
+                    if eof:
+                        raise ValueError(f"Malformed JSON stream: {exc}") from exc
+                    chunk = fh.read(chunk_size)
+                    if not chunk:
+                        eof = True
+                    else:
+                        buf += chunk
+
+
 def parse_takeout_watch_history(
     takeout_path: Path | str,
     warnings: list[str] | None = None,
@@ -319,79 +426,82 @@ def parse_takeout_watch_history(
     path = Path(takeout_path)
     if not path.exists():
         return []
+
+    records: list[dict[str, Any]] = []
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        for entry in _iter_json_array_objects(path):
+            if not isinstance(entry, dict):
+                continue
+            # [M6] Exclude sponsored/Google Ads watch entries
+            if _is_google_ad_entry(entry):
+                continue
+
+            header = str(entry.get("header") or "")
+            url = str(entry.get("titleUrl") or "")
+            raw_title = str(entry.get("title") or "")
+            title = _clean_takeout_title(raw_title)
+            if not title or title.lower().startswith("https://"):
+                continue
+
+            subtitles = entry.get("subtitles") or []
+            channel_name = ""
+            if subtitles and isinstance(subtitles[0], dict):
+                channel_name = str(subtitles[0].get("name") or "").strip()
+
+            is_yt_music = header.lower() == "youtube music" or "music.youtube.com" in url.lower()
+            if not is_yt_music and (_NON_MUSIC_TITLE_RE.search(title) or _NON_MUSIC_TITLE_RE.search(channel_name)):
+                continue
+
+            dash_artist = ""
+            dash_track = ""
+            if " - " in title:
+                left, right = title.split(" - ", 1)
+                if 1 <= len(left.strip()) <= 45 and right.strip():
+                    dash_artist = left.strip()
+                    dash_track = _clean_takeout_title(right.strip())
+
+            has_music_channel = bool(channel_name and _MUSIC_CHANNEL_RE.search(channel_name))
+            has_music_title = bool(_MUSIC_SIGNAL_TITLE_RE.search(title))
+            has_artist_channel_match = bool(
+                dash_artist
+                and _channel_matches_title_artist(channel_name, dash_artist)
+                and not _NON_MUSIC_CHANNEL_RE.search(channel_name)
+                and len(title) <= 60
+                and not _EPISODE_OR_NUMBERED_RE.search(title)
+                and not _NON_MUSIC_TITLE_RE.search(title)
+            )
+
+            # [M6 / Bug #4 / Audit #2] Require music channel, music title signal, or hardened artist-channel match
+            if not (is_yt_music or has_music_channel or has_music_title or has_artist_channel_match):
+                continue
+
+            # Extract artist and clean track title
+            artist = ""
+            track_title = title
+            if dash_artist and not is_yt_music:
+                artist = dash_artist
+                track_title = dash_track
+            if not artist and channel_name:
+                artist = _clean_channel_artist(channel_name)
+            if not artist:
+                continue
+
+            records.append(
+                {
+                    "artist": artist,
+                    "title": track_title,
+                    "video_id": _extract_video_id(url),
+                    "played_at": str(entry.get("time") or ""),
+                    "weight": 1.5 if is_yt_music else 1.0,
+                    "source": "takeout_ytmusic" if is_yt_music else "takeout_youtube",
+                }
+            )
     except (OSError, ValueError) as exc:
         msg = f"Failed to parse Takeout JSON {path}: {exc}"
         logger.warning(msg)
         if warnings is not None:
             warnings.append(msg)
         return []
-
-    if not isinstance(raw, list):
-        return []
-
-    records: list[dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        # [M6] Exclude sponsored/Google Ads watch entries
-        if _is_google_ad_entry(entry):
-            continue
-
-        header = str(entry.get("header") or "")
-        url = str(entry.get("titleUrl") or "")
-        raw_title = str(entry.get("title") or "")
-        title = _clean_takeout_title(raw_title)
-        if not title or title.lower().startswith("https://"):
-            continue
-
-        subtitles = entry.get("subtitles") or []
-        channel_name = ""
-        if subtitles and isinstance(subtitles[0], dict):
-            channel_name = str(subtitles[0].get("name") or "").strip()
-
-        is_yt_music = header.lower() == "youtube music" or "music.youtube.com" in url.lower()
-        if not is_yt_music and (_NON_MUSIC_TITLE_RE.search(title) or _NON_MUSIC_TITLE_RE.search(channel_name)):
-            continue
-
-        dash_artist = ""
-        dash_track = ""
-        if " - " in title:
-            left, right = title.split(" - ", 1)
-            if 1 <= len(left.strip()) <= 45 and right.strip():
-                dash_artist = left.strip()
-                dash_track = _clean_takeout_title(right.strip())
-
-        has_music_channel = bool(channel_name and _MUSIC_CHANNEL_RE.search(channel_name))
-        has_music_title = bool(_MUSIC_SIGNAL_TITLE_RE.search(title))
-        has_artist_channel_match = bool(dash_artist and _channel_matches_title_artist(channel_name, dash_artist))
-
-        # [M6 / Bug #4] Require music channel, music title signal, or verified artist-channel match on "Artist - Track"
-        if not (is_yt_music or has_music_channel or has_music_title or has_artist_channel_match):
-            continue
-
-        # Extract artist and clean track title
-        artist = ""
-        track_title = title
-        if dash_artist and not is_yt_music:
-            artist = dash_artist
-            track_title = dash_track
-        if not artist and channel_name:
-            artist = _clean_channel_artist(channel_name)
-        if not artist:
-            continue
-
-        records.append(
-            {
-                "artist": artist,
-                "title": track_title,
-                "video_id": _extract_video_id(url),
-                "played_at": str(entry.get("time") or ""),
-                "weight": 1.5 if is_yt_music else 1.0,
-                "source": "takeout_ytmusic" if is_yt_music else "takeout_youtube",
-            }
-        )
 
     return records
 
@@ -460,10 +570,12 @@ def build_weighted_theory_stations(
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
     reference_time: datetime | None = None,
     max_weighted_seeds_per_station: int = 12,
-    max_known_items: int = 1000,
+    max_known_items: int = 5000,
 ) -> tuple[list[StationConfig], dict[str, list[str]]]:
     """Classify weighted YouTube history into the 5 DNA stations and build known_video_ids/track_keys."""
     now = reference_time or datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
     stations = default_theory_stations(profile_path=profile_path)
     station_by_id = {s.station_id: s for s in stations}
 
@@ -474,10 +586,11 @@ def build_weighted_theory_stations(
     artist_top_track: dict[str, Counter[str]] = defaultdict(Counter)
     artist_liked_bonus: Counter[str] = Counter()
 
-    known_video_ids: list[str] = []
-    seen_vids: set[str] = set()
-    known_track_keys: list[str] = []
-    seen_keys: set[str] = set()
+    # Track frequency x recency weights for known_video_ids and known_track_keys
+    vid_counts: Counter[str] = Counter()
+    vid_min_days: dict[str, float] = {}
+    key_counts: Counter[str] = Counter()
+    key_min_days: dict[str, float] = {}
 
     for rec in records:
         artist = str(rec.get("artist") or "").strip()
@@ -489,26 +602,30 @@ def build_weighted_theory_stations(
             continue
         artist_display_name.setdefault(a_norm, artist)
 
-        vid = str(rec.get("video_id") or "").strip()
-        if vid and vid not in seen_vids:
-            seen_vids.add(vid)
-            known_video_ids.append(vid)
-        if title:
-            t_key = normalize_track_key(artist, title)
-            if t_key not in seen_keys:
-                seen_keys.add(t_key)
-                known_track_keys.append(t_key)
-            artist_top_track[a_norm][title] += 1
-
         dt = _parse_iso_timestamp(rec.get("played_at") or rec.get("time"))
         days_ago = max(0.0, (now - dt).total_seconds() / 86400.0) if dt is not None else 30.0
+        increment = 3 if rec.get("source") == "ytmusic_liked" else 1
+
+        vid = str(rec.get("video_id") or "").strip()
+        if vid:
+            vid_counts[vid] += increment
+            prev_vid_days = vid_min_days.get(vid)
+            if prev_vid_days is None or days_ago < prev_vid_days:
+                vid_min_days[vid] = days_ago
+
+        if title:
+            t_key = normalize_track_key(artist, title)
+            key_counts[t_key] += increment
+            prev_key_days = key_min_days.get(t_key)
+            if prev_key_days is None or days_ago < prev_key_days:
+                key_min_days[t_key] = days_ago
+            artist_top_track[a_norm][title] += 1
 
         st_id = classify_entry_to_station(artist, title)
         if st_id not in station_by_id:
             st_id = stations[0].station_id
 
         # Liked tracks count as stronger play signal while preserving frequency x recency formula
-        increment = 3 if rec.get("source") == "ytmusic_liked" else 1
         artist_counts[st_id][a_norm] += increment
         if rec.get("source") == "ytmusic_liked":
             artist_liked_bonus[a_norm] += 1
@@ -561,9 +678,19 @@ def build_weighted_theory_stations(
         merged_artists = list(dict.fromkeys([*history_artists, *st.seed_artists]))
         st.seed_artists = merged_artists[:14]
 
+    sorted_known_vids = sorted(
+        vid_counts.keys(),
+        key=lambda v: compute_recency_frequency_weight(vid_counts[v], vid_min_days.get(v, 30.0)),
+        reverse=True,
+    )
+    sorted_known_keys = sorted(
+        key_counts.keys(),
+        key=lambda k: compute_recency_frequency_weight(key_counts[k], key_min_days.get(k, 30.0)),
+        reverse=True,
+    )
     history_index = {
-        "known_video_ids": known_video_ids[:max_known_items],
-        "known_track_keys": known_track_keys[:max_known_items],
+        "known_video_ids": sorted_known_vids[:max_known_items],
+        "known_track_keys": sorted_known_keys[:max_known_items],
     }
     return stations, history_index
 

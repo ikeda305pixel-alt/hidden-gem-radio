@@ -9,10 +9,10 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.adapters.youtube import YouTubeMusicAdapter
-from src.db import RadioDatabase
+from src.db import RadioDatabase, sanitize_video_id
 from src.digger.history_importer import generate_stations_yaml
 from src.digger.pool import CandidatePoolDigger
 from src.models import (
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _PERMANENT_YT_UNPLAYABLE_CODES = frozenset({100, 101, 150})
+_TRANSIENT_YT_ERROR_CODES = frozenset({2, 5})
 
 
 class FeedbackRequest(BaseModel):
@@ -71,10 +72,26 @@ class AddPlaylistTrackRequest(BaseModel):
     sync_youtube: bool = False
     youtube_playlist_id: str | None = None
 
+    @field_validator("video_id")
+    @classmethod
+    def _validate_video_id(cls, value: str) -> str:
+        clean = sanitize_video_id(value)
+        if clean is None:
+            raise ValueError("Invalid YouTube video_id format")
+        return clean
+
 
 class YouTubeSyncRequest(BaseModel):
     video_id: str = Field(..., min_length=1)
     youtube_playlist_id: str | None = None
+
+    @field_validator("video_id")
+    @classmethod
+    def _validate_video_id(cls, value: str) -> str:
+        clean = sanitize_video_id(value)
+        if clean is None:
+            raise ValueError("Invalid YouTube video_id format")
+        return clean
 
 
 class RadioRuntime:
@@ -102,7 +119,7 @@ class RadioRuntime:
         self._digger_init_lock = threading.Lock()
         self._dig_state_lock = threading.Lock()
         self._dig_locks: dict[str, threading.Lock] = {}
-        self._digging_stations: dict[str, object] = {}
+        self._digging_stations: dict[str, set[object]] = {}
         self.stations: dict[str, StationConfig] = {}
         self.bandits: dict[str, ContextualBanditRecommender] = {}
         self.known_video_ids: set[str] = set()
@@ -174,11 +191,19 @@ class RadioRuntime:
                 self._dig_locks[station_id] = lock
             return lock
 
-    def _release_dig_token(self, station_id: str, token: object) -> None:
-        """Release the station's active digging entry only if owned by the matching token."""
+    def _add_dig_token(self, station_id: str, token: object) -> None:
+        """Register an active/waiting dig token for station_id without overwriting other tokens."""
         with self._dig_state_lock:
-            if self._digging_stations.get(station_id) is token:
-                del self._digging_stations[station_id]
+            self._digging_stations.setdefault(station_id, set()).add(token)
+
+    def _release_dig_token(self, station_id: str, token: object) -> None:
+        """Remove a dig token from station_id and delete the station key once no tokens remain."""
+        with self._dig_state_lock:
+            tokens = self._digging_stations.get(station_id)
+            if tokens is not None:
+                tokens.discard(token)
+                if not tokens:
+                    del self._digging_stations[station_id]
 
     def _run_station_dig(
         self,
@@ -194,8 +219,7 @@ class RadioRuntime:
             with lock:
                 if my_token is None:
                     my_token = object()
-                with self._dig_state_lock:
-                    self._digging_stations[station.station_id] = my_token
+                self._add_dig_token(station.station_id, my_token)
                 if skip_if_unheard_gte > 0:
                     existing = self.db.count_playable_candidates(
                         station.station_id,
@@ -234,10 +258,10 @@ class RadioRuntime:
     ) -> bool:
         """Start a single non-blocking background dig thread if one is not already active."""
         with self._dig_state_lock:
-            if station.station_id in self._digging_stations:
+            if self._digging_stations.get(station.station_id):
                 return False
             token = object()
-            self._digging_stations[station.station_id] = token
+            self._digging_stations.setdefault(station.station_id, set()).add(token)
 
         def _worker() -> None:
             self._run_station_dig(
@@ -302,14 +326,16 @@ class RadioRuntime:
                     exclude_canonical_keys=self.known_track_keys,
                 )
 
-        # [M4] Fall back to previously liked/completed tracks ONLY if unheard is still empty
+        # [M4 / Audit #8] Fall back to previously liked/completed tracks ONLY if unheard is still empty,
+        # while continuing to exclude already-known YouTube history video IDs and track keys
         candidates = unheard
         if not candidates:
             candidates = self.db.get_eligible_candidates(
                 station_id=station.station_id,
                 max_popularity_views=station.max_popularity_views,
-                exclude_track_ids=exclude_ids,
+                exclude_track_ids=effective_exclude_ids,
                 include_heard_fallback=True,
+                exclude_canonical_keys=self.known_track_keys,
             )
 
         bandit = self.bandits[station.station_id]
@@ -474,24 +500,40 @@ def create_app(
         video_id: str,
         req: UnplayableRequest | None = None,
     ) -> dict[str, Any]:
-        """Blacklist an unplayable/stalled video_id for 30 days WITHOUT polluting BAD bandit learning."""
+        """Blacklist an unplayable/stalled video_id for 30 days WITHOUT polluting BAD bandit learning.
+
+        Transient YT player errors (codes 2, 5) return a replacement without blacklisting.
+        Permanent YT errors (codes 100, 101, 150) also mark tracks.unplayable = 1.
+        """
+        clean_vid = sanitize_video_id(video_id)
+        if clean_vid is None:
+            raise HTTPException(status_code=400, detail="Invalid YouTube video_id format")
+
         body = req or UnplayableRequest()
-        expires_at = runtime.db.blacklist_unplayable(
-            video_id,
-            reason=body.reason,
-            yt_error_code=body.yt_error_code,
-            ttl_days=body.ttl_days,
-        )
+        is_transient = body.yt_error_code in _TRANSIENT_YT_ERROR_CODES
+        expires_at: float | None = None
+
+        if not is_transient:
+            expires_at = runtime.db.blacklist_unplayable(
+                clean_vid,
+                reason=body.reason,
+                yt_error_code=body.yt_error_code,
+                ttl_days=body.ttl_days,
+            )
+            if body.yt_error_code in _PERMANENT_YT_UNPLAYABLE_CODES:
+                runtime.db.mark_unplayable(video_id=clean_vid, track_id=body.track_id)
+
         replacement = None
         if body.station_id and body.station_id in runtime.stations:
-            exclude = {x for x in (video_id, body.track_id) if x}
+            exclude = {x for x in (clean_vid, body.track_id) if x}
             reps = runtime.next_queue(body.station_id, count=1, exclude_ids=exclude)
             replacement = reps[0] if reps else None
 
         return {
             "status": "ok",
-            "video_id": video_id,
-            "blacklisted_days": body.ttl_days,
+            "video_id": clean_vid,
+            "blacklisted": not is_transient,
+            "blacklisted_days": 0 if is_transient else body.ttl_days,
             "expires_at": expires_at,
             "bad_learning_polluted": False,
             "replacement": replacement,
@@ -541,7 +583,10 @@ def create_app(
     def api_remove_playlist_track(playlist_id: str, video_id: str) -> dict[str, Any]:
         if not runtime.db.playlist_exists(playlist_id):
             raise HTTPException(status_code=404, detail=f"Unknown playlist_id: {playlist_id}")
-        removed = runtime.db.remove_track_from_playlist(playlist_id, video_id)
+        clean_vid = sanitize_video_id(video_id)
+        if clean_vid is None:
+            raise HTTPException(status_code=400, detail="Invalid YouTube video_id format")
+        removed = runtime.db.remove_track_from_playlist(playlist_id, clean_vid)
         return {"status": "ok", "removed": removed > 0}
 
     @app.get("/api/youtube/playlists")
