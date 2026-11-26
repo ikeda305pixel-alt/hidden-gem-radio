@@ -17,6 +17,17 @@ from src.models import PlaybackResolution, TrackEntity, normalize_text
 logger = logging.getLogger(__name__)
 
 _OEMBED_ENDPOINT = "https://www.youtube.com/oembed"
+_EMBED_PAGE_URL = "https://www.youtube.com/embed/{video_id}"
+_EMBED_UNPLAYABLE_PATTERNS = (
+    re.compile(r'\\?"playableInEmbed\\?"\s*:\s*false', re.IGNORECASE),
+    re.compile(
+        r'\\?"playabilityStatus\\?"\s*:\s*\{[^}]{0,400}\\?"status\\?"\s*:\s*\\?"(?:UNPLAYABLE|ERROR|LOGIN_REQUIRED)\\?"',
+        re.IGNORECASE,
+    ),
+    re.compile(r'\\?"status\\?"\s*:\s*\\?"UNPLAYABLE\\?"', re.IGNORECASE),
+    re.compile(r"UNPLAYABLE_IN_EMBED", re.IGNORECASE),
+    re.compile(r"Playback on other websites has been disabled", re.IGNORECASE),
+)
 _VIEW_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*([KMB])?", re.IGNORECASE)
 _MIN_SONG_SECONDS = 60
 _MAX_SONG_SECONDS = 660  # Reject full album mixes / hour-long DJ sets & podcasts
@@ -32,6 +43,81 @@ _SLOP_TITLE_RE = re.compile(
     r"nightcore|sped\s*up|karaoke|cover|full\s*album|loop\s*1h|8d\s*audio)\b)",
     re.IGNORECASE,
 )
+_ALT_REJECT_RE = re.compile(
+    r"(?:\b(?:ai\s*generated|suno|udio|type\s*beat|free\s*beat|1\s*hour|slowed|reverb|"
+    r"nightcore|sped\s*up|spedup|karaoke|cover|full\s*album|loop\s*1h|8d\s*audio|"
+    r"live|concert|unofficial|fan\s*made|fanmade|bootleg|mashup|pitched)\b)",
+    re.IGNORECASE,
+)
+_LYRIC_TITLE_RE = re.compile(r"\blyrics?\b", re.IGNORECASE)
+_OFFICIAL_CHANNEL_RE = re.compile(
+    r"(?:vevo\b|\bofficial\b|\brecords?\b|\brecordings?\b|\bmusic\b|\bentertainment\b|"
+    r"\binterscope\b|\batlantic\b|\brepublic\b|\bdef\s*jam\b|\brca\b|\bcolumbia\b|"
+    r"\bcapitol\b|\bwarner\b|\bsony\b|\buniversal\b|\bxl\s*recordings\b|\b4ad\b|"
+    r"\bdomino\b|\bsub\s*pop\b|\bwarp\b|\bninja\s*tune\b|\bstones\s*throw\b|\btde\b|"
+    r"\btop\s*dawg\b|\bdreamville\b|\bovo\b|\bcactus\s*jack\b|\broc\s*nation\b|"
+    r"\bempire\b|\bawal\b|\bcolors\b|\blyrical\s*lemonade\b|\bworldstarhiphop\b|"
+    r"-\s*topic$)",
+    re.IGNORECASE,
+)
+
+
+def _is_embed_html_unplayable(html_text: str) -> bool:
+    """Detect playableInEmbed:false / UNPLAYABLE / disabled-embedding signals in YouTube embed HTML."""
+    if not html_text:
+        return False
+    return any(pat.search(html_text) for pat in _EMBED_UNPLAYABLE_PATTERNS)
+
+
+def _compact_alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u3040-\u30ff\u4e00-\u9fff]+", "", normalize_text(text))
+
+
+def _title_matches(target_title: str, candidate_title: str) -> bool:
+    t_norm = normalize_text(target_title)
+    c_norm = normalize_text(candidate_title)
+    if not t_norm or not c_norm:
+        return False
+    if t_norm in c_norm or c_norm in t_norm:
+        return True
+    t_tokens = [tok for tok in t_norm.split() if len(tok) >= 2]
+    if not t_tokens:
+        t_tokens = t_norm.split()
+    c_tokens = set(c_norm.split())
+    hits = sum(1 for tok in t_tokens if tok in c_tokens)
+    return hits / max(1, len(t_tokens)) >= 0.6
+
+
+def _artist_matches(target_artist: str, candidate_text: str) -> bool:
+    t_compact = _compact_alnum(target_artist)
+    c_compact = _compact_alnum(candidate_text)
+    if not t_compact or not c_compact:
+        return False
+    if t_compact in c_compact or c_compact in t_compact:
+        return True
+    t_tokens = [tok for tok in normalize_text(target_artist).split() if len(tok) >= 2]
+    if not t_tokens:
+        return False
+    c_norm = normalize_text(candidate_text)
+    return all(tok in c_norm for tok in t_tokens)
+
+
+def _is_official_lyric_channel(item: dict[str, Any], target_artist: str) -> bool:
+    """Verify a lyric video comes from the artist or an official label/channel (rejecting random lyric uploaders)."""
+    if str(item.get("videoType") or "") in _ALLOWED_OFFICIAL_VIDEO_TYPES:
+        return True
+    artists = item.get("artists") or []
+    for entry in artists:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        if _artist_matches(target_artist, name):
+            return True
+        if _OFFICIAL_CHANNEL_RE.search(name):
+            return True
+    return False
 
 
 def is_slop_or_unofficial(item: dict[str, Any]) -> bool:
@@ -207,10 +293,12 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         return self._auth_error
 
     def is_video_embeddable(self, video_id: str, *, timeout: float = 4.0) -> bool:
-        """Check via lightweight auth-free YouTube oEmbed whether a video allows external IFrame embedding.
+        """Check via lightweight auth-free oEmbed + /embed/{video_id} whether a video is playable in external IFrames.
 
-        - HTTP 200 -> True (cached)
-        - HTTP 401 / 403 / 404 -> False (cached; embed disabled or unavailable)
+        - oEmbed HTTP 401 / 403 / 404 -> False (cached)
+        - oEmbed HTTP 200 -> fetch /embed/{video_id} and check playableInEmbed / playabilityStatus / unplayable signals:
+          - Unplayable / playableInEmbed:false -> False (cached)
+          - Otherwise -> True (cached)
         - Timeout / 429 / 5xx / network error -> safe fallback True (not cached as False),
           with a consecutive network-error circuit breaker to avoid slowing down digging during outages.
         """
@@ -244,11 +332,6 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             return True
 
         status = resp.status_code
-        if status == 200:
-            with self._embed_lock:
-                self._embed_consecutive_net_errors = 0
-                self._embeddable_cache[vid] = True
-            return True
         if status in {401, 403, 404}:
             with self._embed_lock:
                 self._embed_consecutive_net_errors = 0
@@ -258,7 +341,139 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             with self._embed_lock:
                 self._embed_consecutive_net_errors += 1
             return True
+        if status != 200:
+            return True
+
+        # oEmbed returned 200, but major-label official tracks often still have playableInEmbed:false.
+        # Perform a lightweight check on /embed/{video_id} for direct playabilityStatus / playableInEmbed signals.
+        try:
+            embed_resp = client.get(
+                _EMBED_PAGE_URL.format(video_id=vid),
+                headers={"Accept-Language": "en-US,en;q=0.9"},
+                timeout=timeout,
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            logger.debug("Embed page check network fallback for %s: %s", vid, exc)
+            with self._embed_lock:
+                self._embed_consecutive_net_errors += 1
+            return True
+
+        embed_status = embed_resp.status_code
+        if embed_status in {401, 403, 404}:
+            with self._embed_lock:
+                self._embed_consecutive_net_errors = 0
+                self._embeddable_cache[vid] = False
+            return False
+        if embed_status == 429 or embed_status >= 500:
+            with self._embed_lock:
+                self._embed_consecutive_net_errors += 1
+            return True
+        if embed_status == 200:
+            is_playable = not _is_embed_html_unplayable(embed_resp.text)
+            with self._embed_lock:
+                self._embed_consecutive_net_errors = 0
+                self._embeddable_cache[vid] = is_playable
+            return is_playable
         return True
+
+    def _search_videos_raw(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        try:
+            rows = self._yt.search(query, filter="videos", limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ytmusicapi search(filter='videos') failed for %r: %s", query, exc)
+            return []
+        return [r for r in (rows or []) if isinstance(r, dict) and r.get("videoId")]
+
+    def find_embeddable_alternative(
+        self,
+        artist: str,
+        title: str,
+        *,
+        exclude_video_ids: set[str] | None = None,
+    ) -> tuple[TrackEntity, str] | None:
+        """Find one embeddable official alternative when the primary video_id is embed-disabled.
+
+        Priority:
+        1. Official Music Video (MUSIC_VIDEO_TYPE_OMV) matching artist & title.
+        2. Official Lyric Video from artist / official label channel, rejecting AI slop / cover / live / remix / slowed.
+        """
+        excluded = set(exclude_video_ids or set())
+        allow_remix = "remix" in title.lower()
+
+        def _is_rejected_title(raw_title: str, channel_name: str) -> bool:
+            if _ALT_REJECT_RE.search(raw_title) or _ALT_REJECT_RE.search(channel_name):
+                return True
+            return bool(not allow_remix and re.search(r"\bremix\b", raw_title, re.IGNORECASE))
+
+        # Pass 1: Official Music Video (OMV)
+        omv_rows = self._search_videos_raw(f"{artist} {title}".strip(), limit=8)
+        for item in omv_rows:
+            vid = str(item.get("videoId") or "").strip()
+            if not vid or vid in excluded:
+                continue
+            if item.get("isAvailable") is False:
+                continue
+            if str(item.get("videoType") or "") != "MUSIC_VIDEO_TYPE_OMV":
+                continue
+            duration = parse_duration_seconds(item.get("duration_seconds"), item.get("duration"))
+            if duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                continue
+            raw_title = str(item.get("title") or "")
+            found_artist = _extract_artist_name(item, raw_title)
+            if _is_rejected_title(raw_title, found_artist):
+                continue
+            if not _title_matches(title, raw_title):
+                continue
+            if not (_artist_matches(artist, found_artist) or _artist_matches(artist, raw_title)):
+                continue
+            if self.is_video_embeddable(vid):
+                alt = TrackEntity(
+                    track_id=f"yt:{vid}",
+                    canonical_key=f"{normalize_text(artist)}::{normalize_text(title)}",
+                    artist=artist,
+                    title=title,
+                    view_count=parse_view_count(item.get("views")),
+                    duration_seconds=duration,
+                    video_id=vid,
+                    source="youtube_music_omv",
+                )
+                return alt, "omv"
+
+        # Pass 2: Official Lyric Video
+        lyric_rows = self._search_videos_raw(f"{artist} {title} official lyric video".strip(), limit=8)
+        for item in lyric_rows:
+            vid = str(item.get("videoId") or "").strip()
+            if not vid or vid in excluded:
+                continue
+            if item.get("isAvailable") is False:
+                continue
+            duration = parse_duration_seconds(item.get("duration_seconds"), item.get("duration"))
+            if duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
+                continue
+            raw_title = str(item.get("title") or "")
+            if not _LYRIC_TITLE_RE.search(raw_title):
+                continue
+            found_artist = _extract_artist_name(item, raw_title)
+            if _is_rejected_title(raw_title, found_artist):
+                continue
+            if not _title_matches(title, raw_title):
+                continue
+            if not _is_official_lyric_channel(item, artist):
+                continue
+            if self.is_video_embeddable(vid):
+                alt = TrackEntity(
+                    track_id=f"yt:{vid}",
+                    canonical_key=f"{normalize_text(artist)}::{normalize_text(title)}",
+                    artist=artist,
+                    title=title,
+                    view_count=parse_view_count(item.get("views")),
+                    duration_seconds=duration,
+                    video_id=vid,
+                    source="youtube_music_lyric",
+                )
+                return alt, "official_lyric_video"
+
+        return None
 
     def list_user_playlists(self, limit: int = 50) -> dict[str, Any]:
         """List authenticated YouTube Music library playlists, or safely return unauthenticated fallback."""

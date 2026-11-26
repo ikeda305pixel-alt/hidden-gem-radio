@@ -452,3 +452,262 @@ vm.runInContext(
     )
     assert proc.returncode == 0, f"Node UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "EMBED_AND_CIRCUIT_BREAKER_UI_OK" in proc.stdout
+
+
+def test_oembed_200_but_embed_html_playable_in_embed_false_or_unplayable_returns_false() -> None:
+    """Even when oEmbed returns HTTP 200, playableInEmbed:false or UNPLAYABLE in /embed/{id} must return False."""
+    embed_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/oembed":
+            return httpx.Response(200, json={"title": "Official Audio"})
+        if path.startswith("/embed/"):
+            vid = path.split("/embed/")[-1]
+            embed_calls.append(vid)
+            if vid == "VID_PIE_FALSE":
+                return httpx.Response(
+                    200,
+                    text='<html><script>ytcfg.set({"PLAYER_VARS":{"embedded_player_response":"{\\"playabilityStatus\\":{\\"status\\":\\"OK\\",\\"playableInEmbed\\":false}}"}});</script></html>',
+                )
+            if vid == "VID_UNPLAY":
+                return httpx.Response(
+                    200,
+                    text='<html><script>var r = {"playabilityStatus":{"status":"UNPLAYABLE","reason":"Video unavailable"}};</script></html>',
+                )
+            if vid == "VID_EMBED_503":
+                return httpx.Response(503, text="Service Unavailable")
+            return httpx.Response(
+                200,
+                text='<html><script>var r = {"playabilityStatus":{"status":"OK","playableInEmbed":true}};</script></html>',
+            )
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    adapter = YouTubeMusicAdapter(client=object(), http_client=client, check_embeddable=True)
+
+    # Escaped playableInEmbed:false -> False & cached
+    assert adapter.is_video_embeddable("VID_PIE_FALSE") is False
+    assert adapter.is_video_embeddable("VID_PIE_FALSE") is False
+    assert embed_calls.count("VID_PIE_FALSE") == 1
+
+    # playabilityStatus UNPLAYABLE -> False & cached
+    assert adapter.is_video_embeddable("VID_UNPLAY") is False
+    assert adapter.is_video_embeddable("VID_UNPLAY") is False
+    assert embed_calls.count("VID_UNPLAY") == 1
+
+    # Embed 503 -> safe fallback True (not cached as False)
+    assert adapter.is_video_embeddable("VID_EMBED_503") is True
+    assert adapter.is_video_embeddable("VID_EMBED_503") is True
+    assert embed_calls.count("VID_EMBED_503") == 2
+
+    # Normal playableInEmbed:true -> True & cached
+    assert adapter.is_video_embeddable("VID_PLAY_OK") is True
+    assert adapter.is_video_embeddable("VID_PLAY_OK") is True
+    assert embed_calls.count("VID_PLAY_OK") == 1
+
+
+def test_stage1_dig_replaces_unembeddable_with_omv_then_official_lyric_and_rejects_slop_lyric(
+    tmp_path: Path,
+) -> None:
+    """Unembeddable / previously-blacklisted tracks rescue via OMV -> Official Lyric Video, rejecting unofficial/slop lyrics."""
+    db = RadioDatabase(tmp_path / "radio.db")
+
+    # Simulate pre-existing legacy yt_error_150 blacklist + unrated track cleanup (--reset-tracks)
+    db.upsert_track(
+        "us_hiphop",
+        TrackEntity(
+            track_id="yt:ATV_A_001",
+            canonical_key="kendrick lamar::money trees",
+            artist="Kendrick Lamar",
+            title="Money Trees",
+            video_id="ATV_A_001",
+            unplayable=True,
+        ),
+    )
+    db.blacklist_unplayable("ATV_A_001", reason="yt_error_150", yt_error_code=150, ttl_days=30)
+    reset_summary = db.reset_unrated_tracks()
+    assert reset_summary["deleted_tracks"] == 1
+
+    class FakeYTMusicClient:
+        def search(self, query: str, filter: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
+            _ = limit
+            q = query.lower()
+            if filter == "songs":
+                return [
+                    {
+                        "videoId": "SEED_HH_01",
+                        "title": "Seed HipHop",
+                        "resultType": "song",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "artists": [{"name": "Seed Rapper", "id": "UC_SEED_HH"}],
+                        "album": {"name": "Seed LP"},
+                        "duration_seconds": 210,
+                    }
+                ]
+            if filter == "videos":
+                # Track A: OMV is embeddable -> should pick OMV_A_001
+                if "money trees" in q and "lyric" not in q:
+                    return [
+                        {
+                            "videoId": "OMV_A_001",
+                            "title": "Kendrick Lamar - Money Trees (Official Music Video)",
+                            "videoType": "MUSIC_VIDEO_TYPE_OMV",
+                            "artists": [{"name": "Kendrick Lamar", "id": "UC_KLAMAR"}],
+                            "duration": "3:45",
+                            "views": "250K",
+                        }
+                    ]
+                # Track B: OMV is embed-disabled; Official Lyric Video is embeddable -> should pick LYRIC_OK_B
+                if "nightcrawler" in q and "lyric" not in q:
+                    return [
+                        {
+                            "videoId": "OMV_B_BLK",
+                            "title": "Travis Scott - Nightcrawler (Official Video)",
+                            "videoType": "MUSIC_VIDEO_TYPE_OMV",
+                            "artists": [{"name": "Travis Scott", "id": "UC_TSCOTT"}],
+                            "duration": "4:05",
+                            "views": "200K",
+                        }
+                    ]
+                if "nightcrawler" in q and "lyric" in q:
+                    return [
+                        {
+                            "videoId": "LYRIC_UNOFF_B",
+                            "title": "Travis Scott - Nightcrawler (Lyrics)",
+                            "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                            "artists": [{"name": "Random Lyrics Zone", "id": "UC_RAND_1"}],
+                            "duration": "4:02",
+                            "views": "90K",
+                        },
+                        {
+                            "videoId": "LYRIC_SLOW_B",
+                            "title": "Travis Scott - Nightcrawler (Slowed + Reverb Lyrics)",
+                            "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                            "artists": [{"name": "TravisScottVEVO", "id": "UC_TS_VEVO"}],
+                            "duration": "4:45",
+                            "views": "50K",
+                        },
+                        {
+                            "videoId": "LYRIC_OK_B",
+                            "title": "Travis Scott - Nightcrawler (Official Lyric Video)",
+                            "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                            "artists": [{"name": "TravisScottVEVO", "id": "UC_TS_VEVO"}],
+                            "duration": "4:05",
+                            "views": "180K",
+                        },
+                    ]
+                # Track C: No OMV, only unofficial / slop / cover / live / 1 hour lyric videos -> must reject all
+                if "ghost town" in q and "lyric" not in q:
+                    return []
+                if "ghost town" in q and "lyric" in q:
+                    return [
+                        {
+                            "videoId": "LYRIC_SLOP_C1",
+                            "title": "Artist C - Ghost Town (Lyrics)",
+                            "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                            "artists": [{"name": "Best Lyrics Daily", "id": "UC_UNOFF_C"}],
+                            "duration": "3:30",
+                            "views": "120K",
+                        },
+                        {
+                            "videoId": "LYRIC_SLOP_C2",
+                            "title": "Artist C - Ghost Town (Live Acoustic Cover Lyrics)",
+                            "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                            "artists": [{"name": "Artist C", "id": "UC_ARTC"}],
+                            "duration": "3:50",
+                            "views": "30K",
+                        },
+                        {
+                            "videoId": "LYRIC_SLOP_C3",
+                            "title": "Artist C - Ghost Town (1 Hour Lyric Video)",
+                            "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                            "artists": [{"name": "Artist C Official", "id": "UC_ARTC"}],
+                            "duration": "3:30",
+                            "views": "20K",
+                        },
+                    ]
+            return []
+
+        def get_watch_playlist(self, videoId: str, limit: int = 25) -> dict[str, Any]:
+            _ = (videoId, limit)
+            return {
+                "tracks": [
+                    {
+                        "videoId": "ATV_A_001",
+                        "title": "Money Trees",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "artists": [{"name": "Kendrick Lamar", "id": "UC_KLAMAR"}],
+                        "album": {"name": "GKMC"},
+                        "length": "3:45",
+                        "views": "150K",
+                    },
+                    {
+                        "videoId": "ATV_B_001",
+                        "title": "Nightcrawler",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "artists": [{"name": "Travis Scott", "id": "UC_TSCOTT"}],
+                        "album": {"name": "Rodeo"},
+                        "length": "4:05",
+                        "views": "140K",
+                    },
+                    {
+                        "videoId": "ATV_C_001",
+                        "title": "Ghost Town",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "artists": [{"name": "Artist C", "id": "UC_ARTC"}],
+                        "album": {"name": "Album C"},
+                        "length": "3:30",
+                        "views": "90K",
+                    },
+                ]
+            }
+
+        def get_artist(self, channel_id: str) -> dict[str, Any]:
+            _ = channel_id
+            return {}
+
+    unembeddable_vids = {"ATV_A_001", "ATV_B_001", "ATV_C_001", "OMV_B_BLK"}
+
+    def http_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oembed":
+            return httpx.Response(200, json={"title": "OK"})
+        if request.url.path.startswith("/embed/"):
+            vid = request.url.path.split("/embed/")[-1]
+            if vid in unembeddable_vids:
+                return httpx.Response(
+                    200,
+                    text='<html><script>{"playabilityStatus":{"status":"OK","playableInEmbed":false}}</script></html>',
+                )
+            return httpx.Response(
+                200,
+                text='<html><script>{"playabilityStatus":{"status":"OK","playableInEmbed":true}}</script></html>',
+            )
+        return httpx.Response(404)
+
+    http_client = httpx.Client(transport=httpx.MockTransport(http_handler))
+    yt_adapter = YouTubeMusicAdapter(client=FakeYTMusicClient(), http_client=http_client, check_embeddable=True)
+    digger = CandidatePoolDigger(db=db, yt_adapter=yt_adapter, enable_mir_enrichment=False)
+
+    station = StationConfig(
+        station_id="us_hiphop",
+        name="US Hip-Hop",
+        seed_tags=["hip-hop"],
+        seed_artists=["Seed Rapper"],
+        spotify_anchor_seeds=["Seed Rapper - Seed HipHop"],
+        max_popularity_views=500_000,
+    )
+    summary = digger.dig_station(station, target_pool_size=10)
+
+    assert summary["added"] == 2
+    assert summary["replaced_omv"] == 1
+    assert summary["replaced_lyric"] == 1
+    assert summary["skipped_unembeddable"] == 1
+
+    playable = db.get_eligible_candidates("us_hiphop", max_popularity_views=500_000)
+    playable_vids = {t.video_id for t in playable}
+    assert playable_vids == {"OMV_A_001", "LYRIC_OK_B"}
+
+    # All original blocked ATV video IDs are blacklisted
+    blacklisted = db.get_blacklisted_video_ids()
+    assert {"ATV_A_001", "ATV_B_001", "ATV_C_001"}.issubset(blacklisted)

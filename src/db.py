@@ -335,6 +335,13 @@ class RadioDatabase:
                 prev_sources = json.loads(existing["discovery_sources_json"] or "[]")
                 merged_sources = list(dict.fromkeys([*prev_sources, *track.discovery_sources]))
                 merged_cooc = max(int(existing["cooccurrence_count"] or 1), int(track.cooccurrence_count or 1), len(merged_sources) or 1)
+                video_replaced = bool(
+                    track.video_id
+                    and track.video_id != existing["video_id"]
+                    and not track.unplayable
+                )
+                new_unplayable = 0 if video_replaced else int(existing["unplayable"] or 0)
+                new_source = track.source if video_replaced else str(existing["source"] or track.source)
                 conn.execute(
                     """
                     UPDATE tracks
@@ -345,6 +352,8 @@ class RadioDatabase:
                         view_count = COALESCE(?, view_count),
                         duration_seconds = COALESCE(?, duration_seconds),
                         video_id = COALESCE(?, video_id),
+                        unplayable = ?,
+                        source = ?,
                         seed_artist = COALESCE(?, seed_artist),
                         seed_archetype = COALESCE(?, seed_archetype),
                         cooccurrence_count = ?,
@@ -366,6 +375,8 @@ class RadioDatabase:
                         track.view_count,
                         track.duration_seconds,
                         track.video_id,
+                        new_unplayable,
+                        new_source,
                         track.seed_artist,
                         track.seed_archetype,
                         merged_cooc,

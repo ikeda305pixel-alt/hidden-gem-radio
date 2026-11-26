@@ -147,9 +147,10 @@ class CandidatePoolDigger:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
         _ = max_lb_resolves  # Preserved for signature compatibility
         blocked_artists = self.db.get_blocked_artists_30d()
-        blacklisted_vids = self.db.get_blacklisted_video_ids()
-        skip_vids = set(known_video_ids or set()) | blacklisted_vids
+        blacklisted_vids = set(self.db.get_blacklisted_video_ids())
+        known_vids = set(known_video_ids or set())
         skip_keys = set(known_track_keys or set())
+        embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
 
         seed_plan = self._build_station_seed_plan(station, max_seeds=max_seeds)
 
@@ -180,7 +181,12 @@ class CandidatePoolDigger:
             for tr in tracks:
                 if not tr.video_id:
                     continue
-                if tr.video_id in skip_vids or tr.video_id in seen_seed_vids or tr.canonical_key in skip_keys:
+                if tr.video_id in known_vids or tr.video_id in seen_seed_vids or tr.canonical_key in skip_keys:
+                    skipped_known += 1
+                    continue
+                # If already blacklisted (e.g. legacy yt_error_150), only retain when embed_check_enabled
+                # so the replacement pass below can rescue it via OMV / Official Lyric Video.
+                if tr.video_id in blacklisted_vids and not embed_check_enabled:
                     skipped_known += 1
                     continue
                 if normalize_artist(tr.artist) in blocked_artists:
@@ -229,7 +235,7 @@ class CandidatePoolDigger:
                 )
                 _ingest(deep_cuts, artist_key, f"{seed_label} 関連アーティスト")
 
-        # Prioritize multi-seed co-occurring gems first, filtering out embed-disabled videos before DB insert
+        # Prioritize multi-seed co-occurring gems first, replacing embed-disabled videos with OMV / Official Lyric Video
         ranked_graph = sorted(
             graph_candidates.items(),
             key=lambda kv: (len(seed_hit_sets[kv[0]]), kv[1].view_count or 0),
@@ -240,26 +246,81 @@ class CandidatePoolDigger:
         cooccurring_count = 0
         mir_enriched_count = 0
         skipped_unembeddable = 0
-        embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
+        replaced_omv = 0
+        replaced_lyric = 0
+        persisted_vids: set[str] = set()
+        persisted_keys: set[str] = set()
+        alt_finder = getattr(self.yt, "find_embeddable_alternative", None)
+
         for vid_key, track in ranked_graph:
             if added >= target_pool_size:
                 break
-
-            if embed_check_enabled and not self.yt.is_video_embeddable(track.video_id):
-                self.db.blacklist_unplayable(
-                    track.video_id,
-                    reason="oembed_embed_disabled",
-                    yt_error_code=150,
-                    ttl_days=30,
-                )
-                skipped_unembeddable += 1
+            if track.canonical_key in persisted_keys:
                 continue
+
+            replacement_tag = ""
+            is_unembeddable = (track.video_id in blacklisted_vids) or (
+                embed_check_enabled and not self.yt.is_video_embeddable(track.video_id)
+            )
+            if is_unembeddable:
+                if track.video_id not in blacklisted_vids:
+                    self.db.blacklist_unplayable(
+                        track.video_id,
+                        reason="oembed_embed_disabled",
+                        yt_error_code=150,
+                        ttl_days=30,
+                    )
+                    blacklisted_vids.add(track.video_id)
+
+                alt_result = None
+                if callable(alt_finder):
+                    alt_result = alt_finder(
+                        track.artist,
+                        track.title,
+                        exclude_video_ids=known_vids | blacklisted_vids | seen_seed_vids | persisted_vids,
+                    )
+
+                if alt_result is None:
+                    skipped_unembeddable += 1
+                    continue
+
+                alt_track, alt_kind = alt_result
+                if not alt_track.video_id or alt_track.video_id in persisted_vids:
+                    skipped_unembeddable += 1
+                    continue
+
+                track = TrackEntity(
+                    track_id=f"yt:{alt_track.video_id}",
+                    canonical_key=track.canonical_key,
+                    isrc=track.isrc,
+                    mbid=track.mbid,
+                    artist=track.artist,
+                    title=track.title,
+                    tags=list(track.tags),
+                    release_year=track.release_year,
+                    view_count=alt_track.view_count if alt_track.view_count is not None else track.view_count,
+                    duration_seconds=(
+                        alt_track.duration_seconds
+                        if alt_track.duration_seconds is not None
+                        else track.duration_seconds
+                    ),
+                    video_id=alt_track.video_id,
+                    source=alt_track.source,
+                    seed_artist=track.seed_artist,
+                    seed_archetype=track.seed_archetype,
+                )
+                if alt_kind == "omv":
+                    replaced_omv += 1
+                    replacement_tag = " [公式MV代替]"
+                else:
+                    replaced_lyric += 1
+                    replacement_tag = " [公式Lyric代替]"
 
             cooc = max(1, len(seed_hit_sets[vid_key]))
             sources = source_labels[vid_key]
             track.cooccurrence_count = cooc
             track.discovery_sources = sources
-            track.discovery_route = _format_discovery_route(sources, cooc)
+            track.discovery_route = f"{_format_discovery_route(sources, cooc)}{replacement_tag}"
             if cooc >= 2:
                 cooccurring_count += 1
 
@@ -285,6 +346,8 @@ class CandidatePoolDigger:
                 mir_enriched_count += 1
 
             self.db.upsert_track(station.station_id, track)
+            persisted_vids.add(track.video_id)
+            persisted_keys.add(track.canonical_key)
             added += 1
 
         total_playable = self.db.count_playable_candidates(
@@ -300,6 +363,8 @@ class CandidatePoolDigger:
             "skipped_blocked_30d": skipped_blocked,
             "skipped_known_history": skipped_known,
             "skipped_unembeddable": skipped_unembeddable,
+            "replaced_omv": replaced_omv,
+            "replaced_lyric": replaced_lyric,
             "total_playable": total_playable,
         }
 
