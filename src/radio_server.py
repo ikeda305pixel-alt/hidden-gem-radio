@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Iterator
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from src.adapters.audio_stream import AudioStreamResolver
 from src.adapters.deezer import DeezerClient
+from src.adapters.mpv_player import MpvLocalPlayer
 from src.adapters.youtube import YouTubeMusicAdapter
 from src.db import RadioDatabase, sanitize_video_id
 from src.digger.history_importer import generate_stations_yaml
@@ -105,6 +106,28 @@ class YouTubeSyncRequest(BaseModel):
         return clean
 
 
+class LocalPlayerPlayRequest(BaseModel):
+    station_id: str | None = None
+    track: dict[str, Any] | None = None
+
+
+class LocalPlayerToggleRequest(BaseModel):
+    station_id: str | None = None
+
+
+class LocalPlayerNextRequest(BaseModel):
+    station_id: str | None = None
+    event_type: str = Field(default="SKIP", description="SKIP | BAD")
+
+
+class LocalPlayerSeekRequest(BaseModel):
+    position_sec: float = Field(..., ge=0.0)
+
+
+class LocalPlayerMuteRequest(BaseModel):
+    muted: bool | None = None
+
+
 class RadioRuntime:
     """Holds stations, SQLite DB, Stage 1 graph digger, 16-dim MIR extractor, and per-station Bandits."""
 
@@ -118,6 +141,7 @@ class RadioRuntime:
         auto_dig: bool = True,
         audio_resolver: AudioStreamResolver | None = None,
         audio_http_factory: Callable[[], httpx.Client] | None = None,
+        mpv_player: MpvLocalPlayer | None = None,
     ) -> None:
         self.stations_path = Path(stations_path)
         self.model_dir = Path(model_dir)
@@ -147,6 +171,68 @@ class RadioRuntime:
         self.known_track_keys: set[str] = set()
         self.known_familiar_artists: set[str] = set()
         self.reload_stations()
+
+        sock_path = Path(db_path).parent / "mpv.sock"
+        if mpv_player is not None:
+            self.mpv_player = mpv_player
+            self.mpv_player.audio_resolver = self.audio_resolver
+            self.mpv_player._next_tracks_provider = self._mpv_next_tracks
+            self.mpv_player._feedback_recorder = self._mpv_record_feedback
+        else:
+            self.mpv_player = MpvLocalPlayer(
+                audio_resolver=self.audio_resolver,
+                next_tracks_provider=self._mpv_next_tracks,
+                feedback_recorder=self._mpv_record_feedback,
+                socket_path=sock_path,
+            )
+
+    def _mpv_next_tracks(self, station_id: str, count: int, exclude_ids: set[str]) -> list[dict[str, Any]]:
+        if station_id not in self.stations:
+            return []
+        return self.next_queue(station_id=station_id, count=count, exclude_ids=exclude_ids, allow_sync_dig=False)
+
+    def _mpv_record_feedback(
+        self,
+        station_id: str,
+        track_dict: dict[str, Any],
+        event_type: str,
+        listen_seconds: float | None,
+        duration_seconds: float | None,
+    ) -> dict[str, Any] | None:
+        if station_id not in self.stations:
+            return None
+        ev = str(event_type or "SKIP").strip().upper()
+        track = self.db.get_track(track_id=track_dict.get("track_id"), video_id=track_dict.get("video_id"))
+        if track is None:
+            return None
+        seen_artists = self.db.get_seen_artists(station_id)
+        is_new_artist = normalize_artist(track.artist) not in seen_artists
+        bandit = self.bandits[station_id]
+        reward = ContextualBanditRecommender.compute_reward(
+            ev,
+            listen_seconds=listen_seconds,
+            duration_seconds=duration_seconds,
+        )
+        feedback_id = self.db.record_feedback(
+            station_id=station_id,
+            track=track,
+            event_type=ev,
+            reward=reward,
+            listen_seconds=listen_seconds,
+            duration_seconds=duration_seconds,
+        )
+        try:
+            bandit.update(
+                track,
+                event_type=ev,
+                listen_seconds=listen_seconds,
+                duration_seconds=duration_seconds,
+                is_new_artist=is_new_artist,
+            )
+        except Exception:
+            self.db.delete_feedback(feedback_id)
+            raise
+        return {"status": "ok", "event_type": ev, "reward": reward, "model_updates": bandit.n_updates}
 
     @property
     def yt_adapter(self) -> YouTubeMusicAdapter:
@@ -465,6 +551,7 @@ def create_app(
     auto_dig: bool = True,
     audio_resolver: AudioStreamResolver | None = None,
     audio_http_factory: Callable[[], httpx.Client] | None = None,
+    mpv_player: MpvLocalPlayer | None = None,
 ) -> FastAPI:
     """Create configured FastAPI application."""
     runtime = RadioRuntime(
@@ -476,9 +563,17 @@ def create_app(
         auto_dig=auto_dig,
         audio_resolver=audio_resolver,
         audio_http_factory=audio_http_factory,
+        mpv_player=mpv_player,
     )
 
-    app = FastAPI(title="Hidden Gem Radio", version="0.2.0")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            runtime.mpv_player.shutdown()
+
+    app = FastAPI(title="Hidden Gem Radio", version="0.3.0", lifespan=lifespan)
     app.state.runtime = runtime
 
     @app.get("/", response_class=HTMLResponse)
@@ -493,7 +588,59 @@ def create_app(
             "status": "ok",
             "station_count": len(runtime.stations),
             "audio_stream_available": runtime.audio_resolver.is_available(),
+            "mpv_available": runtime.mpv_player.is_available(),
         }
+
+    # --- Server-side Native mpv Remote Control Endpoints ---
+    @app.get("/api/local-player/state")
+    def api_local_player_state() -> dict[str, Any]:
+        return runtime.mpv_player.get_state()
+
+    @app.post("/api/local-player/play")
+    def api_local_player_play(req: LocalPlayerPlayRequest | None = None) -> dict[str, Any]:
+        if not runtime.mpv_player.is_available():
+            raise HTTPException(status_code=503, detail="mpv is not available on this host")
+        body = req or LocalPlayerPlayRequest()
+        sid = body.station_id or runtime._active_station_id or (next(iter(runtime.stations.keys())) if runtime.stations else None)
+        if not sid or sid not in runtime.stations:
+            raise HTTPException(status_code=404, detail="Station not found")
+        runtime._active_station_id = sid
+        return runtime.mpv_player.play(sid, track=body.track)
+
+    @app.post("/api/local-player/toggle")
+    def api_local_player_toggle(req: LocalPlayerToggleRequest | None = None) -> dict[str, Any]:
+        if not runtime.mpv_player.is_available():
+            raise HTTPException(status_code=503, detail="mpv is not available on this host")
+        body = req or LocalPlayerToggleRequest()
+        sid = body.station_id or runtime._active_station_id or (next(iter(runtime.stations.keys())) if runtime.stations else None)
+        if sid and sid in runtime.stations:
+            runtime._active_station_id = sid
+        return runtime.mpv_player.toggle_pause(station_id=sid)
+
+    @app.post("/api/local-player/stop")
+    def api_local_player_stop() -> dict[str, Any]:
+        return runtime.mpv_player.stop()
+
+    @app.post("/api/local-player/next")
+    def api_local_player_next(req: LocalPlayerNextRequest | None = None) -> dict[str, Any]:
+        if not runtime.mpv_player.is_available():
+            raise HTTPException(status_code=503, detail="mpv is not available on this host")
+        body = req or LocalPlayerNextRequest()
+        sid = body.station_id or runtime._active_station_id
+        return runtime.mpv_player.next_track(event_type=body.event_type, station_id=sid)
+
+    @app.post("/api/local-player/seek")
+    def api_local_player_seek(req: LocalPlayerSeekRequest) -> dict[str, Any]:
+        if not runtime.mpv_player.is_available():
+            raise HTTPException(status_code=503, detail="mpv is not available on this host")
+        return runtime.mpv_player.seek(req.position_sec)
+
+    @app.post("/api/local-player/mute")
+    def api_local_player_mute(req: LocalPlayerMuteRequest | None = None) -> dict[str, Any]:
+        if not runtime.mpv_player.is_available():
+            raise HTTPException(status_code=503, detail="mpv is not available on this host")
+        body = req or LocalPlayerMuteRequest()
+        return runtime.mpv_player.toggle_mute(muted=body.muted)
 
     @app.get("/api/audio/{video_id}")
     def api_proxy_audio_stream(video_id: str, request: Request) -> StreamingResponse:
