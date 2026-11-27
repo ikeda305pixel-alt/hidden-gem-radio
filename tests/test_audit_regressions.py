@@ -258,7 +258,7 @@ vm.runInContext(
   api.state.player._state = YTStub.PlayerState.UNSTARTED;
   api.state.player._time = 0;
   api.playTrack(trackAutoplay);
-  await advanceTime(8000);
+  await advanceTime(16000);
   assert.strictEqual(
     fetchCalls.filter((c) => c.url.includes("/unplayable")).length,
     0,
@@ -277,20 +277,26 @@ vm.runInContext(
   assert.strictEqual(api.state.hasUserPlaybackStarted, true);
   api.state.player._state = YTStub.PlayerState.PAUSED;
   await api.state.player._config.events.onStateChange({ data: YTStub.PlayerState.PAUSED });
-  await advanceTime(9000);
+  await advanceTime(16000);
   assert.strictEqual(
     fetchCalls.filter((c) => c.url.includes("/unplayable")).length,
     0,
     "Confirmed + paused track must NOT be blacklisted by watchdog"
   );
 
-  // Genuine stall after user playback started -> watchdog MUST call /unplayable
+  // Genuine stall after user playback started -> 15s + 1x BUFFERING grace (30s total) MUST call /unplayable
   fetchCalls.length = 0;
   const trackStalled = { track_id: "t_stall", video_id: "VID_STALL_01", artist: "Art C", title: "Stall" };
   api.state.player._state = YTStub.PlayerState.BUFFERING;
   api.state.player._time = 0;
   api.playTrack(trackStalled);
-  await advanceTime(7500);
+  await advanceTime(15500);
+  assert.strictEqual(
+    fetchCalls.filter((c) => c.url.includes("/api/tracks/VID_STALL_01/unplayable")).length,
+    0,
+    "4G BUFFERING must receive 1x grace extension at 15s before skipping"
+  );
+  await advanceTime(15500);
   assert.strictEqual(
     fetchCalls.filter((c) => c.url.includes("/api/tracks/VID_STALL_01/unplayable")).length,
     1,

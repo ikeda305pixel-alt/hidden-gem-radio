@@ -585,6 +585,10 @@
       retryTimerId: null,
       watchdogTimerId: null,
       watchdogPollId: null,
+      watchdogBufferingExtended: false,
+      playlistTracks: [],
+      playlistIndex: -1,
+      playlistTrackMap: new Map(),
       playlists: [],
       selectedGoodPlaylistId: "pl_favorites",
       viewingPlaylistId: "pl_favorites",
@@ -595,7 +599,8 @@
     const MAX_CONSECUTIVE_ERRORS = 4;
     const MAX_CONSECUTIVE_EMBED_SKIPS = 10;
     const RETRY_BACKOFF_MS = 3000;
-    const PLAYBACK_WATCHDOG_MS = 7000;
+    const PLAYBACK_WATCHDOG_MS = 15000;
+    const PLAYLIST_BATCH_SIZE = 6;
     const WATCHDOG_MIN_PLAY_SEC = 0.3;
     const EMPTY_BATCH_COOLDOWN_MS = 2500;
     const IMPLICIT_COMPLETE_RATIO = 0.70;
@@ -664,6 +669,10 @@
       }
     }
 
+    function isDocumentHidden() {
+      return typeof document !== "undefined" && Boolean(document.hidden);
+    }
+
     function confirmTrackPlayback(videoId) {
       if (!videoId) return;
       state.trackConfirmedPlayingVideoId = videoId;
@@ -671,6 +680,7 @@
       state.consecutiveErrors = 0;
       state.consecutiveEmbedSkips = 0;
       state.circuitBroken = false;
+      state.watchdogBufferingExtended = false;
       clearPlaybackWatchdog();
       updatePlayMuteButton();
     }
@@ -687,14 +697,23 @@
       state.emptyBatchCooldown = { stationId: null, epoch: -1, until: 0 };
     }
 
-    // 7-second stall watchdog: auto-skip 0:00/0:00 stalled videos without false blacklisting
-    function armPlaybackWatchdog(track) {
+    // 15-second stall watchdog (with 1x BUFFERING grace extension & complete pause while document.hidden)
+    function armPlaybackWatchdog(track, isBufferingExtension = false) {
       clearPlaybackWatchdog();
       if (!track || !track.video_id) return;
       const expectedVideoId = track.video_id;
       if (state.trackConfirmedPlayingVideoId === expectedVideoId) return;
+      if (!isBufferingExtension) {
+        state.watchdogBufferingExtended = false;
+      }
+      // Never arm or fire stall watchdog while app/tab is in background (e.g. LINE switch / screen off)
+      if (isDocumentHidden()) return;
 
       state.watchdogPollId = setInterval(() => {
+        if (isDocumentHidden()) {
+          clearPlaybackWatchdog();
+          return;
+        }
         if (!state.player || !state.playerReady) return;
         if (!state.currentTrack || state.currentTrack.video_id !== expectedVideoId) {
           clearPlaybackWatchdog();
@@ -709,6 +728,8 @@
 
       state.watchdogTimerId = setTimeout(async () => {
         clearPlaybackWatchdog();
+        // Background guard: never skip, count error, or trip circuit breaker while document.hidden
+        if (isDocumentHidden()) return;
         if (!state.currentTrack || state.currentTrack.video_id !== expectedVideoId) return;
         if (state.trackConfirmedPlayingVideoId === expectedVideoId) return;
 
@@ -720,20 +741,25 @@
         }
         if (pState === YT.PlayerState.PAUSED) return;
 
+        // 4G buffering grace: extend watchdog once if player is actively BUFFERING
+        if (pState === YT.PlayerState.BUFFERING && !state.watchdogBufferingExtended) {
+          state.watchdogBufferingExtended = true;
+          setStatus("バッファリング中…（4G猶予延長）");
+          armPlaybackWatchdog(track, true);
+          return;
+        }
+
         const isUnstartedOrCued =
           pState === YT.PlayerState.UNSTARTED ||
           pState === YT.PlayerState.CUED ||
           pState === -1;
-        // Do not falsely blacklist tracks blocked by browser autoplay policy or hidden background tab before first play
+        // Do not falsely skip tracks blocked by browser autoplay policy before first user play
         if (!state.hasUserPlaybackStarted && isUnstartedOrCued) {
           setStatus("自動再生待機中（▶ 再生をタップして開始）");
           return;
         }
-        if (typeof document !== "undefined" && document.hidden && !state.hasUserPlaybackStarted && isUnstartedOrCued) {
-          return;
-        }
 
-        await handleUnplayableSkip(state.currentTrack, "stall_watchdog_7s", null);
+        await handleUnplayableSkip(state.currentTrack, "stall_watchdog_15s", null);
       }, PLAYBACK_WATCHDOG_MS);
     }
 
@@ -769,6 +795,7 @@
             : [],
         });
       } catch (_) {}
+      initMediaSessionHandlers();
     }
 
     function initMediaSessionHandlers() {
@@ -818,12 +845,29 @@
       }
     }
 
+    function getUpcomingTracks() {
+      const inPlaylist =
+        state.playlistIndex >= 0 && state.playlistTracks.length > state.playlistIndex + 1
+          ? state.playlistTracks.slice(state.playlistIndex + 1)
+          : [];
+      const seen = new Set(inPlaylist.map((t) => t.track_id));
+      const merged = [...inPlaylist];
+      for (const item of state.queue) {
+        if (!seen.has(item.track_id)) {
+          seen.add(item.track_id);
+          merged.push(item);
+        }
+      }
+      return merged;
+    }
+
     function renderQueue() {
-      if (!state.queue.length) {
+      const upcoming = getUpcomingTracks();
+      if (!upcoming.length) {
         el.queueList.innerHTML = '<li class="queue-item"><span>次曲を先読み中...</span></li>';
         return;
       }
-      el.queueList.innerHTML = state.queue
+      el.queueList.innerHTML = upcoming
         .slice(0, 3)
         .map((item, i) => {
           const route = item.discovery_route || item.reason?.mode || "探索";
@@ -946,7 +990,7 @@
     }
 
     // [M2 / Bug #5 / Audit #11] Share in-flight prefetch Promise with callerEpoch & empty-batch cooldown guards
-    async function ensurePrefetchQueue(targetSize = 3) {
+    async function ensurePrefetchQueue(targetSize = PLAYLIST_BATCH_SIZE) {
       const callerStationId = state.activeStationId;
       const callerEpoch = state.prefetchEpoch;
       if (!callerStationId) return;
@@ -972,10 +1016,16 @@
       let currentPromise = null;
       currentPromise = (async () => {
         try {
-          const exclude = [
+          const activePlaylistIds =
+            state.playlistIndex >= 0
+              ? state.playlistTracks.slice(state.playlistIndex).map((t) => t.track_id)
+              : [];
+          const excludeSet = new Set([
             ...(state.currentTrack ? [state.currentTrack.track_id] : []),
+            ...activePlaylistIds,
             ...state.queue.map((t) => t.track_id),
-          ].join(",");
+          ]);
+          const exclude = Array.from(excludeSet).filter(Boolean).join(",");
           const need = Math.max(1, targetSize - state.queue.length);
           const data = await fetchJson(
             `/api/stations/${encodeURIComponent(stationId)}/batch?count=${need}&exclude=${encodeURIComponent(exclude)}`
@@ -995,7 +1045,10 @@
               if (artistNorm && state.blockedArtists.has(artistNorm)) {
                 continue;
               }
-              if (!state.queue.some((q) => q.track_id === item.track_id)) {
+              if (
+                !state.queue.some((q) => q.track_id === item.track_id) &&
+                !state.playlistTracks.some((p, idx) => idx >= Math.max(0, state.playlistIndex) && p.track_id === item.track_id)
+              ) {
                 state.queue.push(item);
               }
             }
@@ -1013,29 +1066,171 @@
       await currentPromise;
     }
 
+    function resetActivePlaylist() {
+      state.playlistTracks = [];
+      state.playlistIndex = -1;
+      state.playlistTrackMap.clear();
+    }
+
     function playTrack(track) {
       clearPlaybackWatchdog();
       state.currentTrack = track;
       state.currentRatedGood = false;
       state.implicitFeedbackSentVideoId = null;
       state.trackConfirmedPlayingVideoId = null;
-      renderNowPlaying(track);
-      renderQueue();
+      state.watchdogBufferingExtended = false;
 
       if (track) {
         clearRetryTimer();
+        const canUsePlaylist = Boolean(
+          state.player && state.playerReady && typeof state.player.loadPlaylist === "function"
+        );
+        const batch = [track];
+        if (canUsePlaylist) {
+          const seenIds = new Set([track.video_id]);
+          const remainingQueue = [];
+          for (const qItem of state.queue) {
+            const artistNorm = normalizeArtistName(qItem.artist);
+            if (artistNorm && state.blockedArtists.has(artistNorm)) {
+              continue;
+            }
+            if (batch.length < PLAYLIST_BATCH_SIZE && qItem.video_id && !seenIds.has(qItem.video_id)) {
+              seenIds.add(qItem.video_id);
+              batch.push(qItem);
+            } else {
+              remainingQueue.push(qItem);
+            }
+          }
+          state.queue = remainingQueue;
+        }
+        state.playlistTracks = batch;
+        state.playlistIndex = 0;
+        state.playlistTrackMap.clear();
+        for (const item of batch) {
+          if (item && item.video_id) {
+            state.playlistTrackMap.set(item.video_id, item);
+          }
+        }
+
+        renderNowPlaying(track);
+        renderQueue();
+
         if (state.player && state.playerReady) {
-          state.player.loadVideoById(track.video_id);
+          if (canUsePlaylist && batch.length >= 2) {
+            state.player.loadPlaylist(
+              batch.map((t) => t.video_id),
+              0
+            );
+          } else {
+            state.player.loadVideoById(track.video_id);
+          }
           setStatus("ON AIR");
           armPlaybackWatchdog(track);
         }
-        ensurePrefetchQueue(3);
+        if (getUpcomingTracks().length < 3) {
+          ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
+        }
       } else {
+        resetActivePlaylist();
+        renderNowPlaying(null);
+        renderQueue();
         stopPlayerSafely();
         if (!state.circuitBroken) {
           scheduleQueueRetry();
         }
       }
+    }
+
+    function sendKeepaliveComplete(track, stationId) {
+      if (!track || !stationId || !track.video_id) return;
+      if (state.implicitFeedbackSentVideoId === track.video_id) return;
+      state.implicitFeedbackSentVideoId = track.video_id;
+      const durationSeconds = Number(track.duration_seconds || 0) || null;
+      const payload = JSON.stringify({
+        station_id: stationId,
+        track_id: track.track_id,
+        video_id: track.video_id,
+        event_type: "COMPLETE",
+        listen_seconds: durationSeconds || 180,
+        duration_seconds: durationSeconds,
+      });
+      try {
+        Promise.resolve(
+          fetch("/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload,
+            keepalive: true,
+          })
+        )
+          .then((res) => {
+            if (res && res.ok && state.activeStationId === stationId) {
+              refreshTheoryProfile();
+            }
+          })
+          .catch(() => {});
+      } catch (_) {}
+    }
+
+    function syncTrackFromPlayerIfChanged() {
+      if (!state.player || !state.playerReady) return false;
+      const videoData =
+        typeof state.player.getVideoData === "function" ? state.player.getVideoData() : null;
+      const playerVid = videoData && videoData.video_id ? String(videoData.video_id) : null;
+      const playerIdx =
+        typeof state.player.getPlaylistIndex === "function"
+          ? Number(state.player.getPlaylistIndex())
+          : -1;
+
+      if (!playerVid || !state.currentTrack || playerVid === state.currentTrack.video_id) {
+        return false;
+      }
+
+      let nextTrack = state.playlistTrackMap.get(playerVid) || null;
+      let resolvedIdx = playerIdx;
+      if (!nextTrack && playerIdx >= 0 && playerIdx < state.playlistTracks.length) {
+        const candidate = state.playlistTracks[playerIdx];
+        if (candidate && candidate.video_id === playerVid) {
+          nextTrack = candidate;
+        }
+      }
+      if (!nextTrack) {
+        const foundIdx = state.playlistTracks.findIndex((t) => t && t.video_id === playerVid);
+        if (foundIdx >= 0) {
+          nextTrack = state.playlistTracks[foundIdx];
+          resolvedIdx = foundIdx;
+        }
+      }
+      if (!nextTrack) return false;
+
+      const prevTrack = state.currentTrack;
+      const prevStationId = state.activeStationId;
+      if (
+        prevTrack &&
+        prevStationId &&
+        !state.currentRatedGood &&
+        state.trackConfirmedPlayingVideoId === prevTrack.video_id &&
+        state.implicitFeedbackSentVideoId !== prevTrack.video_id
+      ) {
+        // Non-blocking keepalive COMPLETE without awaiting before next track UI/playback sync
+        sendKeepaliveComplete(prevTrack, prevStationId);
+      }
+
+      clearPlaybackWatchdog();
+      state.currentTrack = nextTrack;
+      state.playlistIndex = resolvedIdx >= 0 ? resolvedIdx : state.playlistTracks.indexOf(nextTrack);
+      state.currentRatedGood = false;
+      state.implicitFeedbackSentVideoId = null;
+      state.trackConfirmedPlayingVideoId = null;
+      state.watchdogBufferingExtended = false;
+      renderNowPlaying(nextTrack);
+      renderQueue();
+      setStatus("ON AIR");
+
+      if (getUpcomingTracks().length <= 2) {
+        ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
+      }
+      return true;
     }
 
     async function sendImplicitPlaybackFeedback(isManualSkip, targetTrack = null, targetStationId = null) {
@@ -1088,6 +1283,7 @@
               listen_seconds: listenSeconds,
               duration_seconds: durationSeconds || null,
             }),
+            keepalive: true,
           },
           5500
         );
@@ -1095,6 +1291,42 @@
           refreshTheoryProfile();
         }
       } catch (_) {}
+    }
+
+    async function advanceOrPlayNext() {
+      const canNextVideo = Boolean(
+        state.player &&
+          state.playerReady &&
+          typeof state.player.nextVideo === "function" &&
+          state.playlistIndex >= 0 &&
+          state.playlistIndex + 1 < state.playlistTracks.length
+      );
+      if (canNextVideo) {
+        const nextIdx = state.playlistIndex + 1;
+        const nextTrack = state.playlistTracks[nextIdx];
+        const artistNorm = nextTrack ? normalizeArtistName(nextTrack.artist) : "";
+        if (nextTrack && (!artistNorm || !state.blockedArtists.has(artistNorm))) {
+          clearPlaybackWatchdog();
+          clearRetryTimer();
+          state.playlistIndex = nextIdx;
+          state.currentTrack = nextTrack;
+          state.currentRatedGood = false;
+          state.implicitFeedbackSentVideoId = null;
+          state.trackConfirmedPlayingVideoId = null;
+          state.watchdogBufferingExtended = false;
+          renderNowPlaying(nextTrack);
+          renderQueue();
+          state.player.nextVideo();
+          setStatus("ON AIR");
+          armPlaybackWatchdog(nextTrack);
+          if (getUpcomingTracks().length <= 2) {
+            ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
+          }
+          return;
+        }
+      }
+      resetActivePlaylist();
+      await playNextFromQueue();
     }
 
     async function handleManualSkip() {
@@ -1117,7 +1349,7 @@
         if (state.activeStationId !== stationAtSkip || state.prefetchEpoch !== epochAtSkip) {
           return;
         }
-        await playNextFromQueue();
+        await advanceOrPlayNext();
       } finally {
         state.skippingInProgress = false;
       }
@@ -1125,7 +1357,7 @@
 
     async function playNextFromQueue() {
       if (!state.queue.length) {
-        await ensurePrefetchQueue(3);
+        await ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
       }
       const next = state.queue.shift() || null;
       playTrack(next);
@@ -1144,6 +1376,10 @@
 
     async function handleUnplayableSkip(failedTrack, reason, ytErrorCode) {
       if (state.circuitBroken || !failedTrack) return;
+      const isWatchdogReason = String(reason || "").startsWith("stall_watchdog");
+      // Never skip or increment error count due to watchdog while tab is hidden in background
+      if (isWatchdogReason && isDocumentHidden()) return;
+
       const failedVideoId = failedTrack?.video_id || null;
       if (failedVideoId && state.handlingUnplayableVideoId === failedVideoId) return;
       const stationAtFail = state.activeStationId;
@@ -1210,6 +1446,7 @@
           if (state.consecutiveEmbedSkips >= MAX_CONSECUTIVE_EMBED_SKIPS) {
             state.circuitBroken = true;
             state.currentTrack = null;
+            resetActivePlaylist();
             clearRetryTimer();
             stopPlayerSafely();
             renderNowPlaying(null);
@@ -1219,13 +1456,14 @@
             setStatus(
               `埋め込み制限のため次曲へスキップ (${state.consecutiveEmbedSkips}/${MAX_CONSECUTIVE_EMBED_SKIPS})`
             );
-            await playNextFromQueue();
+            await advanceOrPlayNext();
           }
         } else {
           state.consecutiveErrors += 1;
           if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
             state.circuitBroken = true;
             state.currentTrack = null;
+            resetActivePlaylist();
             clearRetryTimer();
             stopPlayerSafely();
             renderNowPlaying(null);
@@ -1239,9 +1477,11 @@
             setStatus(
               isReferrerConfigError
                 ? "埋め込み設定/Referrerエラー(153)のため次曲へスキップ"
-                : "再生不可を自動スキップ（学習非汚染）"
+                : isWatchdogReason
+                  ? "読込遅延のため次曲へスキップ（ブラックリスト非登録）"
+                  : "再生不可を自動スキップ（学習非汚染）"
             );
-            await playNextFromQueue();
+            await advanceOrPlayNext();
           }
         }
       } finally {
@@ -1298,6 +1538,7 @@
     async function switchStation(stationId) {
       clearRetryTimer();
       clearPlaybackWatchdog();
+      resetActivePlaylist();
       state.activeStationId = stationId;
       state.queue = [];
       state.currentTrack = null;
@@ -1306,6 +1547,7 @@
       state.consecutiveErrors = 0;
       state.consecutiveEmbedSkips = 0;
       state.circuitBroken = false;
+      state.watchdogBufferingExtended = false;
       state.blockedArtists = new Set();
       state.prefetchEpoch += 1;
       state.prefetchPromise = null;
@@ -1316,8 +1558,50 @@
       renderStations();
       setStatus("チューニング中...");
       refreshTheoryProfile();
-      await ensurePrefetchQueue(3);
+      await ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
       await playNextFromQueue();
+    }
+
+    // Foreground recovery when returning from background (e.g. LINE switch / screen unlock)
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      document.addEventListener("visibilitychange", async () => {
+        if (isDocumentHidden()) {
+          clearPlaybackWatchdog();
+          return;
+        }
+        if (!state.hasUserPlaybackStarted || state.circuitBroken) return;
+        if (!state.player || !state.playerReady) return;
+        syncTrackFromPlayerIfChanged();
+        if (!state.currentTrack) {
+          await playNextFromQueue();
+          return;
+        }
+        const pState = state.player.getPlayerState();
+        if (
+          pState === YT.PlayerState.CUED ||
+          pState === YT.PlayerState.UNSTARTED ||
+          pState === -1
+        ) {
+          if (typeof state.player.playVideo === "function") {
+            try {
+              state.player.playVideo();
+            } catch (_) {}
+          }
+          if (state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id) {
+            armPlaybackWatchdog(state.currentTrack);
+          }
+          updatePlayMuteButton();
+        } else if (pState === YT.PlayerState.ENDED) {
+          resetEmptyBatchCooldown();
+          await playNextFromQueue();
+        } else if (
+          pState === YT.PlayerState.BUFFERING &&
+          state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
+          state.watchdogTimerId === null
+        ) {
+          armPlaybackWatchdog(state.currentTrack);
+        }
+      });
     }
 
     // YouTube IFrame Player API Hooks
@@ -1340,12 +1624,20 @@
           onReady: () => {
             state.playerReady = true;
             if (state.currentTrack) {
-              state.player.loadVideoById(state.currentTrack.video_id);
+              if (typeof state.player.loadPlaylist === "function" && state.playlistTracks.length >= 2) {
+                state.player.loadPlaylist(
+                  state.playlistTracks.map((t) => t.video_id),
+                  Math.max(0, state.playlistIndex)
+                );
+              } else {
+                state.player.loadVideoById(state.currentTrack.video_id);
+              }
               armPlaybackWatchdog(state.currentTrack);
             }
           },
           onStateChange: async (event) => {
             if (event.data === YT.PlayerState.PLAYING) {
+              syncTrackFromPlayerIfChanged();
               updatePlayMuteButton();
               if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
               const curSec = state.player && state.playerReady ? Number(state.player.getCurrentTime() || 0) : 0;
@@ -1358,6 +1650,8 @@
               ) {
                 armPlaybackWatchdog(state.currentTrack);
               }
+            } else if (event.data === YT.PlayerState.BUFFERING) {
+              syncTrackFromPlayerIfChanged();
             } else if (event.data === YT.PlayerState.PAUSED) {
               clearPlaybackWatchdog();
               updatePlayMuteButton();
@@ -1365,6 +1659,7 @@
                 navigator.mediaSession.playbackState = "paused";
               }
             } else if (event.data === YT.PlayerState.CUED) {
+              syncTrackFromPlayerIfChanged();
               if (state.hasUserPlaybackStarted && state.currentTrack && !state.circuitBroken) {
                 // Android Brave/mobile often stalls in CUED after loadVideoById; force playVideo() and keep watchdog armed
                 if (state.player && state.playerReady && typeof state.player.playVideo === "function") {
@@ -1389,6 +1684,25 @@
               const endedTrack = state.currentTrack;
               const endedStationId = state.activeStationId;
               const endedEpoch = state.prefetchEpoch;
+              const hasNativeNextInPlaylist =
+                typeof state.player?.loadPlaylist === "function" &&
+                state.playlistIndex >= 0 &&
+                state.playlistIndex + 1 < state.playlistTracks.length;
+
+              if (hasNativeNextInPlaylist) {
+                // YouTube IFrame playlist will auto-advance to next video even in background;
+                // fire non-blocking keepalive COMPLETE without interrupting native playlist flow
+                if (
+                  endedTrack &&
+                  endedStationId &&
+                  !state.currentRatedGood &&
+                  state.trackConfirmedPlayingVideoId === endedTrack.video_id
+                ) {
+                  sendKeepaliveComplete(endedTrack, endedStationId);
+                }
+                return;
+              }
+
               try {
                 await sendImplicitPlaybackFeedback(false, endedTrack, endedStationId);
               } catch (_) {}
@@ -1396,7 +1710,7 @@
                 return;
               }
               if (!state.queue.length) {
-                await ensurePrefetchQueue(3);
+                await ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
               }
               if (state.activeStationId !== endedStationId || state.prefetchEpoch !== endedEpoch) {
                 return;
@@ -1404,8 +1718,9 @@
               if (!state.queue.length) {
                 // 1-track inventory recovery: clear currentTrack so /batch exclude does not block heard_fallback
                 state.currentTrack = null;
+                resetActivePlaylist();
                 resetEmptyBatchCooldown();
-                await ensurePrefetchQueue(3);
+                await ensurePrefetchQueue(PLAYLIST_BATCH_SIZE);
               }
               if (state.activeStationId !== endedStationId || state.prefetchEpoch !== endedEpoch) {
                 return;
@@ -1545,7 +1860,7 @@
           return;
         }
         setStatus("👎 安定MIR学習反映 · 次曲へ");
-        await playNextFromQueue();
+        await advanceOrPlayNext();
       } finally {
         state.skippingInProgress = false;
       }

@@ -261,6 +261,9 @@ class RadioDatabase:
                 else:
                     conn.execute("DELETE FROM station_profiles WHERE station_id = ?", (old_id,))
 
+            # Auto-cleanup legacy stall_watchdog_* false blacklist entries from transient network/background stalls
+            conn.execute("DELETE FROM unplayable_blacklist WHERE reason LIKE 'stall_watchdog%'")
+
     def upsert_track(self, station_id: str, track: TrackEntity) -> str:
         """Insert or merge a platform-agnostic track and associate it with station_id."""
         now = time.time()

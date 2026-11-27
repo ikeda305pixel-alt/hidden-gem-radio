@@ -585,7 +585,12 @@ def create_app(
 
         body = req or UnplayableRequest()
         target_station_id = station_id_override or body.station_id
-        is_transient = body.yt_error_code in _TRANSIENT_YT_ERROR_CODES
+        is_watchdog_stall = str(body.reason or "").strip().lower().startswith("stall_watchdog")
+        is_transient = (
+            body.yt_error_code in _TRANSIENT_YT_ERROR_CODES
+            or is_watchdog_stall
+            or body.yt_error_code is None
+        )
         is_permanent = body.yt_error_code in _PERMANENT_YT_UNPLAYABLE_CODES
         expires_at: float | None = None
 

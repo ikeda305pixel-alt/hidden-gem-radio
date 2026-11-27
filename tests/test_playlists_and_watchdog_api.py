@@ -43,11 +43,12 @@ def test_unplayable_endpoint_blacklists_30d_without_polluting_bad_learning(tmp_p
     client = TestClient(app)
     res = client.post(
         "/api/tracks/STALLED_VID_01/unplayable",
-        json={"station_id": "edm_dance_party", "reason": "stall_watchdog_7s", "ttl_days": 30},
+        json={"station_id": "edm_dance_party", "reason": "yt_error_150", "yt_error_code": 150, "ttl_days": 30},
     )
     assert res.status_code == 200
     body = res.json()
     assert body["bad_learning_polluted"] is False
+    assert body["blacklisted"] is True
     assert body["blacklisted_days"] == 30
     assert body["replacement"]["video_id"] == "PLAYABLE_VID_02"
 
@@ -179,8 +180,10 @@ def test_youtube_hybrid_playlist_sync_fallback_and_authenticated_paths(tmp_path:
 
 def test_web_index_contains_watchdog_media_session_mobile_bar_and_dna_ui() -> None:
     html = Path("web/index.html").read_text(encoding="utf-8")
-    assert "PLAYBACK_WATCHDOG_MS = 7000" in html
-    assert "stall_watchdog_7s" in html
+    assert "PLAYBACK_WATCHDOG_MS = 15000" in html
+    assert "stall_watchdog_15s" in html
+    assert "loadPlaylist" in html
+    assert "visibilitychange" in html
     assert "/unplayable" in html
     assert "navigator.mediaSession" in html
     assert "while (state.prefetchPromise)" in html
