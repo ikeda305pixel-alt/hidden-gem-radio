@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from src.adapters.audio_stream import AudioStreamResolver
 from src.adapters.deezer import DeezerClient
 from src.adapters.youtube import YouTubeMusicAdapter
 from src.db import RadioDatabase, sanitize_video_id
@@ -112,12 +116,18 @@ class RadioRuntime:
         browser_auth_path: Path | str = PROJECT_ROOT / "config/browser.json",
         web_index_path: Path | str = PROJECT_ROOT / "web/index.html",
         auto_dig: bool = True,
+        audio_resolver: AudioStreamResolver | None = None,
+        audio_http_factory: Callable[[], httpx.Client] | None = None,
     ) -> None:
         self.stations_path = Path(stations_path)
         self.model_dir = Path(model_dir)
         self.browser_auth_path = Path(browser_auth_path)
         self.web_index_path = Path(web_index_path)
         self.auto_dig = auto_dig
+        self.audio_resolver = audio_resolver or AudioStreamResolver()
+        self.audio_http_factory: Callable[[], httpx.Client] = audio_http_factory or (
+            lambda: httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0), follow_redirects=True)
+        )
 
         self.db = RadioDatabase(db_path)
         self.theory_extractor = TheoryFeatureExtractor()
@@ -453,6 +463,8 @@ def create_app(
     browser_auth_path: Path | str = PROJECT_ROOT / "config/browser.json",
     web_index_path: Path | str = PROJECT_ROOT / "web/index.html",
     auto_dig: bool = True,
+    audio_resolver: AudioStreamResolver | None = None,
+    audio_http_factory: Callable[[], httpx.Client] | None = None,
 ) -> FastAPI:
     """Create configured FastAPI application."""
     runtime = RadioRuntime(
@@ -462,6 +474,8 @@ def create_app(
         browser_auth_path=browser_auth_path,
         web_index_path=web_index_path,
         auto_dig=auto_dig,
+        audio_resolver=audio_resolver,
+        audio_http_factory=audio_http_factory,
     )
 
     app = FastAPI(title="Hidden Gem Radio", version="0.2.0")
@@ -475,7 +489,105 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "station_count": len(runtime.stations)}
+        return {
+            "status": "ok",
+            "station_count": len(runtime.stations),
+            "audio_stream_available": runtime.audio_resolver.is_available(),
+        }
+
+    @app.get("/api/audio/{video_id}")
+    def api_proxy_audio_stream(video_id: str, request: Request) -> StreamingResponse:
+        clean_vid = sanitize_video_id(video_id)
+        if clean_vid is None:
+            raise HTTPException(status_code=400, detail="Invalid YouTube video_id format")
+        if not runtime.audio_resolver.is_available():
+            raise HTTPException(status_code=503, detail="yt-dlp is not available on this host")
+
+        stream_info = runtime.audio_resolver.resolve(clean_vid)
+        if stream_info is None:
+            raise HTTPException(status_code=502, detail="Failed to extract audio stream URL")
+
+        range_header = request.headers.get("range")
+
+        def _open_upstream(info_obj: Any) -> tuple[httpx.Client, Any, httpx.Response]:
+            req_headers: dict[str, str] = {
+                "User-Agent": info_obj.http_headers.get(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+                ),
+            }
+            if range_header:
+                req_headers["Range"] = range_header
+            client = runtime.audio_http_factory()
+            try:
+                ctx = client.stream("GET", info_obj.url, headers=req_headers)
+                resp = ctx.__enter__()
+                return client, ctx, resp
+            except Exception:
+                client.close()
+                raise
+
+        client: httpx.Client | None = None
+        ctx: Any = None
+        upstream: httpx.Response | None = None
+        try:
+            client, ctx, upstream = _open_upstream(stream_info)
+            # If signed GoogleVideo URL expired (403/410), invalidate cache once and re-resolve
+            if upstream.status_code in {403, 410}:
+                ctx.__exit__(None, None, None)
+                client.close()
+                client = ctx = upstream = None
+                runtime.audio_resolver.invalidate(clean_vid)
+                refreshed = runtime.audio_resolver.resolve(clean_vid, force_refresh=True)
+                if refreshed is None:
+                    raise HTTPException(status_code=502, detail="Failed to refresh expired audio stream URL")
+                stream_info = refreshed
+                client, ctx, upstream = _open_upstream(stream_info)
+
+            if upstream.status_code >= 400:
+                status_code = upstream.status_code
+                ctx.__exit__(None, None, None)
+                client.close()
+                raise HTTPException(status_code=502, detail=f"Upstream audio returned HTTP {status_code}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if ctx is not None:
+                with suppress(Exception):
+                    ctx.__exit__(None, None, None)
+            if client is not None:
+                with suppress(Exception):
+                    client.close()
+            raise HTTPException(status_code=502, detail=f"Audio stream proxy error: {exc}") from exc
+
+        resp_headers: dict[str, str] = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+        }
+        for hdr in ("Content-Range", "Content-Length"):
+            val = upstream.headers.get(hdr)
+            if val:
+                resp_headers[hdr] = val
+        content_type = upstream.headers.get("Content-Type") or stream_info.mime_type or "audio/mp4"
+        out_status = 206 if upstream.status_code == 206 else 200
+
+        def _iter_audio_chunks() -> Iterator[bytes]:
+            try:
+                for chunk in upstream.iter_bytes(chunk_size=32768):
+                    if chunk:
+                        yield chunk
+            finally:
+                with suppress(Exception):
+                    ctx.__exit__(None, None, None)
+                with suppress(Exception):
+                    client.close()
+
+        return StreamingResponse(
+            _iter_audio_chunks(),
+            status_code=out_status,
+            media_type=content_type,
+            headers=resp_headers,
+        )
 
     @app.get("/stations")
     def list_stations() -> dict[str, Any]:
@@ -561,6 +673,10 @@ def create_app(
     ) -> dict[str, Any]:
         exclude_set = {item.strip() for item in exclude.split(",") if item.strip()}
         items = runtime.next_queue(station_id=station_id, count=count, exclude_ids=exclude_set)
+        if items:
+            prefetch_vids = [str(item.get("video_id") or "") for item in items[:3] if item.get("video_id")]
+            if prefetch_vids:
+                runtime.audio_resolver.prefetch_many(prefetch_vids, limit=3)
         return {"station_id": station_id, "count": len(items), "items": items}
 
     @app.get("/api/profile/theory")

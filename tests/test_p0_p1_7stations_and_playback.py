@@ -463,6 +463,7 @@ async function runAll() {
   }
 
   console.log(JSON.stringify({ ok: true }));
+  process.exit(0);
 }
 
 runAll().catch((err) => {
