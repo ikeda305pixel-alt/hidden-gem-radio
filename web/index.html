@@ -677,6 +677,8 @@
       userStopped: false,
       localPlayerState: null,
       localPollTimerId: null,
+      localControlEpoch: 0,
+      isSeekingAudioBar: false,
       consecutiveAudioErrors: 0,
       audioTrackRetryCount: 0,
       playlists: [],
@@ -758,8 +760,11 @@
       return `${m}:${r < 10 ? "0" : ""}${r}`;
     }
 
-    function updateAudioProgressUI(customPos = null, customDur = null) {
+    function updateAudioProgressUI(customPos = null, customDur = null, { fromDrag = false } = {}) {
       if (!el.audioSeekBar || !el.audioTimeLabel) return;
+      if (state.isSeekingAudioBar && !fromDrag) {
+        return;
+      }
       const cur =
         customPos !== null
           ? Number(customPos || 0)
@@ -769,10 +774,14 @@
           ? Number(customDur || state.currentTrack?.duration_seconds || 0)
           : Number(el.nativeAudioPlayer?.duration || state.currentTrack?.duration_seconds || 0);
       if (Number.isFinite(dur) && dur > 0) {
-        el.audioSeekBar.value = String(Math.min(100, Math.max(0, Math.round((cur / dur) * 100))));
+        if (!fromDrag) {
+          el.audioSeekBar.value = String(Math.min(100, Math.max(0, Math.round((cur / dur) * 100))));
+        }
         el.audioTimeLabel.textContent = `${formatTimeSec(cur)} / ${formatTimeSec(dur)}`;
       } else {
-        el.audioSeekBar.value = "0";
+        if (!fromDrag) {
+          el.audioSeekBar.value = "0";
+        }
         el.audioTimeLabel.textContent = `${formatTimeSec(cur)} / 0:00`;
       }
     }
@@ -810,8 +819,6 @@
             el.audioArtworkImg.src = `https://i.ytimg.com/vi/${encodeURIComponent(incomingTrack.video_id)}/hqdefault.jpg`;
           }
         }
-      } else if (lpState.stopped && state.currentTrack) {
-        // Keep last track info visible when stopped, just update status/buttons
       }
       renderQueue();
       updateAudioProgressUI(lpState.position_sec || 0, lpState.duration_sec || incomingTrack?.duration_seconds || 0);
@@ -827,11 +834,14 @@
 
     async function pollLocalPlayerStateOnce() {
       if (!isMpvModeActive()) return;
+      const epochAtStart = state.localControlEpoch;
       try {
         const lpState = await fetchJson("/api/local-player/state", {}, 4000);
-        if (isMpvModeActive()) {
-          syncFromLocalPlayerState(lpState);
+        // Discard stale in-flight poll response if a user control action occurred while polling
+        if (!isMpvModeActive() || state.localControlEpoch !== epochAtStart) {
+          return;
         }
+        syncFromLocalPlayerState(lpState);
       } catch (_) {}
     }
 
@@ -873,7 +883,7 @@
       }
     }
 
-    function setPlaybackMode(mode, { replayCurrent = false } = {}) {
+    async function setPlaybackMode(mode, { replayCurrent = false } = {}) {
       const wasMpv = state.playbackMode === "mpv";
       let resolved = "youtube";
       if (mode === "mpv" && state.mpvAvailable) {
@@ -886,10 +896,14 @@
         resolved = "audio";
       }
       state.playbackMode = resolved;
+      state.localControlEpoch += 1;
 
       if (wasMpv && resolved !== "mpv") {
         stopLocalPlayerPolling();
-        fetchJson("/api/local-player/stop", { method: "POST" }, 3000).catch(() => {});
+        // Await mpv stop BEFORE starting browser audio/YouTube to prevent double playback
+        try {
+          await fetchJson("/api/local-player/stop", { method: "POST" }, 3000);
+        } catch (_) {}
       }
       if (resolved === "mpv" || resolved === "audio") {
         clearPlaybackWatchdog();
@@ -913,17 +927,19 @@
       updatePlayMuteButton();
       if (replayCurrent && state.currentTrack && !state.userStopped) {
         if (resolved === "mpv" && state.activeStationId) {
-          fetchJson(
-            "/api/local-player/play",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ station_id: state.activeStationId, track: state.currentTrack }),
-            },
-            5000
-          )
-            .then((lp) => syncFromLocalPlayerState(lp))
-            .catch(() => {});
+          state.localControlEpoch += 1;
+          try {
+            const lp = await fetchJson(
+              "/api/local-player/play",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ station_id: state.activeStationId, track: state.currentTrack }),
+              },
+              5000
+            );
+            syncFromLocalPlayerState(lp);
+          } catch (_) {}
         } else {
           playTrack(state.currentTrack);
         }
@@ -1095,6 +1111,22 @@
       try {
         navigator.mediaSession.setActionHandler("play", () => {
           state.hasUserPlaybackStarted = true;
+          state.userStopped = false;
+          if (isMpvModeActive()) {
+            state.localControlEpoch += 1;
+            fetchJson(
+              "/api/local-player/toggle",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ station_id: state.activeStationId }),
+              },
+              5000
+            )
+              .then((lp) => syncFromLocalPlayerState(lp))
+              .catch(() => {});
+            return;
+          }
           if (isAudioModeActive()) {
             const p = el.nativeAudioPlayer.play();
             if (p && typeof p.catch === "function") p.catch(() => {});
@@ -1115,6 +1147,21 @@
         });
         navigator.mediaSession.setActionHandler("pause", () => {
           clearPlaybackWatchdog();
+          if (isMpvModeActive()) {
+            state.localControlEpoch += 1;
+            fetchJson(
+              "/api/local-player/toggle",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ station_id: state.activeStationId }),
+              },
+              5000
+            )
+              .then((lp) => syncFromLocalPlayerState(lp))
+              .catch(() => {});
+            return;
+          }
           if (isAudioModeActive()) {
             if (typeof el.nativeAudioPlayer.pause === "function") el.nativeAudioPlayer.pause();
             updatePlayMuteButton();
@@ -1127,6 +1174,10 @@
         });
         navigator.mediaSession.setActionHandler("stop", () => {
           clearPlaybackWatchdog();
+          if (isMpvModeActive()) {
+            handleHardStop();
+            return;
+          }
           if (isAudioModeActive()) {
             if (typeof el.nativeAudioPlayer.pause === "function") el.nativeAudioPlayer.pause();
             updatePlayMuteButton();
@@ -1691,6 +1742,7 @@
         state.userStopped = false;
         state.hasUserPlaybackStarted = true;
         if (isMpvModeActive()) {
+          state.localControlEpoch += 1;
           const lp = await fetchJson(
             "/api/local-player/next",
             {
@@ -1865,7 +1917,15 @@
       if (!state.currentTrack || !state.activeStationId) return null;
       let listenSeconds = null;
       let durationSeconds = state.currentTrack.duration_seconds || null;
-      if (state.player && state.playerReady && typeof state.player.getCurrentTime === "function") {
+      if (isMpvModeActive() && state.localPlayerState) {
+        listenSeconds = Number(state.localPlayerState.position_sec || 0);
+        const mpvDur = Number(state.localPlayerState.duration_sec || 0);
+        if (mpvDur > 0) durationSeconds = mpvDur;
+      } else if (isAudioModeActive() && el.nativeAudioPlayer) {
+        listenSeconds = Number(el.nativeAudioPlayer.currentTime || 0);
+        const audDur = Number(el.nativeAudioPlayer.duration || 0);
+        if (Number.isFinite(audDur) && audDur > 0) durationSeconds = audDur;
+      } else if (state.player && state.playerReady && typeof state.player.getCurrentTime === "function") {
         listenSeconds = Number(state.player.getCurrentTime() || 0);
         const ytDur = Number(state.player.getDuration() || 0);
         if (ytDur > 0) durationSeconds = ytDur;
@@ -1930,6 +1990,7 @@
       setStatus("チューニング中...");
       refreshTheoryProfile();
       if (isMpvModeActive()) {
+        state.localControlEpoch += 1;
         try {
           const lp = await fetchJson(
             "/api/local-player/play",
@@ -2028,6 +2089,8 @@
             }
           },
           onStateChange: async (event) => {
+            // Never let YouTube IFrame events double-play or hijack UI while mpv or HTML5 audio mode is active
+            if (isMpvModeActive() || isAudioModeActive()) return;
             if (event.data === YT.PlayerState.PLAYING) {
               syncTrackFromPlayerIfChanged();
               updatePlayMuteButton();
@@ -2052,7 +2115,7 @@
               }
             } else if (event.data === YT.PlayerState.CUED) {
               syncTrackFromPlayerIfChanged();
-              if (state.hasUserPlaybackStarted && state.currentTrack && !state.circuitBroken) {
+              if (!state.userStopped && state.hasUserPlaybackStarted && state.currentTrack && !state.circuitBroken) {
                 // Android Brave/mobile often stalls in CUED after loadVideoById; force playVideo() and keep watchdog armed
                 if (state.player && state.playerReady && typeof state.player.playVideo === "function") {
                   try {
@@ -2072,6 +2135,7 @@
               }
             } else if (event.data === YT.PlayerState.ENDED) {
               clearPlaybackWatchdog();
+              if (state.userStopped) return;
               resetEmptyBatchCooldown();
               const endedTrack = state.currentTrack;
               const endedStationId = state.activeStationId;
@@ -2121,6 +2185,7 @@
             }
           },
           onError: async (event) => {
+            if (isMpvModeActive() || isAudioModeActive()) return;
             // Silent auto-skip for YT error codes (2, 5, 100, 101, 150, 153) without polluting BAD learning
             await handleUnplayableSkip(state.currentTrack, `yt_error_${event.data}`, event.data);
           },
@@ -2161,6 +2226,7 @@
 
     async function handleHardStop() {
       state.userStopped = true;
+      state.localControlEpoch += 1;
       clearRetryTimer();
       clearPlaybackWatchdog();
       stopPlayerSafely();
@@ -2185,6 +2251,7 @@
       state.hasUserPlaybackStarted = true;
       state.userStopped = false;
       if (isMpvModeActive()) {
+        state.localControlEpoch += 1;
         try {
           const lp = await fetchJson(
             "/api/local-player/toggle",
@@ -2253,14 +2320,14 @@
     });
 
     if (el.btnModeToggle && typeof el.btnModeToggle.addEventListener === "function") {
-      el.btnModeToggle.addEventListener("click", () => {
+      el.btnModeToggle.addEventListener("click", async () => {
         const order = [];
         if (state.mpvAvailable) order.push("mpv");
         if (state.audioStreamAvailable) order.push("audio");
         order.push("youtube");
         const curIdx = order.indexOf(state.playbackMode);
         const nextMode = order[(curIdx + 1) % order.length];
-        setPlaybackMode(nextMode, { replayCurrent: !state.userStopped });
+        await setPlaybackMode(nextMode, { replayCurrent: !state.userStopped });
         const label =
           nextMode === "mpv"
             ? "Termux直再生（裏再生最強）"
@@ -2272,11 +2339,34 @@
     }
 
     if (el.audioSeekBar && typeof el.audioSeekBar.addEventListener === "function") {
+      // During drag (input): update display label only & lock out polling overwrite (zero POST spam)
       el.audioSeekBar.addEventListener("input", () => {
+        state.isSeekingAudioBar = true;
         if (isMpvModeActive()) {
           const dur = Number(state.localPlayerState?.duration_sec || state.currentTrack?.duration_seconds || 0);
           if (Number.isFinite(dur) && dur > 0) {
             const targetSec = (Number(el.audioSeekBar.value || 0) / 100) * dur;
+            updateAudioProgressUI(targetSec, dur, { fromDrag: true });
+          }
+          return;
+        }
+        if (isAudioModeActive()) {
+          const dur = Number(el.nativeAudioPlayer.duration || 0);
+          if (Number.isFinite(dur) && dur > 0) {
+            const targetSec = (Number(el.audioSeekBar.value || 0) / 100) * dur;
+            updateAudioProgressUI(targetSec, dur, { fromDrag: true });
+          }
+        }
+      });
+
+      // On release (change): commit seek once & release drag lock
+      el.audioSeekBar.addEventListener("change", () => {
+        state.isSeekingAudioBar = false;
+        if (isMpvModeActive()) {
+          const dur = Number(state.localPlayerState?.duration_sec || state.currentTrack?.duration_seconds || 0);
+          if (Number.isFinite(dur) && dur > 0) {
+            const targetSec = (Number(el.audioSeekBar.value || 0) / 100) * dur;
+            state.localControlEpoch += 1;
             updateAudioProgressUI(targetSec, dur);
             fetchJson(
               "/api/local-player/seek",
@@ -2286,15 +2376,18 @@
                 body: JSON.stringify({ position_sec: targetSec }),
               },
               4000
-            ).catch(() => {});
+            )
+              .then((lp) => syncFromLocalPlayerState(lp))
+              .catch(() => {});
           }
           return;
         }
-        if (!isAudioModeActive()) return;
-        const dur = Number(el.nativeAudioPlayer.duration || 0);
-        if (Number.isFinite(dur) && dur > 0) {
-          el.nativeAudioPlayer.currentTime = (Number(el.audioSeekBar.value || 0) / 100) * dur;
-          updateAudioProgressUI();
+        if (isAudioModeActive()) {
+          const dur = Number(el.nativeAudioPlayer.duration || 0);
+          if (Number.isFinite(dur) && dur > 0) {
+            el.nativeAudioPlayer.currentTime = (Number(el.audioSeekBar.value || 0) / 100) * dur;
+            updateAudioProgressUI();
+          }
         }
       });
     }
@@ -2437,6 +2530,7 @@
         state.userStopped = false;
         state.hasUserPlaybackStarted = true;
         if (isMpvModeActive()) {
+          state.localControlEpoch += 1;
           try {
             const lp = await fetchJson(
               "/api/local-player/next",
@@ -2641,11 +2735,11 @@
         state.audioStreamAvailable = false;
       }
       if (state.mpvAvailable) {
-        setPlaybackMode("mpv");
+        await setPlaybackMode("mpv");
       } else if (state.audioStreamAvailable) {
-        setPlaybackMode("audio");
+        await setPlaybackMode("audio");
       } else {
-        setPlaybackMode("youtube");
+        await setPlaybackMode("youtube");
       }
     }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, suppress
@@ -179,11 +180,13 @@ class RadioRuntime:
             self.mpv_player._next_tracks_provider = self._mpv_next_tracks
             self.mpv_player._feedback_recorder = self._mpv_record_feedback
         else:
+            port = os.environ.get("PORT", "8000").strip() or "8000"
             self.mpv_player = MpvLocalPlayer(
                 audio_resolver=self.audio_resolver,
                 next_tracks_provider=self._mpv_next_tracks,
                 feedback_recorder=self._mpv_record_feedback,
                 socket_path=sock_path,
+                api_base_url=f"http://127.0.0.1:{port}",
             )
 
     def _mpv_next_tracks(self, station_id: str, count: int, exclude_ids: set[str]) -> list[dict[str, Any]]:

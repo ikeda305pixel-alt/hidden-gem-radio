@@ -7,11 +7,15 @@ runs natively inside Termux without Android Brave's background autoplay restrict
 from __future__ import annotations
 
 import atexit
+import ctypes
 import json
 import logging
+import os
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +29,41 @@ from src.adapters.audio_stream import AudioStreamResolver
 logger = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_MPV_ERRORS = 5
+MAX_UNIX_SOCKET_PATH_BYTES = 96
+TERMUX_AO_PRIORITY = "opensles,audiotrack,aaudio,pulse"
+_PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig_sigterm() -> None:
+    """Ask Linux/Android kernel to send SIGTERM to child mpv if parent Python process dies."""
+    if not sys.platform.startswith("linux"):
+        return
+    with suppress(Exception):
+        for lib_name in ("libc.so.6", "libc.so"):
+            try:
+                libc = ctypes.CDLL(lib_name, use_errno=True)
+                libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
+                return
+            except OSError:
+                continue
+
+
+def _normalize_unix_socket_path(raw_path: Path | str | None, instance_id: int) -> Path:
+    """Resolve absolute socket path and guard against the 108-byte AF_UNIX path limit."""
+    if raw_path is not None:
+        resolved = Path(raw_path).resolve()
+    else:
+        resolved = (Path(tempfile.gettempdir()) / f"hgr_mpv_{instance_id}.sock").resolve()
+    if len(str(resolved).encode("utf-8")) >= MAX_UNIX_SOCKET_PATH_BYTES:
+        fallback = (Path(tempfile.gettempdir()) / "hgr_mpv.sock").resolve()
+        logger.warning(
+            "mpv socket path %s exceeds %d bytes; falling back to %s",
+            resolved,
+            MAX_UNIX_SOCKET_PATH_BYTES,
+            fallback,
+        )
+        return fallback
+    return resolved
 
 
 class MpvLocalPlayer:
@@ -37,23 +76,20 @@ class MpvLocalPlayer:
         next_tracks_provider: Callable[[str, int, set[str]], list[dict[str, Any]]] | None = None,
         feedback_recorder: Callable[[str, dict[str, Any], str, float | None, float | None], Any] | None = None,
         socket_path: Path | str | None = None,
-        api_base_url: str = "http://127.0.0.1:8000",
+        api_base_url: str | None = None,
         ipc_connector: Callable[[Path], socket.socket] | None = None,
         spawn_process: bool = True,
     ) -> None:
         self.audio_resolver = audio_resolver or AudioStreamResolver()
         self._next_tracks_provider = next_tracks_provider
         self._feedback_recorder = feedback_recorder
-        self.api_base_url = api_base_url.rstrip("/")
+        port = os.environ.get("PORT", "8000").strip() or "8000"
+        self.api_base_url = (api_base_url or f"http://127.0.0.1:{port}").rstrip("/")
         self._custom_ipc_connector = ipc_connector
         self._spawn_process = spawn_process
+        self.socket_path = _normalize_unix_socket_path(socket_path, id(self))
 
-        if socket_path is not None:
-            self.socket_path = Path(socket_path)
-        else:
-            # Termux lacks /tmp; prefer tempfile.gettempdir() ($TMPDIR on Termux)
-            self.socket_path = Path(tempfile.gettempdir()) / f"hidden_gem_mpv_{id(self)}.sock"
-
+        self._control_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._proc: subprocess.Popen[bytes] | None = None
@@ -76,6 +112,7 @@ class MpvLocalPlayer:
         self._duration_sec: float = 0.0
         self._load_generation: int = 0
         self._consecutive_errors: int = 0
+        self._retried_error_vids: set[str] = set()
         self._shutdown_called = False
 
         atexit.register(self.shutdown)
@@ -100,6 +137,32 @@ class MpvLocalPlayer:
                 "duration_sec": round(float(self._duration_sec), 2),
                 "queue_preview": [dict(t) for t in self._queue_preview[:5]],
             }
+
+    def _build_mpv_spawn_cmd(self) -> list[str]:
+        return [
+            "mpv",
+            "--no-video",
+            "--idle=yes",
+            "--no-terminal",
+            "--force-window=no",
+            f"--ao={TERMUX_AO_PRIORITY}",
+            f"--input-ipc-server={self.socket_path}",
+        ]
+
+    def _quit_stale_daemon_if_socket_exists(self) -> None:
+        if not self.socket_path.exists():
+            return
+        with suppress(OSError):
+            stale_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                stale_sock.settimeout(0.35)
+                stale_sock.connect(str(self.socket_path))
+                stale_sock.sendall(b'{"command":["quit"]}\n')
+                time.sleep(0.08)
+            finally:
+                stale_sock.close()
+        with suppress(OSError):
+            self.socket_path.unlink()
 
     def _ensure_connected(self) -> bool:
         with self._state_lock:
@@ -138,47 +201,36 @@ class MpvLocalPlayer:
     def _spawn_mpv_daemon_locked(self) -> bool:
         if self._proc is not None and self._proc.poll() is None:
             return True
-        if self.socket_path.exists():
-            with suppress(OSError):
-                self.socket_path.unlink()
+        self._quit_stale_daemon_if_socket_exists()
 
-        base_cmd = [
-            "mpv",
-            "--no-video",
-            "--idle=yes",
-            "--no-terminal",
-            "--force-window=no",
-            f"--input-ipc-server={self.socket_path}",
-        ]
-        # Try Termux default audio output first, fallback to --ao=opensles if immediate exit
-        for extra_args in ([], ["--ao=opensles"]):
-            cmd = base_cmd + extra_args
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except OSError as exc:
-                logger.warning("Failed to spawn mpv (%s): %s", cmd, exc)
+        cmd = self._build_mpv_spawn_cmd()
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform.startswith("linux"):
+            popen_kwargs["preexec_fn"] = _set_pdeathsig_sigterm
+
+        try:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except OSError as exc:
+            logger.warning("Failed to spawn mpv (%s): %s", cmd, exc)
+            return False
+
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                logger.warning("mpv exited immediately with rc=%s", proc.returncode)
                 return False
-
-            # Wait up to 2.5s for socket file creation while checking process didn't crash
-            deadline = time.monotonic() + 2.5
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
-                if self.socket_path.exists():
-                    self._proc = proc
-                    return True
-                time.sleep(0.05)
-
-            if proc.poll() is None:
+            if self.socket_path.exists():
                 self._proc = proc
                 return True
-            logger.warning("mpv exited immediately with rc=%s (args=%s), retrying fallback", proc.returncode, extra_args)
+            time.sleep(0.05)
 
+        if proc.poll() is None:
+            self._proc = proc
+            return True
         return False
 
     @staticmethod
@@ -277,6 +329,8 @@ class MpvLocalPlayer:
                     self._position_sec = max(0.0, float(data))
                     if self._position_sec > 0.3:
                         self._consecutive_errors = 0
+                        if self._current_track and self._current_track.get("video_id"):
+                            self._retried_error_vids.discard(str(self._current_track["video_id"]))
                 elif name == "duration" and isinstance(data, (int, float)) and data > 0:
                     self._duration_sec = float(data)
                 elif name == "pause" and isinstance(data, bool):
@@ -297,11 +351,11 @@ class MpvLocalPlayer:
                 pos_sec = self._position_sec
                 dur_sec = self._duration_sec
 
-            if stopped or not active:
-                # Hard stop lock: NEVER advance or record COMPLETE when user stopped
+            if stopped or not active or paused:
+                # Hard stop & pause lock: NEVER advance, retry, or record COMPLETE while stopped or paused
                 return
 
-            if reason == "eof" and not paused and station_id and ended_track:
+            if reason == "eof" and station_id and ended_track:
                 threading.Thread(
                     target=self._handle_eof_advance,
                     args=(gen, station_id, ended_track, pos_sec, dur_sec),
@@ -316,35 +370,67 @@ class MpvLocalPlayer:
                     name="mpv-error-retry",
                 ).start()
 
-    def _resolve_stream_url(self, video_id: str) -> str:
-        # Prefer cached direct URL via AudioStreamResolver; fallback to local /api/audio/{video_id}
+    def _resolve_stream_info(self, video_id: str, *, force_refresh: bool = False) -> tuple[str, dict[str, str]]:
+        # Prefer cached direct URL + http_headers via AudioStreamResolver; fallback to local /api/audio/{video_id}
         if self.audio_resolver.is_available():
-            stream = self.audio_resolver.resolve(video_id)
+            stream = self.audio_resolver.resolve(video_id, force_refresh=force_refresh)
             if stream is not None and stream.url:
-                return stream.url
-        return f"{self.api_base_url}/api/audio/{video_id}"
+                return stream.url, dict(stream.http_headers or {})
+        return f"{self.api_base_url}/api/audio/{video_id}", {}
 
-    def _load_track_internal(self, station_id: str, track: dict[str, Any]) -> bool:
+    def _apply_http_headers_to_mpv(self, headers: dict[str, str]) -> None:
+        if not headers:
+            return
+        ua = None
+        extra_fields: list[str] = []
+        for k, v in headers.items():
+            key_clean = str(k).strip()
+            val_clean = str(v).strip()
+            if not key_clean or not val_clean:
+                continue
+            if key_clean.lower() == "user-agent":
+                ua = val_clean
+            elif key_clean.lower() in {"referer", "origin", "cookie"}:
+                extra_fields.append(f"{key_clean}: {val_clean}")
+        if ua:
+            self._send_command(["set_property", "user-agent", ua], wait_reply=False)
+        if extra_fields:
+            self._send_command(["set_property", "http-header-fields", extra_fields], wait_reply=False)
+
+    def _load_track_internal(
+        self,
+        station_id: str,
+        track: dict[str, Any],
+        *,
+        expected_gen: int,
+        force_refresh: bool = False,
+    ) -> bool:
         vid = str(track.get("video_id") or "").strip()
         if not vid:
             return False
         if not self._ensure_connected():
             return False
 
-        stream_url = self._resolve_stream_url(vid)
-        with self._state_lock:
-            if self._user_stopped:
-                return False
-            self._load_generation += 1
-            self._station_id = station_id
-            self._current_track = dict(track)
-            self._active = True
-            self._paused = False
-            self._position_sec = 0.0
-            self._duration_sec = float(track.get("duration_seconds") or 0.0)
+        # Resolve stream URL outside control_lock so stop() is never blocked by yt-dlp latency
+        stream_url, http_headers = self._resolve_stream_info(vid, force_refresh=force_refresh)
 
-        self._send_command(["loadfile", stream_url, "replace"], wait_reply=False)
-        self._send_command(["set_property", "pause", False], wait_reply=False)
+        with self._control_lock:
+            with self._state_lock:
+                # Stale generation or stop() arrived while resolving URL -> abort without sending loadfile!
+                if self._user_stopped or not self._active or self._load_generation != expected_gen:
+                    return False
+                self._load_generation += 1
+                self._station_id = station_id
+                self._current_track = dict(track)
+                self._active = True
+                self._paused = False
+                self._position_sec = 0.0
+                self._duration_sec = float(track.get("duration_seconds") or 0.0)
+
+            self._apply_http_headers_to_mpv(http_headers)
+            self._send_command(["loadfile", stream_url, "replace"], wait_reply=False)
+            self._send_command(["set_property", "pause", False], wait_reply=False)
+
         self._refresh_queue_preview(station_id, exclude_track=track)
         return True
 
@@ -413,7 +499,7 @@ class MpvLocalPlayer:
         exclude = {str(x) for x in (ended_track.get("track_id"), ended_track.get("video_id")) if x}
         next_tr = self._pick_next_track(station_id, exclude)
         if next_tr is not None:
-            self._load_track_internal(station_id, next_tr)
+            self._load_track_internal(station_id, next_tr, expected_gen=expected_gen)
 
     def _handle_error_retry(
         self,
@@ -421,22 +507,39 @@ class MpvLocalPlayer:
         station_id: str,
         failed_track: dict[str, Any] | None,
     ) -> None:
+        failed_vid = str(failed_track.get("video_id") or "").strip() if failed_track else ""
+        should_retry_same = False
         with self._state_lock:
-            if self._user_stopped or not self._active or self._load_generation != expected_gen:
+            if self._user_stopped or not self._active or self._paused or self._load_generation != expected_gen:
                 return
-            self._consecutive_errors += 1
-            if self._consecutive_errors >= MAX_CONSECUTIVE_MPV_ERRORS:
-                logger.warning("mpv hit %d consecutive errors; stopping safely", self._consecutive_errors)
-                self._active = False
-                self._user_stopped = True
-                return
+            if failed_vid and failed_vid not in self._retried_error_vids:
+                self._retried_error_vids.add(failed_vid)
+                should_retry_same = True
+            else:
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= MAX_CONSECUTIVE_MPV_ERRORS:
+                    logger.warning("mpv hit %d consecutive errors; stopping safely", self._consecutive_errors)
+                    self._active = False
+                    self._user_stopped = True
+                    return
+
+        if should_retry_same and failed_track is not None and failed_vid:
+            # Invalidate expired/403 signed URL cache and retry the same track once with force_refresh=True
+            self.audio_resolver.invalidate(failed_vid)
+            self._load_track_internal(
+                station_id,
+                failed_track,
+                expected_gen=expected_gen,
+                force_refresh=True,
+            )
+            return
 
         exclude = set()
         if failed_track:
             exclude = {str(x) for x in (failed_track.get("track_id"), failed_track.get("video_id")) if x}
         next_tr = self._pick_next_track(station_id, exclude)
         if next_tr is not None:
-            self._load_track_internal(station_id, next_tr)
+            self._load_track_internal(station_id, next_tr, expected_gen=expected_gen)
 
     def play(self, station_id: str, track: dict[str, Any] | None = None) -> dict[str, Any]:
         """Start or switch station playback on local mpv (clears stopped lock)."""
@@ -446,7 +549,10 @@ class MpvLocalPlayer:
             self._active = True
             self._paused = False
             self._consecutive_errors = 0
+            self._retried_error_vids.clear()
             self._station_id = station_id
+            self._load_generation += 1
+            op_gen = self._load_generation
             if station_changed:
                 self._queue_preview = []
 
@@ -454,18 +560,19 @@ class MpvLocalPlayer:
         if target is None:
             target = self._pick_next_track(station_id, set())
         if target is not None:
-            self._load_track_internal(station_id, target)
+            self._load_track_internal(station_id, target, expected_gen=op_gen)
         return self.get_state()
 
     def stop(self) -> dict[str, Any]:
         """Hard stop: silence mpv and lock out autonomous EOF/error transitions until explicit play()."""
-        with self._state_lock:
-            self._user_stopped = True
-            self._active = False
-            self._paused = False
-            self._load_generation += 1
-            self._position_sec = 0.0
-        self._send_command(["stop"], wait_reply=False)
+        with self._control_lock:
+            with self._state_lock:
+                self._user_stopped = True
+                self._active = False
+                self._paused = False
+                self._load_generation += 1
+                self._position_sec = 0.0
+            self._send_command(["stop"], wait_reply=False)
         return self.get_state()
 
     def toggle_pause(self, station_id: str | None = None) -> dict[str, Any]:
@@ -480,27 +587,36 @@ class MpvLocalPlayer:
                 return self.play(target_station, track=current_track)
             return self.get_state()
 
-        with self._state_lock:
-            self._paused = not self._paused
-            new_paused = self._paused
-        self._send_command(["set_property", "pause", new_paused], wait_reply=False)
+        with self._control_lock:
+            with self._state_lock:
+                if self._user_stopped or not self._active:
+                    return self.get_state()
+                self._paused = not self._paused
+                new_paused = self._paused
+            self._send_command(["set_property", "pause", new_paused], wait_reply=False)
         return self.get_state()
 
     def next_track(self, *, event_type: str = "SKIP", station_id: str | None = None) -> dict[str, Any]:
-        """Record SKIP or BAD and immediately advance to next track."""
+        """Record SKIP or BAD and immediately advance to next track (respecting concurrent stop())."""
         ev = str(event_type or "SKIP").strip().upper()
-        with self._state_lock:
-            target_station = station_id or self._station_id
-            prev_track = dict(self._current_track) if self._current_track else None
-            pos_sec = self._position_sec
-            dur_sec = self._duration_sec
-            self._load_generation += 1
+        with self._control_lock:
+            with self._state_lock:
+                target_station = station_id or self._station_id
+                prev_track = dict(self._current_track) if self._current_track else None
+                pos_sec = self._position_sec
+                dur_sec = self._duration_sec
+                self._load_generation += 1
+                op_gen = self._load_generation
+                self._user_stopped = False
+                self._active = bool(target_station)
+                self._paused = False
+                self._consecutive_errors = 0
+                self._retried_error_vids.clear()
+                if ev == "BAD":
+                    self._queue_preview = []
             if ev == "BAD":
-                self._queue_preview = []
-
-        if ev == "BAD":
-            # Silence audio IMMEDIATELY before recording feedback / loading next track
-            self._send_command(["stop"], wait_reply=False)
+                # Silence audio IMMEDIATELY before recording feedback / loading next track
+                self._send_command(["stop"], wait_reply=False)
 
         if target_station and prev_track and self._feedback_recorder is not None:
             try:
@@ -511,34 +627,35 @@ class MpvLocalPlayer:
         if not target_station:
             return self.get_state()
 
+        # Re-verify stop() or another control action did NOT arrive during feedback recording!
         with self._state_lock:
-            self._user_stopped = False
-            self._active = True
-            self._paused = False
-            self._consecutive_errors = 0
+            if self._user_stopped or not self._active or self._load_generation != op_gen:
+                return self.get_state()
 
         exclude = set()
         if prev_track:
             exclude = {str(x) for x in (prev_track.get("track_id"), prev_track.get("video_id")) if x}
         next_tr = self._pick_next_track(target_station, exclude)
         if next_tr is not None:
-            self._load_track_internal(target_station, next_tr)
+            self._load_track_internal(target_station, next_tr, expected_gen=op_gen)
         else:
             self.stop()
         return self.get_state()
 
     def seek(self, position_sec: float) -> dict[str, Any]:
         pos = max(0.0, float(position_sec))
-        with self._state_lock:
-            self._position_sec = pos
-        self._send_command(["seek", pos, "absolute"], wait_reply=False)
+        with self._control_lock:
+            with self._state_lock:
+                self._position_sec = pos
+            self._send_command(["seek", pos, "absolute"], wait_reply=False)
         return self.get_state()
 
     def toggle_mute(self, muted: bool | None = None) -> dict[str, Any]:
-        with self._state_lock:
-            self._muted = (not self._muted) if muted is None else bool(muted)
-            new_muted = self._muted
-        self._send_command(["set_property", "mute", new_muted], wait_reply=False)
+        with self._control_lock:
+            with self._state_lock:
+                self._muted = (not self._muted) if muted is None else bool(muted)
+                new_muted = self._muted
+            self._send_command(["set_property", "mute", new_muted], wait_reply=False)
         return self.get_state()
 
     def _close_socket_locked(self) -> None:

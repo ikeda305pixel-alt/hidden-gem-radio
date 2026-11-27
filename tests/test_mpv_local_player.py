@@ -414,3 +414,408 @@ runAll().catch((err) => {
     proc = subprocess.run(["node", "-e", script], check=False, capture_output=True, text=True, timeout=15)
     assert proc.returncode == 0, f"Node mpv remote vm test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert '"ok":true' in proc.stdout.replace(" ", "")
+
+
+def test_mpv_user_agent_header_and_error_force_refresh_retry_once(tmp_path: Path) -> None:
+    mock_ipc = _MockMpvIpcServer()
+    resolve_log: list[tuple[str, int]] = []
+
+    def fake_extract(vid: str) -> CachedAudioStream:
+        count = sum(1 for v, _ in resolve_log if v == vid) + 1
+        resolve_log.append((vid, count))
+        return CachedAudioStream(
+            video_id=vid,
+            url=f"https://audio.example.test/{vid}_v{count}.m4a",
+            mime_type="audio/mp4",
+            http_headers={"User-Agent": f"CustomYTAgent/{count}.0"},
+        )
+
+    resolver = AudioStreamResolver(extractor=fake_extract)
+    mpv = MpvLocalPlayer(
+        audio_resolver=resolver,
+        socket_path=tmp_path / "mpv.sock",
+        ipc_connector=lambda _p: mock_ipc.client_sock,
+        spawn_process=False,
+    )
+    app = create_app(
+        db_path=tmp_path / "radio.db",
+        stations_path=tmp_path / "stations.yaml",
+        model_dir=tmp_path / "models",
+        auto_dig=False,
+        audio_resolver=resolver,
+        mpv_player=mpv,
+    )
+    db = app.state.runtime.db
+    db.upsert_track(
+        "pes_passion_groove",
+        TrackEntity.build(artist="Header Artist 1", title="Song 1", view_count=20_000, video_id="HDR_VID_001"),
+    )
+    db.upsert_track(
+        "pes_passion_groove",
+        TrackEntity.build(artist="Header Artist 2", title="Song 2", view_count=20_000, video_id="HDR_VID_002"),
+    )
+
+    try:
+        with TestClient(app) as client:
+            st1 = client.post("/api/local-player/play", json={"station_id": "pes_passion_groove"}).json()
+            first_vid = st1["track"]["video_id"]
+            mock_ipc.wait_for_loadfile_count(1)
+            cmds = mock_ipc.get_commands()
+            ua_idx = next(i for i, c in enumerate(cmds) if c[:2] == ["set_property", "user-agent"])
+            lf_idx = next(i for i, c in enumerate(cmds) if c and c[0] == "loadfile")
+            assert ua_idx < lf_idx, "User-Agent must be set before loadfile"
+            assert cmds[ua_idx][2] == "CustomYTAgent/1.0"
+
+            # 1st error on same track -> invalidates cache & retries SAME track once with v2 URL
+            mock_ipc.emit_event({"event": "end-file", "reason": "error"})
+            loads2 = mock_ipc.wait_for_loadfile_count(2)
+            assert len(loads2) == 2
+            assert f"{first_vid}_v2.m4a" in loads2[1][1]
+
+            # 2nd error on same track -> advances to the OTHER track (not infinite loop on same track)
+            mock_ipc.emit_event({"event": "end-file", "reason": "error"})
+            loads3 = mock_ipc.wait_for_loadfile_count(3)
+            assert len(loads3) == 3
+            assert first_vid not in loads3[2][1]
+    finally:
+        mpv.shutdown()
+        mock_ipc.close()
+
+
+def test_mpv_stop_race_during_slow_resolve_and_paused_error_guard(tmp_path: Path) -> None:
+    mock_ipc = _MockMpvIpcServer()
+    resolve_started = threading.Event()
+    release_resolve = threading.Event()
+    block_first = {"flag": True}
+
+    def slow_extract(vid: str) -> CachedAudioStream:
+        if block_first["flag"]:
+            block_first["flag"] = False
+            resolve_started.set()
+            release_resolve.wait(timeout=3.0)
+        return CachedAudioStream(
+            video_id=vid,
+            url=f"https://audio.example.test/{vid}.m4a",
+            mime_type="audio/mp4",
+        )
+
+    resolver = AudioStreamResolver(extractor=slow_extract)
+    mpv = MpvLocalPlayer(
+        audio_resolver=resolver,
+        socket_path=tmp_path / "mpv.sock",
+        ipc_connector=lambda _p: mock_ipc.client_sock,
+        spawn_process=False,
+    )
+    app = create_app(
+        db_path=tmp_path / "radio.db",
+        stations_path=tmp_path / "stations.yaml",
+        model_dir=tmp_path / "models",
+        auto_dig=False,
+        audio_resolver=resolver,
+        mpv_player=mpv,
+    )
+    db = app.state.runtime.db
+    db.upsert_track(
+        "pes_passion_groove",
+        TrackEntity.build(artist="Race Artist 1", title="Race Song 1", view_count=20_000, video_id="RACE_VID_01"),
+    )
+    db.upsert_track(
+        "pes_passion_groove",
+        TrackEntity.build(artist="Race Artist 2", title="Race Song 2", view_count=20_000, video_id="RACE_VID_02"),
+    )
+
+    try:
+        # 1. stop() arrives while play() is blocked in slow_extract -> ZERO loadfile sent!
+        play_thread = threading.Thread(target=mpv.play, args=("pes_passion_groove",), daemon=True)
+        play_thread.start()
+        assert resolve_started.wait(timeout=2.0)
+        mpv.stop()
+        release_resolve.set()
+        play_thread.join(timeout=2.0)
+
+        assert mpv.get_state()["stopped"] is True
+        assert len([c for c in mock_ipc.get_commands() if c and c[0] == "loadfile"]) == 0
+
+        # 2. Paused track receives end-file (error) -> MUST NOT auto-resume or loadfile!
+        mpv.play("pes_passion_groove")
+        assert len(mock_ipc.wait_for_loadfile_count(1)) == 1
+        mpv.toggle_pause()
+        assert mpv.get_state()["paused"] is True
+        mock_ipc.emit_event({"event": "end-file", "reason": "error"})
+        time.sleep(0.15)
+        assert len([c for c in mock_ipc.get_commands() if c and c[0] == "loadfile"]) == 1
+        assert mpv.get_state()["paused"] is True
+    finally:
+        mpv.shutdown()
+        mock_ipc.close()
+
+
+def test_mpv_socket_path_96b_fallback_and_termux_ao_priority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("PORT", "9123")
+    long_path = tmp_path / ("a" * 110) / "mpv.sock"
+    mpv = MpvLocalPlayer(socket_path=long_path, spawn_process=False)
+    try:
+        assert mpv.socket_path.name == "hgr_mpv.sock"
+        assert len(str(mpv.socket_path).encode("utf-8")) < 96
+        assert mpv.api_base_url == "http://127.0.0.1:9123"
+        cmd = mpv._build_mpv_spawn_cmd()
+        assert "--ao=opensles,audiotrack,aaudio,pulse" in cmd
+    finally:
+        mpv.shutdown()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required for JS vm tests")
+def test_web_ui_mpv_mode_guards_yt_events_epoch_discard_and_good_listen_seconds_node() -> None:
+    inline_js = _extract_inline_js()
+    harness = r"""
+const vm = require("vm");
+
+function makeElement(id) {
+  const listeners = {};
+  return {
+    id,
+    textContent: "",
+    innerHTML: "",
+    value: "50",
+    src: "",
+    style: {},
+    className: "",
+    classList: {
+      _set: new Set(),
+      add(c) { this._set.add(c); },
+      remove(c) { this._set.delete(c); },
+      contains(c) { return this._set.has(c); },
+      toggle(c, force) {
+        if (force === undefined) {
+          if (this._set.has(c)) this._set.delete(c);
+          else this._set.add(c);
+        } else if (force) {
+          this._set.add(c);
+        } else {
+          this._set.delete(c);
+        }
+      },
+    },
+    children: [],
+    appendChild(child) { this.children.push(child); return child; },
+    addEventListener(evt, fn) {
+      listeners[evt] = listeners[evt] || [];
+      listeners[evt].push(fn);
+    },
+    async trigger(evt) {
+      for (const fn of (listeners[evt] || [])) {
+        await fn({ target: this, type: evt });
+      }
+    },
+  };
+}
+
+async function runAll() {
+  const elements = {};
+  const getEl = (id) => {
+    if (!elements[id]) elements[id] = makeElement(id);
+    return elements[id];
+  };
+
+  let ytEvents = null;
+  let ytPlayVideoCalls = 0;
+  let resolveStalePoll = null;
+  let holdNextPoll = false;
+  const feedbackBodies = [];
+  const seekBodies = [];
+
+  const sandbox = {
+    console,
+    Date,
+    Math,
+    Number,
+    String,
+    Boolean,
+    Array,
+    Object,
+    Set,
+    Map,
+    Promise,
+    Error,
+    encodeURIComponent,
+    setTimeout,
+    clearTimeout,
+    setInterval: () => 999,
+    clearInterval: () => {},
+    AbortController: typeof AbortController !== "undefined" ? AbortController : undefined,
+    document: {
+      hidden: false,
+      getElementById: getEl,
+      createElement: (tag) => makeElement(tag),
+      addEventListener: () => {},
+    },
+    window: {
+      location: { origin: "http://127.0.0.1:8000" },
+      addEventListener: () => {},
+    },
+    navigator: {},
+    MediaMetadata: function (obj) { return obj; },
+    YT: {
+      PlayerState: { UNSTARTED: -1, ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 },
+      Player: function (_id, opts) {
+        ytEvents = opts.events;
+        return {
+          loadVideoById() {},
+          playVideo() { ytPlayVideoCalls += 1; },
+          stopVideo() {},
+          pauseVideo() {},
+          getPlayerState() { return 5; },
+          getCurrentTime() { return 0; },
+          getDuration() { return 0; },
+        };
+      },
+    },
+    fetch: async (url, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      if (url === "/health") {
+        return { ok: true, status: 200, json: async () => ({ status: "ok", mpv_available: true, audio_stream_available: true }) };
+      }
+      if (url === "/stations") {
+        return { ok: true, status: 200, json: async () => ({ stations: [{ station_id: "pes_passion_groove", name: "PES", vibe: "v", candidate_count: 5 }] }) };
+      }
+      if (url === "/api/local-player/state") {
+        if (holdNextPoll) {
+          holdNextPoll = false;
+          // Stale in-flight poll that resolves AFTER user clicked Stop
+          return new Promise((resolve) => {
+            resolveStalePoll = () => resolve({
+              ok: true,
+              status: 200,
+              json: async () => ({
+                mpv_available: true,
+                active: true,
+                stopped: false,
+                paused: false,
+                station_id: "pes_passion_groove",
+                position_sec: 88.5,
+                duration_sec: 210,
+                track: { track_id: "trk_1", video_id: "VID_1", artist: "Parcels", title: "Song 1", duration_seconds: 210 },
+                queue_preview: [],
+              }),
+            });
+          });
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            mpv_available: true,
+            active: true,
+            stopped: false,
+            paused: false,
+            station_id: "pes_passion_groove",
+            position_sec: 77.5,
+            duration_sec: 210,
+            track: { track_id: "trk_1", video_id: "VID_1", artist: "Parcels", title: "Song 1", duration_seconds: 210 },
+            queue_preview: [],
+          }),
+        };
+      }
+      if (url === "/api/local-player/stop") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            mpv_available: true,
+            active: false,
+            stopped: true,
+            paused: false,
+            station_id: "pes_passion_groove",
+            position_sec: 0,
+            duration_sec: 210,
+            track: { track_id: "trk_1", video_id: "VID_1", artist: "Parcels", title: "Song 1", duration_seconds: 210 },
+            queue_preview: [],
+          }),
+        };
+      }
+      if (url === "/api/local-player/seek") {
+        seekBodies.push(body);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            mpv_available: true,
+            active: true,
+            stopped: false,
+            paused: false,
+            station_id: "pes_passion_groove",
+            position_sec: body.position_sec,
+            duration_sec: 210,
+            track: { track_id: "trk_1", video_id: "VID_1", artist: "Parcels", title: "Song 1", duration_seconds: 210 },
+            queue_preview: [],
+          }),
+        };
+      }
+      if (url === "/feedback") {
+        feedbackBodies.push(body);
+        return { ok: true, status: 200, json: async () => ({ status: "ok", model_updates: 1 }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ playlists: [], updates: 1, layers: [], axes: [] }) };
+    },
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(
+    INLINE_JS + "\n;globalThis.__exports = { state, el, pollLocalPlayerStateOnce };",
+    sandbox
+  );
+  sandbox.window.onYouTubeIframeAPIReady();
+  await new Promise((r) => setTimeout(r, 30));
+
+  const { state, el, pollLocalPlayerStateOnce } = sandbox.__exports;
+  state.hasUserPlaybackStarted = true;
+
+  // 1. YT CUED / ENDED while in mpv mode must NEVER call yt.playVideo()
+  await ytEvents.onStateChange({ data: 5 }); // CUED
+  await ytEvents.onStateChange({ data: 0 }); // ENDED
+  if (ytPlayVideoCalls !== 0) {
+    throw new Error(`Expected 0 YouTube playVideo calls in mpv mode, got ${ytPlayVideoCalls}`);
+  }
+
+  // 2. Good feedback in mpv mode sends localPlayerState.position_sec (77.5)
+  await el.btnGood.trigger("click");
+  const goodFb = feedbackBodies.find((b) => b.event_type === "GOOD");
+  if (!goodFb || goodFb.listen_seconds !== 77.5) {
+    throw new Error(`Expected GOOD listen_seconds=77.5 from localPlayerState, got ${JSON.stringify(goodFb)}`);
+  }
+
+  // 3. Seekbar drag (input) sends ZERO POSTs; release (change) sends exactly 1 POST
+  el.audioSeekBar.value = "50";
+  await el.audioSeekBar.trigger("input");
+  if (seekBodies.length !== 0 || state.isSeekingAudioBar !== true) {
+    throw new Error(`Expected 0 seek POSTs on input drag, got ${seekBodies.length}`);
+  }
+  await el.audioSeekBar.trigger("change");
+  if (seekBodies.length !== 1 || seekBodies[0].position_sec !== 105 || state.isSeekingAudioBar !== false) {
+    throw new Error(`Expected 1 seek POST (105s) on change, got ${JSON.stringify(seekBodies)}`);
+  }
+
+  // 4. Stale in-flight poll discarded when localControlEpoch incremented by btnStop
+  holdNextPoll = true;
+  const stalePollPromise = pollLocalPlayerStateOnce();
+  await new Promise((r) => setTimeout(r, 5));
+  await el.btnStop.trigger("click");
+  resolveStalePoll();
+  await stalePollPromise;
+  if (el.statusPill.textContent !== "停止中" || state.userStopped !== true) {
+    throw new Error(`Stale poll rewound stopped UI: status='${el.statusPill.textContent}', userStopped=${state.userStopped}`);
+  }
+
+  console.log(JSON.stringify({ ok: true }));
+  process.exit(0);
+}
+
+runAll().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    script = f"const INLINE_JS = {json.dumps(inline_js)};\n{harness}"
+    proc = subprocess.run(["node", "-e", script], check=False, capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, f"Node mpv audit vm test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+    assert '"ok":true' in proc.stdout.replace(" ", "")
