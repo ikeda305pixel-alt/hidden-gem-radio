@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ _EMBED_UNPLAYABLE_PATTERNS = (
 _VIEW_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*([KMB])?", re.IGNORECASE)
 _MIN_SONG_SECONDS = 60
 _MAX_SONG_SECONDS = 660  # Reject full album mixes / hour-long DJ sets & podcasts
+_MIN_ALT_UNVERIFIED_VIEWS = 5_000
 _ALLOWED_OFFICIAL_VIDEO_TYPES = frozenset(
     {
         "MUSIC_VIDEO_TYPE_ATV",
@@ -55,14 +57,17 @@ _ALLOWED_OFFICIAL_VIDEO_TYPES = frozenset(
 )
 _SLOP_TITLE_RE = re.compile(
     r"(?:\b(?:ai\s*generated|suno|udio|type\s*beat|free\s*beat|1\s*hour|slowed|reverb|"
-    r"nightcore|sped\s*up|karaoke|cover|full\s*album|loop\s*1h|8d\s*audio)\b)",
+    r"nightcore|sped\s*up|spedup|karaoke|cover|piano|acoustic|instrumental|off\s*vocal|"
+    r"live|concert|full\s*album|loop\s*1h|8d\s*audio)\b|"
+    r"(?:歌ってみた|弾いてみた|カバー|カラオケ|ピアノ|アコースティック|インスト|オフボーカル|ライブ|コンサート))",
     re.IGNORECASE,
 )
 _ALT_REJECT_RE = re.compile(
     r"(?:\b(?:ai\s*generated|suno|udio|type\s*beat|free\s*beat|1\s*hour|slowed|reverb|"
-    r"nightcore|sped\s*up|spedup|karaoke|cover|full\s*album|loop\s*1h|8d\s*audio|"
-    r"live|concert|unofficial|fan\s*made|fanmade|bootleg|mashup|pitched|"
-    r"instrumental|acapella|reaction|bass\s*boosted|8\s*bit|tutorial|shorts?)\b)",
+    r"nightcore|sped\s*up|spedup|karaoke|cover|piano|acoustic|full\s*album|loop\s*1h|8d\s*audio|"
+    r"live|concert|unofficial|fan\s*made|fanmade|bootleg|mashup|pitched|off\s*vocal|"
+    r"instrumental|acapella|reaction|bass\s*boosted|8\s*bit|tutorial|shorts?)\b|"
+    r"(?:歌ってみた|弾いてみた|カバー|カラオケ|ピアノ|アコースティック|インスト|オフボーカル|ライブ|コンサート|和訳|切り抜き))",
     re.IGNORECASE,
 )
 _LYRIC_TITLE_RE = re.compile(r"\blyrics?\b", re.IGNORECASE)
@@ -75,9 +80,13 @@ _OFFICIAL_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _OFFICIAL_CHANNEL_RE = re.compile(
-    r"(?:vevo$|-\s*topic$|" + _OFFICIAL_LABEL_RE.pattern + r")",
+    r"(?:vevo$|-\s*topic$|\bofficial\b|" + _OFFICIAL_LABEL_RE.pattern + r")",
     re.IGNORECASE,
 )
+
+
+def _nfkc(text: str) -> str:
+    return unicodedata.normalize("NFKC", str(text or ""))
 
 
 def _is_playability_dict_unplayable(status_obj: Any) -> bool:
@@ -214,13 +223,41 @@ def _is_official_lyric_channel(item: dict[str, Any], target_artist: str) -> bool
     return False
 
 
+def _is_official_omv_channel(item: dict[str, Any], target_artist: str) -> bool:
+    """Verify an OMV fallback belongs to the target artist or a verified Topic/Official/VEVO/label channel."""
+    raw_title = str(item.get("title") or "")
+    artists = item.get("artists") or []
+    channel_names = [
+        str(entry.get("name") or "").strip()
+        for entry in artists
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+    views = parse_view_count(item.get("views"))
+    has_official_badge = any(_OFFICIAL_CHANNEL_RE.search(name) for name in channel_names)
+
+    # Reject low-view amateur uploads unless from a verified Topic/VEVO/Official/label channel
+    if views is not None and views < _MIN_ALT_UNVERIFIED_VIEWS and not has_official_badge:
+        return False
+
+    for name in channel_names:
+        if _artist_matches(target_artist, name):
+            return True
+
+    for name in channel_names:
+        if _OFFICIAL_CHANNEL_RE.search(name) and _artist_matches(target_artist, raw_title):
+            return True
+
+    return False
+
+
 _WATCH_UGC_REJECT_RE = re.compile(
-    r"(?:\b(?:cover|live|concert|lyrics?|lyric\s*video|karaoke|slowed|reverb|nightcore|"
+    r"(?:\b(?:cover|live|concert|lyrics?|lyric\s*video|karaoke|piano|acoustic|remix|slowed|reverb|nightcore|"
     r"sped\s*up|spedup|1\s*hour|loop|ai\s*generated|suno|udio|type\s*beat|free\s*beat|"
     r"reaction|tutorial|podcast|vlog|interview|shorts?|full\s*album|bootleg|mashup|"
-    r"instrumental|acapella|bass\s*boosted|8\s*bit|8d\s*audio|unboxing|gameplay|"
+    r"instrumental|off\s*vocal|acapella|bass\s*boosted|8\s*bit|8d\s*audio|unboxing|gameplay|"
     r"walkthrough|trailer|news|recipe|cooking|fan\s*made|fanmade|unofficial)\b|"
-    r"(?:歌ってみた|弾いてみた|カバー|歌詞動画|和訳|実況|解説|ニュース|切り抜き|まとめ|生配信|作業用bgm|耐久))",
+    r"(?:歌ってみた|弾いてみた|カバー|カラオケ|ピアノ|アコースティック|リミックス|インスト|オフボーカル|ライブ|コンサート|"
+    r"歌詞動画|和訳|実況|解説|ニュース|切り抜き|まとめ|生配信|作業用bgm|耐久))",
     re.IGNORECASE,
 )
 
@@ -250,6 +287,8 @@ def is_slop_or_unofficial(
 
     raw_title = str(item.get("title") or "")
     artist = _extract_artist_name(item, raw_title)
+    nfkc_title = _nfkc(raw_title)
+    nfkc_artist = _nfkc(artist)
     artists = item.get("artists") or []
     first_artist_id = (
         str(artists[0].get("id") or "").strip()
@@ -263,7 +302,7 @@ def is_slop_or_unofficial(
         elif allow_verified_watch_ugc and video_type == "MUSIC_VIDEO_TYPE_UGC":
             if not first_artist_id:
                 return True
-            if _WATCH_UGC_REJECT_RE.search(raw_title) or _WATCH_UGC_REJECT_RE.search(artist):
+            if _WATCH_UGC_REJECT_RE.search(nfkc_title) or _WATCH_UGC_REJECT_RE.search(nfkc_artist):
                 return True
         else:
             return True
@@ -274,7 +313,7 @@ def is_slop_or_unofficial(
         if not (has_album or has_artist_id):
             return True
 
-    return bool(_SLOP_TITLE_RE.search(raw_title) or _SLOP_TITLE_RE.search(artist))
+    return bool(_SLOP_TITLE_RE.search(nfkc_title) or _SLOP_TITLE_RE.search(nfkc_artist))
 
 
 def parse_view_count(raw: Any) -> int | None:
@@ -586,9 +625,11 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
         check_cap = max(1, int(max_embed_checks_per_pass))
 
         def _is_rejected_title(raw_title: str, channel_name: str) -> bool:
-            if _ALT_REJECT_RE.search(raw_title) or _ALT_REJECT_RE.search(channel_name):
+            t_nfkc = _nfkc(raw_title)
+            c_nfkc = _nfkc(channel_name)
+            if _ALT_REJECT_RE.search(t_nfkc) or _ALT_REJECT_RE.search(c_nfkc):
                 return True
-            return bool(not allow_remix and re.search(r"\bremix\b", raw_title, re.IGNORECASE))
+            return bool(not allow_remix and re.search(r"(?:\bremix\b|リミックス)", t_nfkc, re.IGNORECASE))
 
         def _is_verified_embeddable(vid: str) -> bool:
             if self._is_embed_breaker_open():
@@ -606,7 +647,7 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                     return False
             return True
 
-        # Pass 1: Official Music Video (OMV)
+        # Pass 1: Official Music Video (OMV) — strict artist/official channel & low-view amateur guard
         omv_rows = self._search_videos_raw(f"{artist} {title}".strip(), limit=8)
         omv_checks = 0
         for item in omv_rows:
@@ -628,7 +669,7 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 continue
             if not _title_matches(title, raw_title):
                 continue
-            if not (_artist_matches(artist, found_artist) or _artist_matches(artist, raw_title)):
+            if not _is_official_omv_channel(item, artist):
                 continue
             omv_checks += 1
             if _is_verified_embeddable(vid):
@@ -667,6 +708,9 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 continue
             if not _title_matches(title, raw_title):
                 continue
+            views = parse_view_count(item.get("views"))
+            if views is not None and views < _MIN_ALT_UNVERIFIED_VIEWS and not _OFFICIAL_CHANNEL_RE.search(found_artist):
+                continue
             if not _is_official_lyric_channel(item, artist):
                 continue
             lyric_checks += 1
@@ -674,7 +718,7 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 alt = TrackEntity.build(
                     artist=artist,
                     title=title,
-                    view_count=parse_view_count(item.get("views")),
+                    view_count=views,
                     duration_seconds=duration,
                     video_id=vid,
                     source="youtube_music_lyric",

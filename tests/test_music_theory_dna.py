@@ -32,6 +32,7 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
         "us_hiphop_bouncy",
         "japan_hiphop_street",
         "edm_dance_party",
+        "ukg_bass_bounce",
         "melodic_rap_alt",
         "jpop_citypop_groove",
     ]
@@ -44,7 +45,10 @@ def test_music_theory_profile_yaml_defines_6_axes_and_5_exact_stations() -> None
         "T1": 0.65, "T2": 0.75, "T3": 0.82, "T4": 0.72, "T5": 0.85,
     }
     assert by_id["edm_dance_party"].target_theory_vector == {
-        "T1": 0.92, "T2": 0.88, "T3": 0.75, "T4": 0.85, "T5": 0.95,
+        "T1": 0.92, "T2": 0.80, "T3": 0.75, "T4": 0.88, "T5": 0.95,
+    }
+    assert by_id["ukg_bass_bounce"].target_theory_vector == {
+        "T1": 0.84, "T2": 0.96, "T3": 0.78, "T4": 0.76, "T5": 0.94,
     }
     assert by_id["melodic_rap_alt"].target_theory_vector == {
         "T1": 0.78, "T2": 0.62, "T3": 0.70, "T4": 0.96, "T5": 0.84,

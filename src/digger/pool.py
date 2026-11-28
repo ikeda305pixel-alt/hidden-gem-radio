@@ -28,7 +28,12 @@ from src.adapters.deezer import DeezerClient
 from src.adapters.youtube import YouTubeMusicAdapter
 from src.db import RadioDatabase
 from src.digger.listenbrainz import ListenBrainzClient
-from src.models import StationConfig, TrackEntity, normalize_artist
+from src.models import (
+    StationConfig,
+    TrackEntity,
+    normalize_artist,
+    split_artist_credits,
+)
 from src.recommender.audio_mir import AudioMIRExtractor
 
 logger = logging.getLogger(__name__)
@@ -146,6 +151,7 @@ class CandidatePoolDigger:
         max_seeds: int = 8,
         max_alt_searches_per_dig: int = 12,
         max_tracks_per_artist_in_pool: int = 2,
+        max_tracks_per_seed: int | None = None,
     ) -> dict[str, Any]:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
         from src.models import is_japanese_music_entity
@@ -155,9 +161,16 @@ class CandidatePoolDigger:
         blacklisted_vids = set(self.db.get_blacklisted_video_ids())
         known_vids = set(known_video_ids or set())
         skip_keys = set(known_track_keys or set())
-        familiar_artists = {
-            normalize_artist(a) for a in (known_familiar_artists or set()) if normalize_artist(a)
-        }
+
+        # Expand combined credits (e.g. "Chrystal & NOTION" -> {"chrystal", "notion"}) in familiar artists
+        familiar_artists: set[str] = set()
+        for raw_a in known_familiar_artists or set():
+            full_norm = normalize_artist(raw_a)
+            if full_norm:
+                familiar_artists.add(full_norm)
+            for tok in split_artist_credits(raw_a):
+                familiar_artists.add(tok)
+
         is_western_only = station.region_policy == "western_only"
         embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
         pool_artist_cap = max(1, int(max_tracks_per_artist_in_pool))
@@ -173,6 +186,16 @@ class CandidatePoolDigger:
                 for row in seed_plan
                 if not is_japanese_music_entity(row[0], row[1])
             ]
+
+        # Seed-artist self-exclusion (including split collab credits like "Chrystal & NOTION" -> "notion")
+        seed_artist_tokens: set[str] = set()
+        for q_artist, _q_title, seed_label, _q_arch in seed_plan:
+            for raw_seed_name in (q_artist, seed_label):
+                norm_s = normalize_artist(raw_seed_name)
+                if norm_s:
+                    seed_artist_tokens.add(norm_s)
+                for tok in split_artist_credits(raw_seed_name):
+                    seed_artist_tokens.add(tok)
 
         # Resolve official seed songs (and artist browseIds) via filter="songs"
         resolved_seeds: list[tuple[str, str, str | None, str | None]] = []
@@ -190,6 +213,7 @@ class CandidatePoolDigger:
         graph_candidates: dict[str, TrackEntity] = {}
         seed_hit_sets: dict[str, set[str]] = {}
         source_labels: dict[str, list[str]] = {}
+        primary_seed_for_vid: dict[str, str] = {}
         seen_artist_browse_ids: set[str] = set()
 
         skipped_popular = 0
@@ -198,6 +222,7 @@ class CandidatePoolDigger:
         skipped_region_mismatch = 0
         skipped_familiar_artist = 0
         skipped_artist_cap = 0
+        skipped_seed_cap = 0
 
         def _ingest(tracks: list[TrackEntity], seed_artist_key: str, label: str) -> None:
             nonlocal skipped_popular, skipped_blocked, skipped_known, skipped_region_mismatch, skipped_familiar_artist
@@ -213,13 +238,16 @@ class CandidatePoolDigger:
                     skipped_known += 1
                     continue
                 a_norm = normalize_artist(tr.artist)
-                if a_norm in blocked_artists:
+                artist_tokens = set(split_artist_credits(tr.artist))
+                if a_norm:
+                    artist_tokens.add(a_norm)
+                if artist_tokens & blocked_artists:
                     skipped_blocked += 1
                     continue
                 if is_western_only and is_japanese_music_entity(tr.artist, tr.title):
                     skipped_region_mismatch += 1
                     continue
-                if a_norm and a_norm in familiar_artists:
+                if artist_tokens & (familiar_artists | seed_artist_tokens):
                     skipped_familiar_artist += 1
                     continue
                 if tr.view_count is not None and tr.view_count > station.max_popularity_views:
@@ -231,6 +259,7 @@ class CandidatePoolDigger:
                     graph_candidates[dedup_key] = tr
                     seed_hit_sets[dedup_key] = {seed_artist_key}
                     source_labels[dedup_key] = [label]
+                    primary_seed_for_vid[dedup_key] = seed_artist_key
                 else:
                     seed_hit_sets[dedup_key].add(seed_artist_key)
                     if label not in source_labels[dedup_key]:
@@ -265,12 +294,48 @@ class CandidatePoolDigger:
                 )
                 _ingest(deep_cuts, artist_key, f"{seed_label} 関連アーティスト")
 
-        # Prioritize multi-seed co-occurring gems first, replacing embed-disabled videos with OMV / Official Lyric Video
-        ranked_graph = sorted(
-            graph_candidates.items(),
+        # Prioritize multi-seed co-occurring gems first, then round-robin across distinct seeds
+        # so no single seed dominates the candidate pool.
+        cooc_items = sorted(
+            [kv for kv in graph_candidates.items() if len(seed_hit_sets[kv[0]]) >= 2],
             key=lambda kv: (len(seed_hit_sets[kv[0]]), kv[1].view_count or 0),
             reverse=True,
         )
+        single_seed_buckets: dict[str, list[tuple[str, TrackEntity]]] = {}
+        for vid_key, tr in graph_candidates.items():
+            if len(seed_hit_sets[vid_key]) >= 2:
+                continue
+            s_key = primary_seed_for_vid.get(vid_key, "artist:unknown")
+            single_seed_buckets.setdefault(s_key, []).append((vid_key, tr))
+        for bucket in single_seed_buckets.values():
+            bucket.sort(key=lambda kv: kv[1].view_count or 0, reverse=True)
+
+        round_robin_items: list[tuple[str, TrackEntity]] = []
+        bucket_keys = list(single_seed_buckets.keys())
+        round_idx = 0
+        while True:
+            progressed = False
+            for s_key in bucket_keys:
+                bucket = single_seed_buckets[s_key]
+                if round_idx < len(bucket):
+                    round_robin_items.append(bucket[round_idx])
+                    progressed = True
+            if not progressed:
+                break
+            round_idx += 1
+
+        ranked_graph = [*cooc_items, *round_robin_items]
+
+        # Enforce per-seed pool cap (max 25% of target_pool_size or max 10 tracks) whenever multiple seeds exist
+        # or caller explicitly specifies max_tracks_per_seed.
+        distinct_seed_keys = {primary_seed_for_vid[k] for k in graph_candidates}
+        enforce_seed_cap = (max_tracks_per_seed is not None) or (len(distinct_seed_keys) >= 2)
+        per_seed_cap = (
+            max(1, int(max_tracks_per_seed))
+            if max_tracks_per_seed is not None
+            else min(10, max(1, int(target_pool_size * 0.25)))
+        )
+        seed_added_counts: dict[str, int] = {}
 
         added = 0
         cooccurring_count = 0
@@ -288,6 +353,10 @@ class CandidatePoolDigger:
             if added >= target_pool_size:
                 break
             if track.canonical_key in persisted_keys:
+                continue
+            s_key = primary_seed_for_vid.get(vid_key, "artist:unknown")
+            if enforce_seed_cap and seed_added_counts.get(s_key, 0) >= per_seed_cap:
+                skipped_seed_cap += 1
                 continue
             a_norm = normalize_artist(track.artist)
             if a_norm and pool_artist_counts.get(a_norm, 0) >= pool_artist_cap:
@@ -385,6 +454,7 @@ class CandidatePoolDigger:
             self.db.upsert_track(station.station_id, track)
             persisted_vids.add(track.video_id)
             persisted_keys.add(track.canonical_key)
+            seed_added_counts[s_key] = seed_added_counts.get(s_key, 0) + 1
             if a_norm:
                 pool_artist_counts[a_norm] = pool_artist_counts.get(a_norm, 0) + 1
             added += 1
@@ -406,6 +476,7 @@ class CandidatePoolDigger:
             "skipped_region_mismatch": skipped_region_mismatch,
             "skipped_familiar_artist": skipped_familiar_artist,
             "skipped_artist_cap": skipped_artist_cap,
+            "skipped_seed_cap": skipped_seed_cap,
             "skipped_unembeddable": skipped_unembeddable,
             "replaced_omv": replaced_omv,
             "replaced_lyric": replaced_lyric,

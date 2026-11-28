@@ -805,6 +805,24 @@ class RadioDatabase:
             ).fetchall()
             return [str(r["artist_norm"]) for r in rows if r["artist_norm"]]
 
+    def get_recent_played_seed_artists(self, station_id: str, limit: int = 3) -> list[str]:
+        """Return normalized seed_artist names of the most recent N played/rated tracks on this station."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.seed_artist
+                FROM feedback_events fe
+                INNER JOIN tracks t ON t.track_id = fe.track_id
+                WHERE fe.station_id = ?
+                  AND t.seed_artist IS NOT NULL
+                  AND t.seed_artist != ''
+                ORDER BY fe.created_at DESC, fe.id DESC
+                LIMIT ?
+                """,
+                (station_id, max(1, int(limit))),
+            ).fetchall()
+            return [normalize_artist(str(r["seed_artist"])) for r in rows if normalize_artist(str(r["seed_artist"]))]
+
     def get_recent_played_mir_vectors(self, station_id: str, limit: int = 5) -> list[list[float]]:
         """Return 16-dim MIR vectors of the most recent N played/rated tracks on this station (for MMR)."""
         with self._connect() as conn:

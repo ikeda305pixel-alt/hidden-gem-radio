@@ -277,7 +277,7 @@ class RadioRuntime:
                 output_path=self.stations_path,
                 browser_auth_path=self.browser_auth_path,
                 takeout_path=PROJECT_ROOT / "data/watch-history.json",
-                num_stations=7,
+                num_stations=8,
                 offline=True,
             )
         station_list = load_stations_yaml(self.stations_path)
@@ -497,6 +497,7 @@ class RadioRuntime:
             limit=count,
             recent_artists=self.db.get_recent_played_artists(station.station_id, limit=5),
             recent_mir_vectors=self.db.get_recent_played_mir_vectors(station.station_id, limit=5),
+            recent_seed_artists=self.db.get_recent_played_seed_artists(station.station_id, limit=3),
         )
         return [item.to_queue_dict() for item in ranked]
 

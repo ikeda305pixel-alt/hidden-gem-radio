@@ -243,12 +243,13 @@
       color: var(--text);
       font-size: 0.92rem;
       font-weight: 600;
+      white-space: nowrap;
       cursor: pointer;
       transition: transform 0.1s ease, background 0.15s ease;
     }
 
     .ctrl-btn:active { transform: scale(0.97); }
-    .ctrl-play { border-color: var(--accent); }
+    .ctrl-play { border-color: var(--accent); white-space: nowrap; }
     .ctrl-good {
       background: rgba(34, 197, 94, 0.14);
       border-color: rgba(34, 197, 94, 0.55);
@@ -589,7 +590,6 @@
           <div class="controls-bar">
             <div class="controls">
               <button class="ctrl-btn ctrl-play" id="btnPlayMute" type="button">▶ 再生</button>
-              <button class="ctrl-btn" id="btnStop" type="button">⏹ 停止</button>
               <button class="ctrl-btn ctrl-good" id="btnGood" type="button">👍 Good</button>
               <button class="ctrl-btn" id="btnSkip" type="button">⏭ 次曲</button>
               <button class="ctrl-btn ctrl-bad" id="btnBad" type="button">👎 BAD（即次曲）</button>
@@ -720,7 +720,6 @@
       theoryLine: document.getElementById("theoryLine"),
       queueList: document.getElementById("queueList"),
       btnPlayMute: document.getElementById("btnPlayMute"),
-      btnStop: document.getElementById("btnStop"),
       btnGood: document.getElementById("btnGood"),
       btnSkip: document.getElementById("btnSkip"),
       btnBad: document.getElementById("btnBad"),
@@ -2201,14 +2200,14 @@
       if (isMpvModeActive()) {
         const lp = state.localPlayerState;
         const isPlaying = Boolean(lp && lp.active && !lp.stopped && !lp.paused);
-        el.btnPlayMute.textContent = isPlaying ? "⏸ 一時停止" : "▶ 再生";
+        el.btnPlayMute.textContent = isPlaying ? "⏹ 停止" : "▶ 再生";
         return;
       }
       if (isAudioModeActive()) {
         if (state.userStopped || el.nativeAudioPlayer.paused) {
           el.btnPlayMute.textContent = "▶ 再生";
         } else {
-          el.btnPlayMute.textContent = "⏸ 一時停止";
+          el.btnPlayMute.textContent = "⏹ 停止";
         }
         return;
       }
@@ -2220,7 +2219,7 @@
       if (state.userStopped || pState !== YT.PlayerState.PLAYING) {
         el.btnPlayMute.textContent = "▶ 再生";
       } else {
-        el.btnPlayMute.textContent = "⏸ 一時停止";
+        el.btnPlayMute.textContent = "⏹ 停止";
       }
     }
 
@@ -2241,20 +2240,24 @@
       updatePlayMuteButton();
     }
 
-    if (el.btnStop && typeof el.btnStop.addEventListener === "function") {
-      el.btnStop.addEventListener("click", async () => {
-        await handleHardStop();
-      });
-    }
-
     el.btnPlayMute.addEventListener("click", async () => {
-      state.hasUserPlaybackStarted = true;
-      state.userStopped = false;
       if (isMpvModeActive()) {
+        const lpNow = state.localPlayerState;
+        const isPlaying = Boolean(lpNow && lpNow.active && !lpNow.stopped && !lpNow.paused);
+        if (isPlaying) {
+          await handleHardStop();
+          return;
+        }
+        state.hasUserPlaybackStarted = true;
+        state.userStopped = false;
         state.localControlEpoch += 1;
         try {
+          const endpoint =
+            lpNow && lpNow.active && !lpNow.stopped && lpNow.paused
+              ? "/api/local-player/toggle"
+              : "/api/local-player/play";
           const lp = await fetchJson(
-            "/api/local-player/toggle",
+            endpoint,
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -2269,6 +2272,8 @@
         return;
       }
       if (state.circuitBroken || !state.currentTrack) {
+        state.hasUserPlaybackStarted = true;
+        state.userStopped = false;
         if (state.skippingInProgress) return;
         state.skippingInProgress = true;
         try {
@@ -2285,36 +2290,37 @@
         return;
       }
       if (isAudioModeActive()) {
-        if (el.nativeAudioPlayer.paused) {
-          const p = el.nativeAudioPlayer.play();
-          if (p && typeof p.catch === "function") p.catch(() => {});
-          setStatus("ON AIR（音声モード）");
-        } else if (typeof el.nativeAudioPlayer.pause === "function") {
-          el.nativeAudioPlayer.pause();
-          setStatus("一時停止中");
+        if (!state.userStopped && !el.nativeAudioPlayer.paused) {
+          await handleHardStop();
+          return;
         }
+        state.hasUserPlaybackStarted = true;
+        state.userStopped = false;
+        const p = el.nativeAudioPlayer.play();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+        setStatus("ON AIR（音声モード）");
         updatePlayMuteButton();
         return;
       }
       if (!state.player || !state.playerReady) return;
       const pState = state.player.getPlayerState();
-      if (pState !== YT.PlayerState.PLAYING) {
-        state.consecutiveErrors = 0;
-        state.consecutiveEmbedSkips = 0;
-        state.circuitBroken = false;
-        state.player.playVideo();
-        const curSec = Number(state.player.getCurrentTime() || 0);
-        if (
-          state.currentTrack &&
-          state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
-          curSec <= WATCHDOG_MIN_PLAY_SEC
-        ) {
-          armPlaybackWatchdog(state.currentTrack);
-        }
-      } else if (typeof state.player.pauseVideo === "function") {
-        clearPlaybackWatchdog();
-        state.player.pauseVideo();
-        setStatus("一時停止中");
+      if (!state.userStopped && pState === YT.PlayerState.PLAYING) {
+        await handleHardStop();
+        return;
+      }
+      state.hasUserPlaybackStarted = true;
+      state.userStopped = false;
+      state.consecutiveErrors = 0;
+      state.consecutiveEmbedSkips = 0;
+      state.circuitBroken = false;
+      state.player.playVideo();
+      const curSec = Number(state.player.getCurrentTime() || 0);
+      if (
+        state.currentTrack &&
+        state.trackConfirmedPlayingVideoId !== state.currentTrack.video_id &&
+        curSec <= WATCHDOG_MIN_PLAY_SEC
+      ) {
+        armPlaybackWatchdog(state.currentTrack);
       }
       setTimeout(updatePlayMuteButton, 150);
     });

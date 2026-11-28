@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_MPV_ERRORS = 5
 MAX_UNIX_SOCKET_PATH_BYTES = 96
-TERMUX_AO_PRIORITY = "opensles,audiotrack,aaudio,pulse"
+TERMUX_AO_PRIORITY = "audiotrack,opensles,aaudio,pulse"
+STALL_FREEZE_TIMEOUT_SEC = 12.0
 _PR_SET_PDEATHSIG = 1
 
 
@@ -79,6 +80,8 @@ class MpvLocalPlayer:
         api_base_url: str | None = None,
         ipc_connector: Callable[[Path], socket.socket] | None = None,
         spawn_process: bool = True,
+        stall_timeout_sec: float = STALL_FREEZE_TIMEOUT_SEC,
+        stall_poll_interval_sec: float = 1.0,
     ) -> None:
         self.audio_resolver = audio_resolver or AudioStreamResolver()
         self._next_tracks_provider = next_tracks_provider
@@ -88,6 +91,8 @@ class MpvLocalPlayer:
         self._custom_ipc_connector = ipc_connector
         self._spawn_process = spawn_process
         self.socket_path = _normalize_unix_socket_path(socket_path, id(self))
+        self._stall_timeout_sec = max(0.05, float(stall_timeout_sec))
+        self._stall_poll_interval_sec = max(0.02, float(stall_poll_interval_sec))
 
         self._control_lock = threading.Lock()
         self._state_lock = threading.RLock()
@@ -96,6 +101,8 @@ class MpvLocalPlayer:
         self._sock: socket.socket | None = None
         self._reader_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
         self._req_id = 0
         self._pending_lock = threading.Lock()
         self._pending_replies: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
@@ -113,6 +120,9 @@ class MpvLocalPlayer:
         self._load_generation: int = 0
         self._consecutive_errors: int = 0
         self._retried_error_vids: set[str] = set()
+        self._last_progress_mono: float = 0.0
+        self._last_observed_pos: float = -1.0
+        self._stall_triggered_gen: int = -1
         self._shutdown_called = False
 
         atexit.register(self.shutdown)
@@ -146,6 +156,11 @@ class MpvLocalPlayer:
             "--no-terminal",
             "--force-window=no",
             f"--ao={TERMUX_AO_PRIORITY}",
+            "--cache=yes",
+            "--demuxer-max-bytes=16MiB",
+            "--demuxer-readahead-secs=20",
+            "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
+            "--audio-stream-silence=no",
             f"--input-ipc-server={self.socket_path}",
         ]
 
@@ -193,10 +208,52 @@ class MpvLocalPlayer:
             )
             self._reader_thread.start()
 
+            if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+                self._watchdog_stop.clear()
+                self._watchdog_thread = threading.Thread(
+                    target=self._stall_watchdog_loop,
+                    daemon=True,
+                    name="mpv-stall-watchdog",
+                )
+                self._watchdog_thread.start()
+
         # Observe core properties asynchronously so get_state() never blocks
         for obs_id, prop in ((1, "time-pos"), (2, "duration"), (3, "pause"), (4, "mute")):
             self._send_command(["observe_property", obs_id, prop], wait_reply=False)
         return True
+
+    def _stall_watchdog_loop(self) -> None:
+        """Detect silent playback freezes (time-pos stagnant >= stall_timeout_sec) and auto-recover."""
+        while not self._watchdog_stop.wait(timeout=self._stall_poll_interval_sec):
+            trigger: tuple[int, str, dict[str, Any]] | None = None
+            now_mono = time.monotonic()
+            with self._state_lock:
+                if (
+                    self._active
+                    and not self._paused
+                    and not self._user_stopped
+                    and self._current_track is not None
+                    and self._station_id is not None
+                    and self._last_progress_mono > 0.0
+                    and self._stall_triggered_gen != self._load_generation
+                    and (now_mono - self._last_progress_mono) >= self._stall_timeout_sec
+                ):
+                    self._stall_triggered_gen = self._load_generation
+                    trigger = (self._load_generation, self._station_id, dict(self._current_track))
+
+            if trigger is not None:
+                gen, st_id, frozen_track = trigger
+                logger.warning(
+                    "mpv silence-freeze detected (%.1fs stagnant on %s); recovering via refresh/skip",
+                    self._stall_timeout_sec,
+                    frozen_track.get("video_id"),
+                )
+                threading.Thread(
+                    target=self._handle_error_retry,
+                    args=(gen, st_id, frozen_track),
+                    daemon=True,
+                    name="mpv-stall-recover",
+                ).start()
 
     def _spawn_mpv_daemon_locked(self) -> bool:
         if self._proc is not None and self._proc.poll() is None:
@@ -326,7 +383,11 @@ class MpvLocalPlayer:
             data = msg.get("data")
             with self._state_lock:
                 if name == "time-pos" and isinstance(data, (int, float)):
-                    self._position_sec = max(0.0, float(data))
+                    new_pos = max(0.0, float(data))
+                    self._position_sec = new_pos
+                    if self._last_observed_pos < 0.0 or new_pos > self._last_observed_pos + 0.05:
+                        self._last_observed_pos = new_pos
+                        self._last_progress_mono = time.monotonic()
                     if self._position_sec > 0.3:
                         self._consecutive_errors = 0
                         if self._current_track and self._current_track.get("video_id"):
@@ -335,6 +396,8 @@ class MpvLocalPlayer:
                     self._duration_sec = float(data)
                 elif name == "pause" and isinstance(data, bool):
                     self._paused = data
+                    if not data:
+                        self._last_progress_mono = time.monotonic()
                 elif name == "mute" and isinstance(data, bool):
                     self._muted = data
             return
@@ -426,6 +489,8 @@ class MpvLocalPlayer:
                 self._paused = False
                 self._position_sec = 0.0
                 self._duration_sec = float(track.get("duration_seconds") or 0.0)
+                self._last_observed_pos = 0.0
+                self._last_progress_mono = time.monotonic()
 
             self._apply_http_headers_to_mpv(http_headers)
             self._send_command(["loadfile", stream_url, "replace"], wait_reply=False)
@@ -593,6 +658,8 @@ class MpvLocalPlayer:
                     return self.get_state()
                 self._paused = not self._paused
                 new_paused = self._paused
+                if not new_paused:
+                    self._last_progress_mono = time.monotonic()
             self._send_command(["set_property", "pause", new_paused], wait_reply=False)
         return self.get_state()
 
@@ -676,6 +743,7 @@ class MpvLocalPlayer:
             self._user_stopped = True
             self._active = False
             self._load_generation += 1
+            self._watchdog_stop.set()
 
         with suppress(Exception):
             self._send_command(["quit"], wait_reply=False)

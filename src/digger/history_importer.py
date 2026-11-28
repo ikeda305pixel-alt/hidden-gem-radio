@@ -35,6 +35,7 @@ from src.models import (
     normalize_artist,
     normalize_track_key,
     save_stations_yaml,
+    split_artist_credits,
 )
 from src.recommender.theory_features import (
     DEFAULT_THEORY_PROFILE_PATH,
@@ -137,22 +138,32 @@ _US_HIPHOP_KW_RE = re.compile(
     r"\b(?:hip\s*hop|rap|trap|drill|808|bouncy\s*rap|boom\s*bap|freestyle|cypher|gangsta)\b",
     re.IGNORECASE,
 )
+_UKG_BASS_ARTISTS = {
+    "chrystal", "notion", "sammy virji", "interplanetary criminal", "conducta",
+    "oppidan", "disclosure", "mph", "bicep", "fred again", "barry can t swim",
+    "eliza rose", "joy anonymous", "p rallel", "salute", "overmono", "nia archives",
+    "higgo", "badger", "dj ez", "mj cole", "todd edwards", "craig david",
+}
+_UKG_BASS_KW_RE = re.compile(
+    r"\b(?:ukg|uk\s*garage|2-?step|speed\s*garage|bassline|bass\s*house|future\s*garage|garage\s*house|notion\s+remix)\b",
+    re.IGNORECASE,
+)
 _EDM_ARTISTS = {
-    "avicii", "david guetta", "calvin harris", "chrystal", "notion", "saint jhn",
+    "avicii", "david guetta", "calvin harris", "saint jhn",
     "imanbek", "tiesto", "tiësto", "major lazer", "jax jones", "black eyed peas",
-    "madism", "katy perry", "kygo", "zedd", "martin garrix", "alesso", "fred again",
-    "bicep", "disclosure", "four tet", "skrillex", "daft punk", "swedish house mafia",
+    "madism", "katy perry", "kygo", "zedd", "martin garrix", "alesso",
+    "four tet", "skrillex", "daft punk", "swedish house mafia",
     "marshmello", "fisher", "peggy gou", "kaytranada", "sub focus", "chase status",
     "bonobo", "caribou", "flume", "odesza", "illenium", "porter robinson", "madeon",
     "galantis", "alan walker", "david guetta avicii", "diplo", "dom dolla", "john summit",
-    "barry can t swim", "sammy virji", "interplanetary criminal", "gryffin", "showtek",
+    "gryffin", "showtek",
     "bakermat", "la roux", "gamper dadoni", "snakehips", "dj snake", "daddy yankee",
     "flo rida", "ellie goulding", "dua lipa", "justin bieber", "mike perry",
     "sam smith", "kim petras", "chris brown", "rihanna", "elite force", "data",
 }
 _EDM_KW_RE = re.compile(
-    r"\b(?:remix|edm|house|ukg|uk\s*garage|2-?step|techno|trance|dnb|drum\s*and\s*bass|"
-    r"dubstep|club\s*mix|original\s*mix|extended\s*mix|boiler\s*room|dj\s*set|dance\s*pop|progressive\s*house)\b",
+    r"\b(?:remix|edm|house|techno|trance|dnb|drum\s*and\s*bass|"
+    r"dubstep|club\s*mix|original\s*mix|extended\s*mix|boiler\s*room|dj\s*set|dance\s*pop|progressive\s*house|festival\s*dance)\b",
     re.IGNORECASE,
 )
 _MELODIC_RAP_ALT_ARTISTS = {
@@ -254,13 +265,23 @@ def default_fallback_stations() -> list[StationConfig]:
         ),
         StationConfig(
             station_id="edm_dance_party",
-            name="ブチ上げ ダンス",
-            vibe="解放感・フェス・4つ打ち＆跳ねUKG",
+            name="ブチ上げ 4つ打ち",
+            vibe="解放感・フェス・多幸感4つ打ち",
             region_policy="western_only",
-            seed_tags=["melodic progressive house", "uk garage", "dance pop"],
+            seed_tags=["melodic progressive house", "festival dance", "dance pop"],
             seed_artists=["Avicii", "Calvin Harris"],
             max_popularity_views=500_000_000,
             exploration_rate=0.9,
+        ),
+        StationConfig(
+            station_id="ukg_bass_bounce",
+            name="跳ねUKG ＆ ベース",
+            vibe="2ステップ・深夜グルーヴ・跳ねベース",
+            region_policy="western_only",
+            seed_tags=["uk garage", "2-step", "speed garage", "bassline"],
+            seed_artists=["Chrystal & NOTION", "Sammy Virji", "Interplanetary Criminal"],
+            max_popularity_views=500_000_000,
+            exploration_rate=1.0,
         ),
     ]
 
@@ -307,9 +328,10 @@ def classify_entry_to_station(
     title: str,
     tags: list[str] | None = None,
 ) -> str:
-    """Route a YouTube/YTMusic watch entry into one of the 7 canonical thematic stations.
+    """Route a YouTube/YTMusic watch entry into one of the 8 canonical thematic stations.
 
-    Enforces a strict Western/Japanese hard gate so Japanese artists never leak into Western stations.
+    Enforces a strict Western/Japanese hard gate so Japanese artists never leak into Western stations,
+    and routes UKG / 2-step / Speed Garage / Bassline cleanly to ukg_bass_bounce separate from edm_dance_party.
     """
     from src.models import is_japanese_music_entity
 
@@ -331,9 +353,11 @@ def classify_entry_to_station(
             return "japan_hiphop_street"
         return "jpop_citypop_groove"
 
-    # Step 2: Explicit Western artist lexicons
+    # Step 2: Explicit Western artist lexicons (UKG checked strictly before 4-on-the-floor EDM)
     if candidate_norms & _PARISIAN_CHIC_ARTISTS:
         return "parisian_chic_disco"
+    if candidate_norms & _UKG_BASS_ARTISTS:
+        return "ukg_bass_bounce"
     if candidate_norms & _MELODIC_RAP_ALT_ARTISTS:
         return "melodic_rap_alt"
     if candidate_norms & _US_HIPHOP_ARTISTS:
@@ -343,9 +367,11 @@ def classify_entry_to_station(
     if candidate_norms & _PES_PASSION_ARTISTS:
         return "pes_passion_groove"
 
-    # Step 3: Keyword fallback for Western tracks
+    # Step 3: Keyword fallback for Western tracks (UKG checked strictly before EDM)
     if _PARISIAN_CHIC_KW_RE.search(combined):
         return "parisian_chic_disco"
+    if _UKG_BASS_KW_RE.search(combined):
+        return "ukg_bass_bounce"
     if _MELODIC_RAP_ALT_KW_RE.search(combined):
         return "melodic_rap_alt"
     if _EDM_KW_RE.search(combined):
@@ -678,7 +704,9 @@ def build_weighted_theory_stations(
         dt = _parse_iso_timestamp(rec.get("played_at") or rec.get("time"))
         days_ago = max(0.0, (now - dt).total_seconds() / 86400.0) if dt is not None else 30.0
         increment = 3 if rec.get("source") == "ytmusic_liked" else 1
-        global_artist_plays[a_norm] += 1
+        credit_tokens = list(dict.fromkeys([a_norm, *split_artist_credits(artist)]))
+        for tok in credit_tokens:
+            global_artist_plays[tok] += 1
 
         vid = str(rec.get("video_id") or "").strip()
         if vid:
@@ -694,7 +722,8 @@ def build_weighted_theory_stations(
             if prev_key_days is None or days_ago < prev_key_days:
                 key_min_days[t_key] = days_ago
             artist_top_track[a_norm][title] += 1
-            global_artist_titles[a_norm].add(t_key)
+            for tok in credit_tokens:
+                global_artist_titles[tok].add(t_key)
 
         st_id = classify_entry_to_station(artist, title)
         if st_id not in station_by_id:
@@ -893,7 +922,7 @@ def build_stations_from_history(
 
 
 def _select_stations_for_count(all_stations: list[StationConfig], num_stations: int) -> list[StationConfig]:
-    """Return all 7 canonical stations when num_stations>=7, or a history-prioritized subset."""
+    """Return all 8 canonical stations when num_stations>=8, or a history-prioritized subset."""
     n = max(2, min(len(all_stations), int(num_stations)))
     if n >= len(all_stations):
         return list(all_stations)
@@ -901,6 +930,7 @@ def _select_stations_for_count(all_stations: list[StationConfig], num_stations: 
         "pes_passion_groove",
         "parisian_chic_disco",
         "edm_dance_party",
+        "ukg_bass_bounce",
         "us_hiphop_bouncy",
         "melodic_rap_alt",
         "japan_hiphop_street",
@@ -918,13 +948,13 @@ def generate_stations_yaml(
     output_path: Path | str = Path("config/stations.yaml"),
     browser_auth_path: Path | str = Path("config/browser.json"),
     takeout_path: Path | str = Path("data/watch-history.json"),
-    num_stations: int = 7,
+    num_stations: int = 8,
     offline: bool = False,
     profile_path: Path | str = DEFAULT_THEORY_PROFILE_PATH,
     reference_time: datetime | None = None,
     calibrate_db_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Read available history sources, build weighted 7-station config, and optionally calibrate SQLite MIR profiles."""
+    """Read available history sources, build weighted 8-station config, and optionally calibrate SQLite MIR profiles."""
     records: list[dict[str, Any]] = []
     sources_used: list[str] = []
     warnings: list[str] = []
@@ -1031,7 +1061,7 @@ def generate_stations_yaml(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Auto-generate config/stations.yaml from YouTube / YouTube Music history (5-station Theory DNA)."
+        description="Auto-generate config/stations.yaml from YouTube / YouTube Music history (8-station Theory DNA)."
     )
     parser.add_argument(
         "--output",
@@ -1051,9 +1081,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stations",
         type=int,
-        default=5,
-        choices=[2, 3, 4, 5],
-        help="Number of stations to generate (2-5, default: 5)",
+        default=8,
+        choices=[2, 3, 4, 5, 6, 7, 8],
+        help="Number of stations to generate (2-8, default: 8)",
     )
     parser.add_argument(
         "--offline",

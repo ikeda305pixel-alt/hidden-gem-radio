@@ -1,5 +1,5 @@
 meta:
-  generated_at: '2026-11-26T14:19:51.275441+00:00'
+  generated_at: '2026-11-28T06:44:14.101562+00:00'
   sources_used:
   - default_seed_fallback
   records_imported: 0
@@ -243,16 +243,15 @@ stations:
   pes_anchors:
   - Jabberloop x Soft Lipa - Dental Driller
 - station_id: edm_dance_party
-  name: ブチ上げ ダンス
+  name: ブチ上げ 4つ打ち
   seed_tags:
   - melodic progressive house
-  - uk garage
+  - progressive house
+  - festival dance
   - dance pop
   - house
   seed_artists:
   - Avicii
-  - Chrystal
-  - NOTION
   - Bakermat
   - Tiesto
   - Major Lazer
@@ -263,29 +262,29 @@ stations:
   - Jax Jones
   - Snakehips
   - Diplo
+  - Kygo
+  - Alesso
   max_popularity_views: 500000000
   exploration_rate: 0.9
-  vibe: 解放感・フェス・4つ打ち＆跳ねUKG
+  vibe: 解放感・フェス・多幸感4つ打ち
   region_policy: western_only
   target_theory_vector:
     T1: 0.92
-    T2: 0.88
+    T2: 0.8
     T3: 0.75
-    T4: 0.85
+    T4: 0.88
     T5: 0.95
   bpm_zones:
-  - 118-138
+  - 120-132
   theory_archetypes:
   - absent_emergent_tonic
   - four_on_floor_sidechain
-  - ukg_2step_drive
   - tresillo_drop
   spotify_anchor_seeds:
   - Avicii - Gonna Love Ya
   - Avicii & Aluna - What Would I Change It To
   - David Guetta & Avicii - Sunshine
   - Calvin Harris - Feel So Close
-  - Chrystal & NOTION - The Days (NOTION Remix)
   - SAINt JHN - Roses (Imanbek Remix)
   - Madism - Pumped Up Kicks
   - Tiesto - Red Lights
@@ -309,6 +308,54 @@ stations:
   - Data - Aerius Light
   - The xx - Crystalized (Rory Phillips Remix)
   - Elite Force - The Law of Life
+- station_id: ukg_bass_bounce
+  name: 跳ねUKG ＆ ベース
+  seed_tags:
+  - uk garage
+  - 2-step
+  - speed garage
+  - bassline
+  - bass house
+  seed_artists:
+  - Chrystal & NOTION
+  - Sammy Virji
+  - Interplanetary Criminal
+  - Conducta
+  - Oppidan
+  - Disclosure
+  - MPH
+  - Bicep
+  - Fred again..
+  - Barry Can't Swim
+  - Joy Anonymous
+  - salute
+  max_popularity_views: 500000000
+  exploration_rate: 1.0
+  vibe: 2ステップ・深夜グルーヴ・跳ねベース
+  region_policy: western_only
+  target_theory_vector:
+    T1: 0.84
+    T2: 0.96
+    T3: 0.78
+    T4: 0.76
+    T5: 0.94
+  bpm_zones:
+  - 128-140
+  theory_archetypes:
+  - ukg_2step_drive
+  - absent_emergent_tonic
+  - bouncy_808_tresillo
+  spotify_anchor_seeds:
+  - Chrystal & NOTION - The Days (NOTION Remix)
+  - Sammy Virji - If U Need It
+  - Interplanetary Criminal & Eliza Rose - B.O.T.A. (Baddest Of Them All)
+  - Conducta - Whippet
+  - Oppidan - Mr. Sandman
+  - Disclosure - Latch
+  - MPH - Run It
+  - Fred again.. - Delilah (pull me out of this)
+  - Bicep - Glue
+  - Barry Can't Swim - Sunsleeper
 - station_id: melodic_rap_alt
   name: エモ切な メロディック
   seed_tags:

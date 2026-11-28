@@ -340,6 +340,10 @@ async function runAll() {
         }
         return { ok: true, status: 200, json: async () => ({ ...serverState }) };
       }
+      if (url === "/api/local-player/play") {
+        serverState = { ...serverState, active: true, stopped: false, paused: false };
+        return { ok: true, status: 200, json: async () => ({ ...serverState }) };
+      }
       if (url === "/api/local-player/next") {
         serverState = {
           ...serverState,
@@ -367,26 +371,26 @@ async function runAll() {
   if (!isMpvModeActive() || state.playbackMode !== "mpv") {
     throw new Error(`Expected default mpv mode when mpv_available=true, got ${state.playbackMode}`);
   }
-  if (el.btnPlayMute.textContent !== "⏸ 一時停止") {
-    throw new Error(`Expected main play button to show '⏸ 一時停止' while playing (NOT Mute), got '${el.btnPlayMute.textContent}'`);
+  if (el.btnPlayMute.textContent !== "⏹ 停止") {
+    throw new Error(`Expected unified button to show '⏹ 停止' while playing, got '${el.btnPlayMute.textContent}'`);
   }
 
-  // 1. Click ⏹ 停止 -> POST /api/local-player/stop -> status '停止中', button '▶ 再生'
-  await el.btnStop.trigger("click");
+  // 1. Click ⏹ 停止 (unified btnPlayMute) -> POST /api/local-player/stop -> status '停止中', button '▶ 再生'
+  await el.btnPlayMute.trigger("click");
   if (!apiCalls.some((c) => c.url === "/api/local-player/stop" && c.method === "POST")) {
-    throw new Error("Expected POST /api/local-player/stop on btnStop click");
+    throw new Error("Expected POST /api/local-player/stop on unified btnPlayMute click while playing");
   }
   if (el.statusPill.textContent !== "停止中" || el.btnPlayMute.textContent !== "▶ 再生") {
     throw new Error(`Expected stopped UI, got status='${el.statusPill.textContent}', btn='${el.btnPlayMute.textContent}'`);
   }
 
-  // 2. Click ▶ 再生 -> POST /api/local-player/toggle -> playing -> '⏸ 一時停止'
+  // 2. Click ▶ 再生 (unified btnPlayMute) -> POST /api/local-player/play -> playing -> '⏹ 停止'
   await el.btnPlayMute.trigger("click");
-  if (!apiCalls.some((c) => c.url === "/api/local-player/toggle" && c.method === "POST")) {
-    throw new Error("Expected POST /api/local-player/toggle on btnPlayMute click");
+  if (!apiCalls.some((c) => c.url === "/api/local-player/play" && c.method === "POST")) {
+    throw new Error("Expected POST /api/local-player/play on unified btnPlayMute click while stopped");
   }
-  if (el.btnPlayMute.textContent !== "⏸ 一時停止") {
-    throw new Error(`Expected '⏸ 一時停止' after toggle play, got '${el.btnPlayMute.textContent}'`);
+  if (el.btnPlayMute.textContent !== "⏹ 停止") {
+    throw new Error(`Expected '⏹ 停止' after resuming playback, got '${el.btnPlayMute.textContent}'`);
   }
 
   // 3. Click ⏭ 次曲 -> POST /api/local-player/next (SKIP)
@@ -559,7 +563,7 @@ def test_mpv_socket_path_96b_fallback_and_termux_ao_priority(monkeypatch: pytest
         assert len(str(mpv.socket_path).encode("utf-8")) < 96
         assert mpv.api_base_url == "http://127.0.0.1:9123"
         cmd = mpv._build_mpv_spawn_cmd()
-        assert "--ao=opensles,audiotrack,aaudio,pulse" in cmd
+        assert "--ao=audiotrack,opensles,aaudio,pulse" in cmd
     finally:
         mpv.shutdown()
 
@@ -795,11 +799,11 @@ async function runAll() {
     throw new Error(`Expected 1 seek POST (105s) on change, got ${JSON.stringify(seekBodies)}`);
   }
 
-  // 4. Stale in-flight poll discarded when localControlEpoch incremented by btnStop
+  // 4. Stale in-flight poll discarded when localControlEpoch incremented by unified Stop button
   holdNextPoll = true;
   const stalePollPromise = pollLocalPlayerStateOnce();
   await new Promise((r) => setTimeout(r, 5));
-  await el.btnStop.trigger("click");
+  await el.btnPlayMute.trigger("click");
   resolveStalePoll();
   await stalePollPromise;
   if (el.statusPill.textContent !== "停止中" || state.userStopped !== true) {

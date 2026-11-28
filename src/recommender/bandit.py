@@ -600,8 +600,9 @@ class ContextualBanditRecommender:
         limit: int = 3,
         recent_artists: list[str] | None = None,
         recent_mir_vectors: list[list[float]] | None = None,
+        recent_seed_artists: list[str] | None = None,
     ) -> list[RankedCandidate]:
-        """Stage 2 Precision Scoring + Stage 3 Re-Ranking (5-track artist cooldown + MMR diversity + 80/20 exploit/explore)."""
+        """Stage 2 Precision Scoring + Stage 3 Re-Ranking (artist cooldown + MMR + seed diversity + 30-40% explore)."""
         if not candidates:
             return []
 
@@ -717,6 +718,22 @@ class ContextualBanditRecommender:
             max_sim = np.max(sim_mat, axis=1)
             total_scores = 0.75 * total_scores - 0.25 * max_sim
 
+        # Stage 3 Consecutive-Seed Penalty: strongly penalize candidates sharing seed_artist
+        # with the recent 2-3 played tracks to prevent single-seed loops.
+        recent_seed_list = [
+            normalize_artist(s) for s in (recent_seed_artists or [])[:3] if normalize_artist(s)
+        ]
+        recent_seed_counts: dict[str, int] = {}
+        for s_norm in recent_seed_list:
+            recent_seed_counts[s_norm] = recent_seed_counts.get(s_norm, 0) + 1
+        if recent_seed_counts:
+            for idx, track in enumerate(candidates):
+                cand_seed = normalize_artist(track.seed_artist or "")
+                if cand_seed and cand_seed in recent_seed_counts:
+                    repeats = recent_seed_counts[cand_seed]
+                    penalty = 0.35 + 0.15 * min(2, repeats - 1)
+                    total_scores[idx] -= penalty
+
         scored: list[tuple[RankedCandidate, float]] = []
         seed_tag_set = set(self.seed_tags)
         for idx, track in enumerate(candidates):
@@ -756,43 +773,72 @@ class ContextualBanditRecommender:
         # Stage 3 Re-Ranking:
         # 1. Recent 5-track artist cooldown (avoid repeating any artist in recent_artists[:5] or current batch)
         recent_set = {normalize_artist(a) for a in (recent_artists or [])[:5] if a}
+        recent_seed_set = set(recent_seed_counts.keys())
 
         exploit_pool = sorted(scored, key=lambda pair: pair[0].score, reverse=True)
-        # Exploration crossover pool: co-occurring / cult-chic crossover gems
+        # Exploration pool: strongly prefers distinct / non-recent seeds, co-occurring & under-explored clusters
         explore_pool = sorted(
             scored,
-            key=lambda pair: (pair[0].track.cooccurrence_count >= 2, pair[1], pair[0].score),
+            key=lambda pair: (
+                normalize_artist(pair[0].track.seed_artist or "") not in recent_seed_set,
+                pair[0].track.cooccurrence_count >= 2,
+                pair[1],
+                pair[0].explore_bonus,
+                pair[0].score,
+            ),
             reverse=True,
         )
 
         selected: list[RankedCandidate] = []
         used_track_ids: set[str] = set()
         used_artists: set[str] = set(recent_set)
+        used_batch_seeds: set[str] = set()
 
-        def _pick_from(pool: list[tuple[RankedCandidate, float]], allow_recent_artist: bool) -> RankedCandidate | None:
+        def _pick_from(
+            pool: list[tuple[RankedCandidate, float]],
+            *,
+            allow_recent_artist: bool,
+            prefer_distinct_seed: bool = False,
+        ) -> RankedCandidate | None:
             for cand, _cross in pool:
                 if cand.track.track_id in used_track_ids:
                     continue
                 a_norm = normalize_artist(cand.track.artist)
                 if not allow_recent_artist and a_norm in used_artists:
                     continue
+                s_norm = normalize_artist(cand.track.seed_artist or "")
+                if prefer_distinct_seed and s_norm and (s_norm in used_batch_seeds or s_norm in recent_seed_set):
+                    continue
                 used_track_ids.add(cand.track.track_id)
                 used_artists.add(a_norm)
+                if s_norm:
+                    used_batch_seeds.add(s_norm)
                 return cand
             return None
 
-        # 80% Exploit + 20% Explore slot pattern
+        # Reserve 30-40% forced Explore slots per batch (e.g. 1/3=33%, 2/5=40%, 4/10=40%)
+        explore_slots: set[int] = set()
+        if limit >= 3:
+            target_explore = max(1, round(limit * 0.35))
+            # Distribute explore slots evenly toward the latter portion of each 3-track cycle
+            step = limit / float(target_explore)
+            for k in range(target_explore):
+                slot_idx = min(limit - 1, max(0, math.floor((k + 1) * step) - 1))
+                explore_slots.add(slot_idx)
+
         for slot in range(limit):
-            is_explore_slot = (slot % 5) == 4
+            is_explore_slot = slot in explore_slots
             primary_pool = explore_pool if is_explore_slot else exploit_pool
             secondary_pool = exploit_pool if is_explore_slot else explore_pool
 
-            chosen = _pick_from(primary_pool, allow_recent_artist=False)
+            chosen = _pick_from(primary_pool, allow_recent_artist=False, prefer_distinct_seed=True)
             if chosen is None:
-                chosen = _pick_from(secondary_pool, allow_recent_artist=False)
+                chosen = _pick_from(primary_pool, allow_recent_artist=False, prefer_distinct_seed=False)
+            if chosen is None:
+                chosen = _pick_from(secondary_pool, allow_recent_artist=False, prefer_distinct_seed=False)
             if chosen is None:
                 # Only relax artist cooldown when all remaining unique candidates belong to recent artists
-                chosen = _pick_from(primary_pool, allow_recent_artist=True)
+                chosen = _pick_from(primary_pool, allow_recent_artist=True, prefer_distinct_seed=False)
             if chosen is None:
                 break
             if is_explore_slot:

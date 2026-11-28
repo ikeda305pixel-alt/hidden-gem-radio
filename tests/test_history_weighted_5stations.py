@@ -33,7 +33,7 @@ def test_classify_entry_routes_all_5_stations_accurately() -> None:
     assert classify_entry_to_station("ZORN", "My Life") == "japan_hiphop_street"
     assert classify_entry_to_station("bbno$", "edamame") == "us_hiphop_bouncy"
     assert classify_entry_to_station("Avicii", "Gonna Love Ya") == "edm_dance_party"
-    assert classify_entry_to_station("Chrystal", "The Days (NOTION Remix)") == "edm_dance_party"
+    assert classify_entry_to_station("Chrystal", "The Days (NOTION Remix)") == "ukg_bass_bounce"
     assert classify_entry_to_station("Juice WRLD", "Lucid Dreams") == "melodic_rap_alt"
     assert classify_entry_to_station("Lil Peep", "Better Off (Dying)") == "melodic_rap_alt"
     assert classify_entry_to_station("Royel Otis", "Oysters In My Pocket") == "pes_passion_groove"

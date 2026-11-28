@@ -200,6 +200,32 @@ def normalize_track_key(artist: str, title: str) -> str:
     return f"{normalize_artist(artist)}::{normalize_title_for_key(title)}"
 
 
+_ARTIST_CREDIT_SPLIT_RE = re.compile(
+    r"\s*(?:feat\.?|ft\.?|featuring|&|,|\+|/|\s+x\s+|×|\bwith\b|\bvs\.?\b)\s*",
+    re.IGNORECASE,
+)
+
+
+def split_artist_credits(artist: str) -> list[str]:
+    """Split combined artist credits (e.g. 'Chrystal & NOTION', 'A feat. B', 'A x B') into normalized tokens."""
+    raw = str(artist or "").strip()
+    if not raw:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for part in _ARTIST_CREDIT_SPLIT_RE.split(raw):
+        cleaned = part.strip(" ()[]")
+        norm = normalize_artist(cleaned)
+        if norm and norm not in seen:
+            seen.add(norm)
+            tokens.append(norm)
+    if not tokens:
+        fallback = normalize_artist(raw)
+        if fallback:
+            tokens.append(fallback)
+    return tokens
+
+
 def is_japanese_music_entity(artist: str, title: str = "") -> bool:
     """Return True if artist or title is Japanese (Japanese script or known Romanized JP artist)."""
     if _JP_SCRIPT_RE.search(artist or "") or _JP_SCRIPT_RE.search(title or ""):
@@ -210,9 +236,8 @@ def is_japanese_music_entity(artist: str, title: str = "") -> bool:
     if a_norm in _JAPANESE_ENGLISH_ARTISTS:
         return True
     # Also check individual tokens in collab strings (e.g. "imase & Punpee")
-    for part in re.split(r"\s*(?:feat\.?|ft\.?|&|,|\s+x\s+|×|\bwith\b)\s*", artist or "", flags=re.IGNORECASE):
-        p_norm = normalize_artist(part)
-        if p_norm and p_norm in _JAPANESE_ENGLISH_ARTISTS:
+    for p_norm in split_artist_credits(artist):
+        if p_norm in _JAPANESE_ENGLISH_ARTISTS:
             return True
     return False
 
@@ -526,7 +551,7 @@ def load_history_index(path: Path) -> tuple[set[str], set[str]]:
 
 
 def load_known_familiar_artists(path: Path) -> set[str]:
-    """Load normalized known_familiar_artists from stations.yaml history_index section."""
+    """Load normalized known_familiar_artists (including split collab credits) from stations.yaml."""
     if not path.exists():
         return set()
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -535,11 +560,17 @@ def load_known_familiar_artists(path: Path) -> set[str]:
     idx = raw.get("history_index") or {}
     if not isinstance(idx, dict):
         return set()
-    return {
-        normalize_artist(str(a))
-        for a in idx.get("known_familiar_artists", [])
-        if str(a).strip() and normalize_artist(str(a))
-    }
+    familiar: set[str] = set()
+    for a in idx.get("known_familiar_artists", []):
+        text = str(a).strip()
+        if not text:
+            continue
+        full_norm = normalize_artist(text)
+        if full_norm:
+            familiar.add(full_norm)
+        for token in split_artist_credits(text):
+            familiar.add(token)
+    return familiar
 
 
 def save_stations_yaml(

@@ -360,7 +360,7 @@ def test_stage1_graph_digger_blocks_ai_slop_ugc_and_boosts_cooccurrence(tmp_path
 def test_calibration_bounded_slow_learning_station_isolation_and_reset_tracks(tmp_path: Path) -> None:
     db = RadioDatabase(tmp_path / "radio.db")
     stations = default_theory_stations()
-    assert len(stations) == 7
+    assert len(stations) == 8
 
     # Deterministic synthetic per-track Deezer/MIR vectors so calibration measures real variance & centroids
     class DeterministicMIR(AudioMIRExtractor):
