@@ -194,6 +194,10 @@ class CandidatePoolDigger:
                 familiar_artists.add(tok)
 
         is_western_only = station.region_policy == "western_only"
+        if is_western_only:
+            purger = getattr(self.db, "purge_japanese_unheard_for_station", None)
+            if callable(purger):
+                purger(station.station_id)
         embed_check_enabled = bool(getattr(self.yt, "embed_check_enabled", False))
         pool_artist_cap = max(1, int(max_tracks_per_artist_in_pool))
         pool_artist_counts = self.db.count_unheard_by_artist(
@@ -247,6 +251,8 @@ class CandidatePoolDigger:
         skipped_seed_cap = 0
         skipped_low_views = 0
 
+        from src.models import has_japanese_metadata
+
         def _ingest(tracks: list[TrackEntity], seed_artist_key: str, label: str) -> None:
             nonlocal skipped_popular, skipped_blocked, skipped_known, skipped_region_mismatch, skipped_familiar_artist
             for tr in tracks:
@@ -267,7 +273,14 @@ class CandidatePoolDigger:
                 if artist_tokens & blocked_artists:
                     skipped_blocked += 1
                     continue
-                if is_western_only and is_japanese_music_entity(tr.artist, tr.title):
+                if is_western_only and (
+                    is_japanese_music_entity(tr.artist, tr.title)
+                    or has_japanese_metadata(
+                        title=tr.title,
+                        artist=tr.artist,
+                        extra_texts=[*tr.tags],
+                    )
+                ):
                     skipped_region_mismatch += 1
                     continue
                 if artist_tokens & (familiar_artists | seed_artist_tokens):

@@ -514,8 +514,9 @@ def test_mpv_4g_reconnect_flags_and_silence_freeze_recovery(tmp_path: Path) -> N
         cmd = mpv._build_mpv_spawn_cmd()
         assert "--ao=audiotrack,opensles,aaudio,pulse" in cmd
         assert "--cache=yes" in cmd
-        assert "--demuxer-max-bytes=16MiB" in cmd
-        assert "--demuxer-readahead-secs=20" in cmd
+        assert "--demuxer-max-bytes=32MiB" in cmd
+        assert "--demuxer-max-back-bytes=16MiB" in cmd
+        assert "--demuxer-readahead-secs=300" in cmd
         assert "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5" in cmd
         assert "--audio-stream-silence=no" in cmd
 
@@ -1054,8 +1055,8 @@ def test_western_only_dig_station_cuts_single_seed_low_views_but_keeps_cooc_and_
                         cooc_gem,
                         {
                             "videoId": "VID_SINGLE_22K",
-                            "title": "ANKI WITH ME",
-                            "artists": [{"name": "MORE STAR", "id": "UC_MS"}],
+                            "title": "Minor Single Track",
+                            "artists": [{"name": "Unknown Garage Act", "id": "UC_UGA"}],
                             "videoType": "MUSIC_VIDEO_TYPE_ATV",
                             "length": "3:00",
                             "views": "22K",
@@ -1140,5 +1141,115 @@ def test_bandit_penalizes_unverified_mir_low_view_candidate_below_measured_track
     )
     assert ranked[0].track.video_id == "VID_MEASURED"
     assert ranked[0].score > ranked[1].score + 0.25
+
+
+def test_western_only_excludes_romanized_jp_chotokkyu_via_channel_description_and_db_purge(tmp_path: Path) -> None:
+    """Romanized JP tracks (e.g. Chotokkyu - The End For Beginning) with JP channel/description are blocked & purged."""
+    from src.adapters.youtube import has_japanese_metadata
+
+    assert (
+        has_japanese_metadata(
+            title="The End For Beginning (Re-ver.)",
+            artist="Chotokkyu",
+            channel="超特急 Official",
+        )
+        is True
+    )
+    assert (
+        has_japanese_metadata(
+            title="The End For Beginning (Re-ver.)",
+            artist="Chotokkyu",
+            description="超特急 ニューシングル配信中",
+        )
+        is True
+    )
+    assert (
+        has_japanese_metadata(
+            title="Feel So Close",
+            artist="Calvin Harris",
+            channel="CalvinHarrisVEVO",
+            description="Official Music Video by Calvin Harris.",
+        )
+        is False
+    )
+
+    class FakeYTChotokkyu:
+        def get_watch_playlist(self, videoId: str, radio: bool = True, limit: int = 25):
+            _ = (videoId, radio, limit)
+            return {
+                "tracks": [
+                    {
+                        "videoId": "VID_CHOTOKKYU_CH",
+                        "title": "The End For Beginning (Re-ver.)",
+                        "artists": [{"name": "Chotokkyu", "id": "UC_CTK"}],
+                        "channel": "超特急 Official",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "length": "3:45",
+                        "views": "500K",
+                    },
+                    {
+                        "videoId": "VID_CHOTOKKYU_DESC",
+                        "title": "My Buddy",
+                        "artists": [{"name": "RomanizedGroup", "id": "UC_RG"}],
+                        "description": "メインダンサー＆バックボーカルグループ超特急",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "length": "3:30",
+                        "views": "400K",
+                    },
+                    {
+                        "videoId": "VID_PURE_WEST",
+                        "title": "Feel So Close",
+                        "artists": [{"name": "Calvin Harris", "id": "UC_CH"}],
+                        "channel": "CalvinHarrisVEVO",
+                        "description": "Official audio.",
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "length": "3:26",
+                        "views": "5M",
+                    },
+                ]
+            }
+
+    adapter = YouTubeMusicAdapter(client=FakeYTChotokkyu())
+    tracks = adapter.get_related_tracks("SEED_EDM", limit=12, reject_japanese_context=True)
+    vids = {t.video_id for t in tracks}
+    assert "VID_CHOTOKKYU_CH" not in vids
+    assert "VID_CHOTOKKYU_DESC" not in vids
+    assert "VID_PURE_WEST" in vids
+
+    # Existing DB cleanup purges unheard Chotokkyu / Japanese-tagged tracks from western_only station
+    db = RadioDatabase(tmp_path / "radio.db")
+    db.upsert_track(
+        "edm_dance_party",
+        TrackEntity.build(
+            artist="Chotokkyu",
+            title="The End For Beginning (Re-ver.)",
+            video_id="DB_CTK_1",
+            view_count=300_000,
+        ),
+    )
+    db.upsert_track(
+        "edm_dance_party",
+        TrackEntity.build(
+            artist="UnknownRomanized",
+            title="English Title",
+            tags=["超特急"],
+            video_id="DB_JP_TAG_1",
+            view_count=300_000,
+        ),
+    )
+    db.upsert_track(
+        "edm_dance_party",
+        TrackEntity.build(
+            artist="Alesso",
+            title="Heroes",
+            video_id="DB_WEST_1",
+            view_count=5_000_000,
+        ),
+    )
+    purged = db.purge_japanese_unheard_for_station("edm_dance_party")
+    assert purged == 2
+    remaining_vids = {t.video_id for t in db.get_eligible_candidates("edm_dance_party", 500_000_000)}
+    assert remaining_vids == {"DB_WEST_1"}
+
 
 

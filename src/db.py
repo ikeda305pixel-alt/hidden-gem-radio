@@ -886,6 +886,40 @@ class RadioDatabase:
                 counts[key] = counts.get(key, 0) + 1
         return counts
 
+    def purge_japanese_unheard_for_station(self, station_id: str) -> int:
+        """Remove Japanese-entity or Japanese-metadata unheard tracks from a western_only station's candidate pool."""
+        from src.models import has_japanese_metadata, is_japanese_music_entity
+
+        heard_ids = self.get_recently_heard_track_ids(station_id, limit=10_000)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.*
+                FROM tracks t
+                INNER JOIN station_candidates sc ON sc.track_id = t.track_id
+                WHERE sc.station_id = ?
+                """,
+                (station_id,),
+            ).fetchall()
+            to_remove: list[str] = []
+            for row in rows:
+                tr = self._row_to_track(row)
+                if tr.track_id in heard_ids:
+                    continue
+                if is_japanese_music_entity(tr.artist, tr.title) or has_japanese_metadata(
+                    title=tr.title,
+                    artist=tr.artist,
+                    extra_texts=[*tr.tags],
+                ):
+                    to_remove.append(tr.track_id)
+            if not to_remove:
+                return 0
+            conn.executemany(
+                "DELETE FROM station_candidates WHERE station_id = ? AND track_id = ?",
+                [(station_id, tid) for tid in to_remove],
+            )
+            return len(to_remove)
+
     def get_audio_feature_cache(
         self,
         *,

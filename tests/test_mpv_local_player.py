@@ -823,3 +823,71 @@ runAll().catch((err) => {
     proc = subprocess.run(["node", "-e", script], check=False, capture_output=True, text=True, timeout=15)
     assert proc.returncode == 0, f"Node mpv audit vm test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert '"ok":true' in proc.stdout.replace(" ", "")
+
+
+def test_mpv_full_track_cache_resume_from_last_pos_and_single_stall_retry_cap(tmp_path: Path) -> None:
+    """Verify 32MiB/300s cache flags, start=97.0 resume on 1st stall, and immediate skip on 2nd stall even after progress."""
+    mock_ipc = _MockMpvIpcServer()
+    resolve_counts: dict[str, int] = {}
+
+    def fake_extract(vid: str) -> CachedAudioStream:
+        resolve_counts[vid] = resolve_counts.get(vid, 0) + 1
+        return CachedAudioStream(
+            video_id=vid,
+            url=f"https://audio.example.test/{vid}_v{resolve_counts[vid]}.m4a",
+            mime_type="audio/mp4",
+        )
+
+    tracks = [
+        {"track_id": "trk_s1", "video_id": "STALL_VID_1", "artist": "Artist A", "title": "Track A", "duration_seconds": 210},
+        {"track_id": "trk_s2", "video_id": "STALL_VID_2", "artist": "Artist B", "title": "Track B", "duration_seconds": 200},
+    ]
+
+    def next_provider(station_id: str, count: int, exclude: set[str]) -> list[dict[str, Any]]:
+        _ = (station_id, count)
+        return [t for t in tracks if t["video_id"] not in exclude and t["track_id"] not in exclude]
+
+    resolver = AudioStreamResolver(extractor=fake_extract)
+    mpv = MpvLocalPlayer(
+        audio_resolver=resolver,
+        next_tracks_provider=next_provider,
+        socket_path=tmp_path / "mpv_stall_cap.sock",
+        ipc_connector=lambda _p: mock_ipc.client_sock,
+        spawn_process=False,
+        stall_timeout_sec=0.12,
+        stall_poll_interval_sec=0.03,
+    )
+
+    try:
+        cmd = mpv._build_mpv_spawn_cmd()
+        assert "--cache=yes" in cmd
+        assert "--demuxer-max-bytes=32MiB" in cmd
+        assert "--demuxer-max-back-bytes=16MiB" in cmd
+        assert "--demuxer-readahead-secs=300" in cmd
+
+        # Start Track A and advance time-pos to 97.0s
+        mpv.play("ukg_bass_bounce", track=tracks[0])
+        assert len(mock_ipc.wait_for_loadfile_count(1, timeout=1.5)) == 1
+        mock_ipc.emit_event({"event": "property-change", "name": "time-pos", "data": 97.0})
+        time.sleep(0.03)
+
+        # 1st stall freeze -> reloads STALL_VID_1_v2 with start=97.0 (NOT 0:00)
+        loads2 = mock_ipc.wait_for_loadfile_count(2, timeout=2.0)
+        assert len(loads2) >= 2
+        assert "STALL_VID_1_v2.m4a" in loads2[1][1]
+        assert "start=97.0" in loads2[1]
+
+        # Even if playback progresses a few seconds (97s -> 103s), per-video stall retry count MUST NOT reset!
+        mock_ipc.emit_event({"event": "property-change", "name": "time-pos", "data": 100.0})
+        time.sleep(0.02)
+        mock_ipc.emit_event({"event": "property-change", "name": "time-pos", "data": 103.0})
+
+        # 2nd stall freeze on same track -> skips immediately to STALL_VID_2 (no 0:00 infinite loop)
+        loads3 = mock_ipc.wait_for_loadfile_count(3, timeout=2.0)
+        assert len(loads3) >= 3
+        assert "STALL_VID_2_v1.m4a" in loads3[2][1]
+        assert resolve_counts["STALL_VID_1"] == 2
+    finally:
+        mpv.shutdown()
+        mock_ipc.close()
+

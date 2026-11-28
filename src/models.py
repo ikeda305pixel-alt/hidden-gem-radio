@@ -156,8 +156,38 @@ _JAPANESE_ENGLISH_ARTISTS: frozenset[str] = frozenset(
         "eyden",
         "bonbero",
         "kohjiya",
+        "chotokkyu",
+        "bullet train",
+        "more star",
     }
 )
+
+_JA_CHAR_RE = re.compile(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]")
+
+
+def has_japanese_metadata(
+    *,
+    title: str | None = None,
+    artist: str | None = None,
+    channel: str | None = None,
+    channel_title: str | None = None,
+    raw_title: str | None = None,
+    description: str | None = None,
+    album: str | None = None,
+    extra_texts: list[str] | None = None,
+) -> bool:
+    """Return True if any metadata field contains Japanese script (Hiragana, Katakana, or Kanji)."""
+    fields = [
+        title,
+        artist,
+        channel,
+        channel_title,
+        raw_title,
+        description,
+        album,
+        *(extra_texts or []),
+    ]
+    return any(bool(val and _JA_CHAR_RE.search(str(val))) for val in fields)
 
 
 def normalize_text(value: str) -> str:

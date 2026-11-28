@@ -120,6 +120,8 @@ class MpvLocalPlayer:
         self._load_generation: int = 0
         self._consecutive_errors: int = 0
         self._retried_error_vids: set[str] = set()
+        self._stall_retries_by_video: dict[str, int] = {}
+        self._pending_resume_seek_sec: float | None = None
         self._last_progress_mono: float = 0.0
         self._last_observed_pos: float = -1.0
         self._stall_triggered_gen: int = -1
@@ -157,8 +159,9 @@ class MpvLocalPlayer:
             "--force-window=no",
             f"--ao={TERMUX_AO_PRIORITY}",
             "--cache=yes",
-            "--demuxer-max-bytes=16MiB",
-            "--demuxer-readahead-secs=20",
+            "--demuxer-max-bytes=32MiB",
+            "--demuxer-max-back-bytes=16MiB",
+            "--demuxer-readahead-secs=300",
             "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
             "--audio-stream-silence=no",
             f"--input-ipc-server={self.socket_path}",
@@ -225,7 +228,7 @@ class MpvLocalPlayer:
     def _stall_watchdog_loop(self) -> None:
         """Detect silent playback freezes (time-pos stagnant >= stall_timeout_sec) and auto-recover."""
         while not self._watchdog_stop.wait(timeout=self._stall_poll_interval_sec):
-            trigger: tuple[int, str, dict[str, Any]] | None = None
+            trigger: tuple[int, str, dict[str, Any], float] | None = None
             now_mono = time.monotonic()
             with self._state_lock:
                 if (
@@ -239,18 +242,20 @@ class MpvLocalPlayer:
                     and (now_mono - self._last_progress_mono) >= self._stall_timeout_sec
                 ):
                     self._stall_triggered_gen = self._load_generation
-                    trigger = (self._load_generation, self._station_id, dict(self._current_track))
+                    last_pos = max(0.0, float(self._position_sec or 0.0))
+                    trigger = (self._load_generation, self._station_id, dict(self._current_track), last_pos)
 
             if trigger is not None:
-                gen, st_id, frozen_track = trigger
+                gen, st_id, frozen_track, last_pos = trigger
                 logger.warning(
-                    "mpv silence-freeze detected (%.1fs stagnant on %s); recovering via refresh/skip",
+                    "mpv silence-freeze detected (%.1fs stagnant on %s at %.1fs); recovering via refresh/skip",
                     self._stall_timeout_sec,
                     frozen_track.get("video_id"),
+                    last_pos,
                 )
                 threading.Thread(
-                    target=self._handle_error_retry,
-                    args=(gen, st_id, frozen_track),
+                    target=self._handle_stall_recovery,
+                    args=(gen, st_id, frozen_track, last_pos),
                     daemon=True,
                     name="mpv-stall-recover",
                 ).start()
@@ -402,6 +407,21 @@ class MpvLocalPlayer:
                     self._muted = data
             return
 
+        if event == "file-loaded":
+            seek_target: float | None = None
+            with self._state_lock:
+                if (
+                    self._active
+                    and not self._user_stopped
+                    and self._pending_resume_seek_sec is not None
+                    and self._pending_resume_seek_sec > 1.0
+                ):
+                    seek_target = self._pending_resume_seek_sec
+                    self._pending_resume_seek_sec = None
+            if seek_target is not None:
+                self._send_command(["seek", seek_target, "absolute"], wait_reply=False)
+            return
+
         if event == "end-file":
             reason = str(msg.get("reason") or "").strip().lower()
             with self._state_lock:
@@ -467,6 +487,7 @@ class MpvLocalPlayer:
         *,
         expected_gen: int,
         force_refresh: bool = False,
+        start_sec: float | None = None,
     ) -> bool:
         vid = str(track.get("video_id") or "").strip()
         if not vid:
@@ -476,6 +497,7 @@ class MpvLocalPlayer:
 
         # Resolve stream URL outside control_lock so stop() is never blocked by yt-dlp latency
         stream_url, http_headers = self._resolve_stream_info(vid, force_refresh=force_refresh)
+        resume_pos = float(start_sec) if (start_sec is not None and float(start_sec) > 1.0) else None
 
         with self._control_lock:
             with self._state_lock:
@@ -487,13 +509,20 @@ class MpvLocalPlayer:
                 self._current_track = dict(track)
                 self._active = True
                 self._paused = False
-                self._position_sec = 0.0
+                self._position_sec = resume_pos if resume_pos is not None else 0.0
                 self._duration_sec = float(track.get("duration_seconds") or 0.0)
-                self._last_observed_pos = 0.0
+                self._last_observed_pos = resume_pos if resume_pos is not None else 0.0
                 self._last_progress_mono = time.monotonic()
+                self._pending_resume_seek_sec = resume_pos
 
             self._apply_http_headers_to_mpv(http_headers)
-            self._send_command(["loadfile", stream_url, "replace"], wait_reply=False)
+            if resume_pos is not None:
+                self._send_command(
+                    ["loadfile", stream_url, "replace", f"start={resume_pos:.1f}"],
+                    wait_reply=False,
+                )
+            else:
+                self._send_command(["loadfile", stream_url, "replace"], wait_reply=False)
             self._send_command(["set_property", "pause", False], wait_reply=False)
 
         self._refresh_queue_preview(station_id, exclude_track=track)
@@ -566,6 +595,49 @@ class MpvLocalPlayer:
         if next_tr is not None:
             self._load_track_internal(station_id, next_tr, expected_gen=expected_gen)
 
+    def _handle_stall_recovery(
+        self,
+        expected_gen: int,
+        station_id: str,
+        frozen_track: dict[str, Any] | None,
+        last_pos: float,
+    ) -> None:
+        """Recover from 12s silence freeze: max 1 reload per video_id (preserving last_pos), then skip to next track."""
+        frozen_vid = str(frozen_track.get("video_id") or "").strip() if frozen_track else ""
+        should_retry_same = False
+        with self._state_lock:
+            if self._user_stopped or not self._active or self._paused or self._load_generation != expected_gen:
+                return
+            retries = self._stall_retries_by_video.get(frozen_vid, 0) if frozen_vid else 1
+            if frozen_vid and retries < 1:
+                self._stall_retries_by_video[frozen_vid] = retries + 1
+                should_retry_same = True
+            else:
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= MAX_CONSECUTIVE_MPV_ERRORS:
+                    logger.warning("mpv hit %d consecutive stall/errors; stopping safely", self._consecutive_errors)
+                    self._active = False
+                    self._user_stopped = True
+                    return
+
+        if should_retry_same and frozen_track is not None and frozen_vid:
+            self.audio_resolver.invalidate(frozen_vid)
+            self._load_track_internal(
+                station_id,
+                frozen_track,
+                expected_gen=expected_gen,
+                force_refresh=True,
+                start_sec=(last_pos if last_pos > 1.0 else None),
+            )
+            return
+
+        exclude = set()
+        if frozen_track:
+            exclude = {str(x) for x in (frozen_track.get("track_id"), frozen_track.get("video_id")) if x}
+        next_tr = self._pick_next_track(station_id, exclude)
+        if next_tr is not None:
+            self._load_track_internal(station_id, next_tr, expected_gen=expected_gen)
+
     def _handle_error_retry(
         self,
         expected_gen: int,
@@ -621,6 +693,7 @@ class MpvLocalPlayer:
             self._paused = False
             self._consecutive_errors = 0
             self._retried_error_vids.clear()
+            self._stall_retries_by_video.clear()
             self._station_id = station_id
             self._load_generation += 1
             op_gen = self._load_generation

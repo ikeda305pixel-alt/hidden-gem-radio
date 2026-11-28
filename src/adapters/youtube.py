@@ -16,7 +16,30 @@ import httpx
 from ytmusicapi import YTMusic
 
 from src.adapters.base import MusicPlatformAdapter
-from src.models import PlaybackResolution, TrackEntity, normalize_text
+from src.models import (
+    PlaybackResolution,
+    TrackEntity,
+    has_japanese_metadata,
+    normalize_text,
+)
+
+
+def _item_has_japanese_metadata(item: dict[str, Any], *, extra_texts: list[str] | None = None) -> bool:
+    """Return True if any metadata field on a raw ytmusicapi track/video item contains Japanese characters."""
+    album_obj = item.get("album")
+    album_name = str(album_obj.get("name") or "") if isinstance(album_obj, dict) else str(album_obj or "")
+    artists = item.get("artists") or []
+    artist_names = [str(a.get("name") or "") for a in artists if isinstance(a, dict) and a.get("name")]
+    return has_japanese_metadata(
+        title=str(item.get("title") or ""),
+        raw_title=str(item.get("raw_title") or ""),
+        artist=str(item.get("artist") or ""),
+        channel=str(item.get("channel") or item.get("author") or ""),
+        channel_title=str(item.get("channel_title") or item.get("channelTitle") or ""),
+        description=str(item.get("description") or ""),
+        album=album_name,
+        extra_texts=[*artist_names, *(extra_texts or [])],
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -935,13 +958,8 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             if not vid or not raw_title or str(vid) == platform_track_id:
                 continue
             duration = parse_duration_seconds(item.get("duration_seconds"), item.get("length"))
-            if reject_japanese_context:
-                from src.models import _JP_SCRIPT_RE
-
-                album_obj = item.get("album")
-                album_name = str(album_obj.get("name") or "") if isinstance(album_obj, dict) else str(album_obj or "")
-                if album_name and _JP_SCRIPT_RE.search(album_name):
-                    continue
+            if reject_japanese_context and _item_has_japanese_metadata(item):
+                continue
             if str(item.get("videoType") or "") == "MUSIC_VIDEO_TYPE_UGC":
                 if duration is None or not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                     continue
@@ -1016,17 +1034,14 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
 
             songs_section = rel_detail.get("songs") or {}
             raw_songs = list(songs_section.get("results") or [])
-            if reject_japanese_context:
-                from src.models import _JP_SCRIPT_RE
-
-                artist_context_texts = [
-                    rel_name,
-                    str(rel_detail.get("name") or ""),
-                    str(rel_detail.get("description") or ""),
-                    *[str(s.get("title") or "") for s in raw_songs[:10] if isinstance(s, dict)],
-                ]
-                if any(_JP_SCRIPT_RE.search(t) for t in artist_context_texts if t):
-                    continue
+            if reject_japanese_context and has_japanese_metadata(
+                artist=rel_name,
+                channel=str(rel_detail.get("channel") or rel_detail.get("name") or ""),
+                channel_title=str(rel_detail.get("channel_title") or rel_detail.get("channelTitle") or ""),
+                description=str(rel_detail.get("description") or ""),
+                extra_texts=[str(s.get("title") or "") for s in raw_songs[:10] if isinstance(s, dict)],
+            ):
+                continue
             # If the artist page exposes a full songs browseId (playlist), fetch deeper cuts (#3..#15)
             songs_browse = songs_section.get("browseId")
             if songs_browse and len(raw_songs) < deep_cut_end and hasattr(self._yt, "get_playlist"):
@@ -1047,10 +1062,16 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                 raw_title = str(item.get("title") or "").strip()
                 if not vid or not raw_title or str(vid) in seen_vids:
                     continue
+                if reject_japanese_context and _item_has_japanese_metadata(item):
+                    continue
                 duration = parse_duration_seconds(item.get("duration_seconds"), item.get("duration") or item.get("length"))
                 if str(item.get("videoType") or "") == "MUSIC_VIDEO_TYPE_UGC":
                     if duration is None or not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                         continue
+                    if reject_japanese_context:
+                        ugc_views = parse_view_count(item.get("views"))
+                        if ugc_views is not None and ugc_views < 100_000:
+                            continue
                 elif duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                     continue
 
@@ -1084,7 +1105,10 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
             radio_id = str(artist_data.get("radioId") or "").strip()
             if radio_id and hasattr(self._yt, "get_watch_playlist"):
                 try:
-                    radio_watch = self._yt.get_watch_playlist(playlistId=radio_id, limit=25) or {}
+                    radio_watch = self._yt.get_watch_playlist(
+                        playlistId=radio_id,
+                        limit=(12 if reject_japanese_context else 25),
+                    ) or {}
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("ytmusicapi get_watch_playlist(playlistId=%s) failed: %s", radio_id, exc)
                     radio_watch = {}
@@ -1095,10 +1119,16 @@ class YouTubeMusicAdapter(MusicPlatformAdapter):
                     raw_title = str(item.get("title") or "").strip()
                     if not vid or not raw_title or str(vid) in seen_vids:
                         continue
+                    if reject_japanese_context and _item_has_japanese_metadata(item):
+                        continue
                     duration = parse_duration_seconds(item.get("duration_seconds"), item.get("length"))
                     if str(item.get("videoType") or "") == "MUSIC_VIDEO_TYPE_UGC":
                         if duration is None or not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                             continue
+                        if reject_japanese_context:
+                            ugc_views = parse_view_count(item.get("views"))
+                            if ugc_views is not None and ugc_views < 100_000:
+                                continue
                     elif duration is not None and not (_MIN_SONG_SECONDS <= duration <= _MAX_SONG_SECONDS):
                         continue
 

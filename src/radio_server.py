@@ -300,6 +300,9 @@ class RadioRuntime:
         with self._dig_state_lock:
             for s in station_list:
                 self._dig_locks.setdefault(s.station_id, threading.Lock())
+        for s in station_list:
+            if s.region_policy == "western_only":
+                self.db.purge_japanese_unheard_for_station(s.station_id)
 
     def get_station(self, station_id: str) -> StationConfig:
         station = self.stations.get(station_id)
@@ -488,6 +491,22 @@ class RadioRuntime:
                 include_heard_fallback=True,
                 exclude_canonical_keys=self.known_track_keys,
             )
+
+        if station.region_policy == "western_only" and candidates:
+            from src.models import has_japanese_metadata, is_japanese_music_entity
+
+            candidates = [
+                tr
+                for tr in candidates
+                if not (
+                    is_japanese_music_entity(tr.artist, tr.title)
+                    or has_japanese_metadata(
+                        title=tr.title,
+                        artist=tr.artist,
+                        extra_texts=[*tr.tags],
+                    )
+                )
+            ]
 
         bandit = self.bandits[station.station_id]
         ranked = bandit.rank_candidates(
