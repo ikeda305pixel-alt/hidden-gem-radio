@@ -609,7 +609,13 @@ class MpvLocalPlayer:
     def play(self, station_id: str, track: dict[str, Any] | None = None) -> dict[str, Any]:
         """Start or switch station playback on local mpv (clears stopped lock)."""
         with self._state_lock:
+            was_stopped = self._user_stopped or not self._active
             station_changed = station_id != self._station_id
+            resume_track = (
+                dict(self._current_track)
+                if (track is None and was_stopped and not station_changed and self._current_track)
+                else None
+            )
             self._user_stopped = False
             self._active = True
             self._paused = False
@@ -621,7 +627,7 @@ class MpvLocalPlayer:
             if station_changed:
                 self._queue_preview = []
 
-        target = track
+        target = track or resume_track
         if target is None:
             target = self._pick_next_track(station_id, set())
         if target is not None:
@@ -714,6 +720,8 @@ class MpvLocalPlayer:
         with self._control_lock:
             with self._state_lock:
                 self._position_sec = pos
+                self._last_observed_pos = pos
+                self._last_progress_mono = time.monotonic()
             self._send_command(["seek", pos, "absolute"], wait_reply=False)
         return self.get_state()
 

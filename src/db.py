@@ -867,6 +867,25 @@ class RadioDatabase:
                 counts[a_norm] = counts.get(a_norm, 0) + 1
         return counts
 
+    def count_unheard_by_seed(
+        self,
+        station_id: str,
+        max_popularity_views: int,
+    ) -> dict[str, int]:
+        """Return count of currently unheard playable tracks per normalized seed_artist key."""
+        unheard = self.get_eligible_candidates(
+            station_id,
+            max_popularity_views,
+            include_heard_fallback=False,
+        )
+        counts: dict[str, int] = {}
+        for tr in unheard:
+            s_norm = normalize_artist(tr.seed_artist or "")
+            if s_norm:
+                key = f"artist:{s_norm}"
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def get_audio_feature_cache(
         self,
         *,

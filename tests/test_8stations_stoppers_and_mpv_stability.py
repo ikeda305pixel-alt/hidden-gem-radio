@@ -688,3 +688,200 @@ runAll().catch((err) => {
     proc = subprocess.run(["node", "-e", script], check=False, capture_output=True, text=True, timeout=15)
     assert proc.returncode == 0, f"Unified play/stop UI test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert '"ok":true' in proc.stdout.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# 8. Audit P0/P1/P2 Regression Tests
+# ---------------------------------------------------------------------------
+def test_p0_split_artist_credits_respects_word_boundaries() -> None:
+    assert split_artist_credits("Daft Punk") == ["daft punk"]
+    assert split_artist_credits("Jabberloop x Soft Lipa") == ["jabberloop", "soft lipa"]
+    assert split_artist_credits("Taylor Swift") == ["taylor swift"]
+    assert split_artist_credits("Leftfield") == ["leftfield"]
+    assert split_artist_credits("Chrystal ft. NOTION") == ["chrystal", "notion"]
+    assert split_artist_credits("Disclosure feat. Sam Smith") == ["disclosure", "sam smith"]
+
+
+def test_p0_official_atv_titles_do_not_false_positive_on_live_or_piano() -> None:
+    base_atv = {
+        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+        "artists": [{"name": "Oasis", "id": "UC_OASIS"}],
+        "album": {"name": "Definitely Maybe"},
+    }
+    assert is_slop_or_unofficial({**base_atv, "title": "Live Forever"}) is False
+    assert is_slop_or_unofficial({**base_atv, "title": "Live Your Life"}) is False
+    assert is_slop_or_unofficial({**base_atv, "title": "Piano Man"}) is False
+
+    # Actual live recordings / amateur covers still rejected
+    assert is_slop_or_unofficial({**base_atv, "title": "Song (Live at Budokan)"}) is True
+    assert is_slop_or_unofficial({**base_atv, "title": "Song - Live"}) is True
+    assert is_slop_or_unofficial({**base_atv, "title": "Song (Piano Ver.)"}) is True
+    assert is_slop_or_unofficial({**base_atv, "title": "歌ってみた"}) is True
+
+
+def test_p1_mpv_backward_seek_no_false_stall_and_stop_resumes_same_track(tmp_path: Path) -> None:
+    mock_ipc = _MiniMockMpvIpc()
+
+    def fake_extract(vid: str) -> CachedAudioStream:
+        return CachedAudioStream(
+            video_id=vid,
+            url=f"https://audio.example.test/{vid}.m4a",
+            mime_type="audio/mp4",
+        )
+
+    tracks = [
+        {"track_id": "t1", "video_id": "SEEK_VID_1", "artist": "Artist 1", "title": "Song 1", "duration_seconds": 180},
+        {"track_id": "t2", "video_id": "SEEK_VID_2", "artist": "Artist 2", "title": "Song 2", "duration_seconds": 180},
+    ]
+
+    def next_provider(station_id: str, count: int, exclude: set[str]) -> list[dict[str, Any]]:
+        _ = (station_id, count)
+        return [t for t in tracks if t["video_id"] not in exclude and t["track_id"] not in exclude]
+
+    resolver = AudioStreamResolver(extractor=fake_extract)
+    mpv = MpvLocalPlayer(
+        audio_resolver=resolver,
+        next_tracks_provider=next_provider,
+        socket_path=tmp_path / "mpv_seek.sock",
+        ipc_connector=lambda _p: mock_ipc.client_sock,
+        spawn_process=False,
+        stall_timeout_sec=0.20,
+        stall_poll_interval_sec=0.04,
+    )
+
+    try:
+        mpv.play("ukg_bass_bounce", track=tracks[0])
+        assert len(mock_ipc.wait_for_loadfiles(1, timeout=1.5)) == 1
+
+        # Simulate playing at 60s, then backward seek to 10s, then advancing 10s -> 25s
+        mpv._handle_ipc_message({"event": "property-change", "name": "time-pos", "data": 60.0})
+        mpv.seek(10.0)
+        for pos in (12.0, 15.0, 19.0, 22.0, 25.0):
+            time.sleep(0.06)
+            mpv._handle_ipc_message({"event": "property-change", "name": "time-pos", "data": pos})
+
+        # Total elapsed > 0.30s (> stall_timeout_sec=0.20s), yet NO false reload/skip occurred!
+        loads_after_seek = mock_ipc.wait_for_loadfiles(1, timeout=0.2)
+        assert len(loads_after_seek) == 1
+
+        # stop() -> play(same_station) must resume the SAME track (SEEK_VID_1), not skip to SEEK_VID_2
+        mpv.stop()
+        st_resumed = mpv.play("ukg_bass_bounce")
+        loads_after_resume = mock_ipc.wait_for_loadfiles(2, timeout=1.5)
+        assert len(loads_after_resume) == 2
+        assert "SEEK_VID_1.m4a" in loads_after_resume[1][1]
+        assert st_resumed["track"]["video_id"] == "SEEK_VID_1"
+    finally:
+        mpv.shutdown()
+        mock_ipc.close()
+
+
+def test_p1_cumulative_db_seed_cap_prevents_overfill_across_repeated_digs(tmp_path: Path) -> None:
+    db = RadioDatabase(tmp_path / "radio.db")
+    # Pre-populate DB with 5 unheard tracks from SeedAlpha (already at 25% cap of target_pool_size=20)
+    for i in range(5):
+        db.upsert_track(
+            "ukg_bass_bounce",
+            TrackEntity.build(
+                artist=f"PreAlpha Artist {i}",
+                title=f"PreAlpha Song {i}",
+                video_id=f"PRE_ALPHA_{i}",
+                view_count=100_000,
+                seed_artist="SeedAlpha",
+            ),
+        )
+    # Also 1 unheard track from SeedBeta so pool is multi-seed
+    db.upsert_track(
+        "ukg_bass_bounce",
+        TrackEntity.build(
+            artist="PreBeta Artist 0",
+            title="PreBeta Song 0",
+            video_id="PRE_BETA_0",
+            view_count=100_000,
+            seed_artist="SeedBeta",
+        ),
+    )
+
+    counts = db.count_unheard_by_seed("ukg_bass_bounce", 500_000_000)
+    assert counts["artist:seedalpha"] == 5
+    assert counts["artist:seedbeta"] == 1
+
+    class FakeYTRedig:
+        def search(self, query: str, filter: str = "songs", limit: int = 8):
+            _ = (filter, limit)
+            if "seedalpha" in query.lower():
+                return [
+                    {
+                        "videoId": "SEED_A_VID",
+                        "title": "Anchor A",
+                        "artists": [{"name": "SeedAlpha", "id": "UC_SA"}],
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "resultType": "song",
+                        "duration": "3:00",
+                        "views": "1M",
+                    }
+                ]
+            if "seedbeta" in query.lower():
+                return [
+                    {
+                        "videoId": "SEED_B_VID",
+                        "title": "Anchor B",
+                        "artists": [{"name": "SeedBeta", "id": "UC_SB"}],
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "resultType": "song",
+                        "duration": "3:00",
+                        "views": "1M",
+                    }
+                ]
+            return []
+
+        def get_watch_playlist(self, videoId: str, radio: bool = True, limit: int = 25):
+            _ = (radio, limit)
+            if videoId == "SEED_A_VID":
+                return {
+                    "tracks": [
+                        {
+                            "videoId": f"NEW_ALPHA_{i}",
+                            "title": f"New Alpha {i}",
+                            "artists": [{"name": f"NewAlphaArtist {i}", "id": f"UC_NA{i}"}],
+                            "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                            "length": "3:00",
+                            "views": "200K",
+                        }
+                        for i in range(4)
+                    ]
+                }
+            return {
+                "tracks": [
+                    {
+                        "videoId": "NEW_BETA_1",
+                        "title": "New Beta 1",
+                        "artists": [{"name": "NewBetaArtist 1", "id": "UC_NB1"}],
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "length": "3:00",
+                        "views": "200K",
+                    }
+                ]
+            }
+
+        def get_artist(self, browseId: str):
+            _ = browseId
+            return {}
+
+    digger = CandidatePoolDigger(db=db, yt_adapter=YouTubeMusicAdapter(client=FakeYTRedig()))
+    st = StationConfig(
+        station_id="ukg_bass_bounce",
+        name="跳ねUKG ＆ ベース",
+        seed_tags=["uk garage"],
+        seed_artists=["SeedAlpha", "SeedBeta"],
+        spotify_anchor_seeds=["SeedAlpha - Anchor A", "SeedBeta - Anchor B"],
+        region_policy="western_only",
+    )
+    res = digger.dig_station(st, target_pool_size=20)
+    assert res["skipped_seed_cap"] == 4
+    assert res["added"] == 1
+
+    final_counts = db.count_unheard_by_seed("ukg_bass_bounce", 500_000_000)
+    assert final_counts["artist:seedalpha"] == 5
+    assert final_counts["artist:seedbeta"] == 2
+

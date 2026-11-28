@@ -326,16 +326,22 @@ class CandidatePoolDigger:
 
         ranked_graph = [*cooc_items, *round_robin_items]
 
+        seed_counter = getattr(self.db, "count_unheard_by_seed", None)
+        seed_added_counts: dict[str, int] = (
+            dict(seed_counter(station.station_id, station.max_popularity_views))
+            if callable(seed_counter)
+            else {}
+        )
+
         # Enforce per-seed pool cap (max 25% of target_pool_size or max 10 tracks) whenever multiple seeds exist
         # or caller explicitly specifies max_tracks_per_seed.
-        distinct_seed_keys = {primary_seed_for_vid[k] for k in graph_candidates}
+        distinct_seed_keys = {primary_seed_for_vid[k] for k in graph_candidates} | set(seed_added_counts.keys())
         enforce_seed_cap = (max_tracks_per_seed is not None) or (len(distinct_seed_keys) >= 2)
         per_seed_cap = (
             max(1, int(max_tracks_per_seed))
             if max_tracks_per_seed is not None
             else min(10, max(1, int(target_pool_size * 0.25)))
         )
-        seed_added_counts: dict[str, int] = {}
 
         added = 0
         cooccurring_count = 0

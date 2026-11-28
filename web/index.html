@@ -1147,18 +1147,11 @@
         navigator.mediaSession.setActionHandler("pause", () => {
           clearPlaybackWatchdog();
           if (isMpvModeActive()) {
-            state.localControlEpoch += 1;
-            fetchJson(
-              "/api/local-player/toggle",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ station_id: state.activeStationId }),
-              },
-              5000
-            )
-              .then((lp) => syncFromLocalPlayerState(lp))
-              .catch(() => {});
+            const lpNow = state.localPlayerState;
+            const isPlaying = Boolean(lpNow && lpNow.active && !lpNow.stopped && !lpNow.paused);
+            if (isPlaying) {
+              handleHardStop();
+            }
             return;
           }
           if (isAudioModeActive()) {
@@ -2256,12 +2249,22 @@
             lpNow && lpNow.active && !lpNow.stopped && lpNow.paused
               ? "/api/local-player/toggle"
               : "/api/local-player/play";
+          const resumeTrack =
+            endpoint === "/api/local-player/play" &&
+            lpNow &&
+            lpNow.track &&
+            lpNow.station_id === state.activeStationId
+              ? lpNow.track
+              : undefined;
+          const payload = resumeTrack
+            ? { station_id: state.activeStationId, track: resumeTrack }
+            : { station_id: state.activeStationId };
           const lp = await fetchJson(
             endpoint,
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ station_id: state.activeStationId }),
+              body: JSON.stringify(payload),
             },
             5500
           );

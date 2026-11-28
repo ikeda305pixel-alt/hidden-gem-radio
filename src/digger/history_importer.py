@@ -83,7 +83,7 @@ _EPISODE_OR_NUMBERED_RE = re.compile(
     re.IGNORECASE,
 )
 _COLLAB_SPLIT_RE = re.compile(
-    r"\s*(?:feat\.?|ft\.?|&|,|\s+x\s+|×|\bwith\b)\s*",
+    r"\s*(?:\b(?:feat|ft|vs)\.?(?=\s|$)|\b(?:featuring|with)\b|&|,|\s+x\s+|×)\s*",
     re.IGNORECASE,
 )
 _MUSIC_SIGNAL_TITLE_RE = re.compile(

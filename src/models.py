@@ -201,7 +201,7 @@ def normalize_track_key(artist: str, title: str) -> str:
 
 
 _ARTIST_CREDIT_SPLIT_RE = re.compile(
-    r"\s*(?:feat\.?|ft\.?|featuring|&|,|\+|/|\s+x\s+|×|\bwith\b|\bvs\.?\b)\s*",
+    r"\s*(?:\b(?:feat|ft|vs)\.?(?=\s|$)|\b(?:featuring|with)\b|&|,|\+|/|\s+x\s+|×)\s*",
     re.IGNORECASE,
 )
 

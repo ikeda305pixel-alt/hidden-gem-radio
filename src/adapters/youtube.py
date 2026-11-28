@@ -57,9 +57,13 @@ _ALLOWED_OFFICIAL_VIDEO_TYPES = frozenset(
 )
 _SLOP_TITLE_RE = re.compile(
     r"(?:\b(?:ai\s*generated|suno|udio|type\s*beat|free\s*beat|1\s*hour|slowed|reverb|"
-    r"nightcore|sped\s*up|spedup|karaoke|cover|piano|acoustic|instrumental|off\s*vocal|"
-    r"live|concert|full\s*album|loop\s*1h|8d\s*audio)\b|"
-    r"(?:歌ってみた|弾いてみた|カバー|カラオケ|ピアノ|アコースティック|インスト|オフボーカル|ライブ|コンサート))",
+    r"nightcore|sped\s*up|spedup|karaoke|cover|off\s*vocal|full\s*album|loop\s*1h|8d\s*audio|"
+    r"piano\s*(?:ver\.?|version|cover|arr(?:angement)?)|"
+    r"acoustic\s*(?:ver\.?|version|cover|session)|"
+    r"live\s+(?:at|from|in|ver\.?|version|session|performance|concert))\b|"
+    r"[\(\[\-–—]\s*(?:live|concert|acoustic|piano|instrumental|cover|karaoke|off\s*vocal)\b|"
+    r"(?:歌ってみた|弾いてみた|カバー|カラオケ|オフボーカル|"
+    r"(?:ピアノ|アコースティック|インスト|ライブ|コンサート)(?:ver|バージョン|版|カバー|演奏)?))",
     re.IGNORECASE,
 )
 _ALT_REJECT_RE = re.compile(

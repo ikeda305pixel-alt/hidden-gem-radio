@@ -40,7 +40,7 @@ fi
 
 # Refresh stations.yaml automatically if watch-history.json exists and is newer than stations.yaml
 if [ -f "data/watch-history.json" ]; then
-  if [ ! -f "config/stations.yaml" ] || [ "data/watch-history.json" -nt "config/stations.yaml" ]; then
+  if [ ! -f "config/stations.yaml" ] || [ "data/watch-history.json" -nt "config/stations.yaml" ] || ! grep -q "ukg_bass_bounce" "config/stations.yaml"; then
     echo "[Hidden Gem Radio] Updating config/stations.yaml from data/watch-history.json..."
     python3 -m src.digger.history_importer --stations 8 --offline || true
   fi
