@@ -118,9 +118,30 @@ class CandidatePoolDigger:
             w_title = str(item.get("top_title") or item.get("title") or "").strip()
             _add(w_artist, w_title, w_artist, default_arch)
 
-        # 2. Curated Spotify anchor tracks for this station
-        for idx, anchor in enumerate(station.spotify_anchor_seeds[:6]):
+        # 2. Curated Spotify anchor tracks (2-pass primary-artist diversification so 1 artist never monopolizes [:6])
+        chosen_anchors: list[tuple[int, str, str]] = []
+        deferred_anchors: list[tuple[int, str, str]] = []
+        seen_primary_artists: set[str] = {
+            (split_artist_credits(row[0])[0] if split_artist_credits(row[0]) else normalize_artist(row[0]))
+            for row in plan
+            if row[0]
+        }
+        for idx, anchor in enumerate(station.spotify_anchor_seeds):
             a, t = _parse_anchor(anchor)
+            if not a:
+                continue
+            tokens = split_artist_credits(a)
+            primary = tokens[0] if tokens else normalize_artist(a)
+            if primary and primary not in seen_primary_artists and len(chosen_anchors) < 6:
+                seen_primary_artists.add(primary)
+                chosen_anchors.append((idx, a, t))
+            else:
+                deferred_anchors.append((idx, a, t))
+        for item in deferred_anchors:
+            if len(chosen_anchors) >= 6:
+                break
+            chosen_anchors.append(item)
+        for idx, a, t in chosen_anchors:
             arch = (
                 station.theory_archetypes[idx % len(station.theory_archetypes)]
                 if station.theory_archetypes
@@ -152,6 +173,7 @@ class CandidatePoolDigger:
         max_alt_searches_per_dig: int = 12,
         max_tracks_per_artist_in_pool: int = 2,
         max_tracks_per_seed: int | None = None,
+        min_single_seed_views: int | None = None,
     ) -> dict[str, Any]:
         """Run Stage 1 Collaborative Co-occurrence Graph digging strictly within station's own seed graph."""
         from src.models import is_japanese_music_entity
@@ -223,6 +245,7 @@ class CandidatePoolDigger:
         skipped_familiar_artist = 0
         skipped_artist_cap = 0
         skipped_seed_cap = 0
+        skipped_low_views = 0
 
         def _ingest(tracks: list[TrackEntity], seed_artist_key: str, label: str) -> None:
             nonlocal skipped_popular, skipped_blocked, skipped_known, skipped_region_mismatch, skipped_familiar_artist
@@ -274,24 +297,43 @@ class CandidatePoolDigger:
             # Unify co-occurrence key by normalized seed artist so 2 songs by the same artist never self-co-occur
             artist_key = f"artist:{normalize_artist(seed_label) or seed_label.lower()}"
 
-            # 1. Watch Playlist Radio neighborhood (official songs only, slop filtered in adapter)
-            related = self.yt.get_related_tracks(
-                seed_vid,
-                limit=25,
-                seed_artist=seed_label,
-                seed_archetype=seed_arch,
-            )
+            # 1. Watch Playlist Radio neighborhood (tighter window on western_only to avoid JP radio drift)
+            watch_limit = 12 if is_western_only else 25
+            try:
+                related = self.yt.get_related_tracks(
+                    seed_vid,
+                    limit=watch_limit,
+                    seed_artist=seed_label,
+                    seed_archetype=seed_arch,
+                    reject_japanese_context=is_western_only,
+                )
+            except TypeError:
+                related = self.yt.get_related_tracks(
+                    seed_vid,
+                    limit=watch_limit,
+                    seed_artist=seed_label,
+                    seed_archetype=seed_arch,
+                )
             _ingest(related, artist_key, f"{seed_label} 関連")
 
             # 2. Related real artists -> deep cuts (songs #3..#15), deduplicated per artist_browse_id
             if artist_browse_id and artist_browse_id not in seen_artist_browse_ids:
                 seen_artist_browse_ids.add(artist_browse_id)
-                deep_cuts = self.yt.get_artist_related_deep_cuts(
-                    artist_browse_id,
-                    seed_label=seed_label,
-                    seed_archetype=seed_arch,
-                    max_related_artists=3,
-                )
+                try:
+                    deep_cuts = self.yt.get_artist_related_deep_cuts(
+                        artist_browse_id,
+                        seed_label=seed_label,
+                        seed_archetype=seed_arch,
+                        max_related_artists=3,
+                        reject_japanese_context=is_western_only,
+                    )
+                except TypeError:
+                    deep_cuts = self.yt.get_artist_related_deep_cuts(
+                        artist_browse_id,
+                        seed_label=seed_label,
+                        seed_archetype=seed_arch,
+                        max_related_artists=3,
+                    )
                 _ingest(deep_cuts, artist_key, f"{seed_label} 関連アーティスト")
 
         # Prioritize multi-seed co-occurring gems first, then round-robin across distinct seeds
@@ -363,6 +405,19 @@ class CandidatePoolDigger:
             s_key = primary_seed_for_vid.get(vid_key, "artist:unknown")
             if enforce_seed_cap and seed_added_counts.get(s_key, 0) >= per_seed_cap:
                 skipped_seed_cap += 1
+                continue
+            eff_min_views = (
+                int(min_single_seed_views)
+                if min_single_seed_views is not None
+                else (50_000 if (is_western_only and station.max_popularity_views >= 10_000_000) else 0)
+            )
+            if (
+                eff_min_views > 0
+                and len(seed_hit_sets[vid_key]) < 2
+                and track.view_count is not None
+                and track.view_count < eff_min_views
+            ):
+                skipped_low_views += 1
                 continue
             a_norm = normalize_artist(track.artist)
             if a_norm and pool_artist_counts.get(a_norm, 0) >= pool_artist_cap:
@@ -483,6 +538,7 @@ class CandidatePoolDigger:
             "skipped_familiar_artist": skipped_familiar_artist,
             "skipped_artist_cap": skipped_artist_cap,
             "skipped_seed_cap": skipped_seed_cap,
+            "skipped_low_views": skipped_low_views,
             "skipped_unembeddable": skipped_unembeddable,
             "replaced_omv": replaced_omv,
             "replaced_lyric": replaced_lyric,

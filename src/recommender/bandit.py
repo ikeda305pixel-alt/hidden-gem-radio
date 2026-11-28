@@ -718,6 +718,23 @@ class ContextualBanditRecommender:
             max_sim = np.max(sim_mat, axis=1)
             total_scores = 0.75 * total_scores - 0.25 * max_sim
 
+        # Unverified-MIR / Low-View Single-Seed Penalty:
+        # Never let unmeasured fallback vectors (BPM unmeasured & no Deezer/MIR cache) masquerade as top Exploit picks.
+        for idx, track in enumerate(candidates):
+            is_unverified_mir = (
+                measured_bpms[idx] is None
+                and not track.mir_vector
+                and track.deezer_id is None
+            )
+            if is_unverified_mir:
+                total_scores[idx] -= 0.22
+                if (
+                    track.cooccurrence_count < 2
+                    and track.view_count is not None
+                    and track.view_count < 50_000
+                ):
+                    total_scores[idx] -= 0.18
+
         # Stage 3 Consecutive-Seed Penalty: strongly penalize candidates sharing seed_artist
         # with the recent 2-3 played tracks to prevent single-seed loops.
         recent_seed_list = [

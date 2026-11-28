@@ -885,3 +885,260 @@ def test_p1_cumulative_db_seed_cap_prevents_overfill_across_repeated_digs(tmp_pa
     assert final_counts["artist:seedalpha"] == 5
     assert final_counts["artist:seedbeta"] == 2
 
+
+# ---------------------------------------------------------------------------
+# 9. Western-Only Drift, Seed Diversification, Low-View & Unverified-MIR Guards
+# ---------------------------------------------------------------------------
+def test_us_hiphop_seed_plan_diversifies_primary_artists(tmp_path: Path) -> None:
+    stations = {s.station_id: s for s in default_theory_stations()}
+    us_station = stations["us_hiphop_bouncy"]
+    db = RadioDatabase(tmp_path / "radio.db")
+    digger = CandidatePoolDigger(db=db, yt_adapter=YouTubeMusicAdapter(client=object()))  # type: ignore[arg-type]
+
+    plan = digger._build_station_seed_plan(us_station, max_seeds=6)
+    assert len(plan) == 6
+    primaries = [split_artist_credits(row[0])[0] for row in plan]
+    # Must NOT be monopolized by bbno$ — all 6 primary artists should be distinct
+    assert len(set(primaries)) >= 5
+    assert "bbno" in primaries
+    assert "kyle" in primaries
+    assert "macklemore" in primaries
+
+
+def test_reject_japanese_context_blocks_romanized_jp_idol_and_low_view_ugc() -> None:
+    class FakeYTJpContext:
+        def get_watch_playlist(self, videoId: str, radio: bool = True, limit: int = 25):
+            _ = (videoId, radio, limit)
+            return {
+                "tracks": [
+                    {
+                        "videoId": "VID_UGC_LOW",
+                        "title": "ANKI WITH ME",
+                        "artists": [{"name": "MORE STAR", "id": "UC_MORE_STAR"}],
+                        "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                        "length": "3:10",
+                        "views": "22K",
+                    },
+                    {
+                        "videoId": "VID_JP_ALBUM",
+                        "title": "ENGLISH TITLE",
+                        "artists": [{"name": "IDOL GROUP", "id": "UC_IDOL"}],
+                        "album": {"name": "ファーストアルバム"},
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "length": "3:15",
+                        "views": "500K",
+                    },
+                    {
+                        "videoId": "VID_WEST_OK",
+                        "title": "Real Bounce Cut",
+                        "artists": [{"name": "Yung Gravy", "id": "UC_YG"}],
+                        "album": {"name": "Marvelous"},
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "length": "2:55",
+                        "views": "800K",
+                    },
+                ]
+            }
+
+        def get_artist(self, browseId: str):
+            if browseId == "UC_SEED_US":
+                return {
+                    "related": {
+                        "results": [
+                            {"browseId": "UC_MORE_STAR", "title": "MORE STAR"},
+                            {"browseId": "UC_REAL_US", "title": "Duckwrth"},
+                        ]
+                    }
+                }
+            if browseId == "UC_MORE_STAR":
+                return {
+                    "name": "MORE STAR",
+                    "description": "東京を拠点に活動する日本のアイドルグループ",
+                    "songs": {
+                        "results": [
+                            {
+                                "videoId": "VID_IDOL_ENG",
+                                "title": "ANKI WITH ME",
+                                "artists": [{"name": "MORE STAR", "id": "UC_MORE_STAR"}],
+                                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                                "duration": "3:05",
+                                "views": "22K",
+                            },
+                            {
+                                "videoId": "VID_IDOL_JP",
+                                "title": "キラメキ☆スター",
+                                "artists": [{"name": "MORE STAR", "id": "UC_MORE_STAR"}],
+                                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                                "duration": "3:20",
+                                "views": "15K",
+                            },
+                        ]
+                    },
+                }
+            if browseId == "UC_REAL_US":
+                return {
+                    "name": "Duckwrth",
+                    "description": "Los Angeles rapper and singer.",
+                    "songs": {
+                        "results": [
+                            {
+                                "videoId": "VID_DUCK_1",
+                                "title": "Michuul",
+                                "artists": [{"name": "Duckwrth", "id": "UC_REAL_US"}],
+                                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                                "duration": "3:12",
+                                "views": "2.1M",
+                            }
+                        ]
+                    },
+                }
+            return {}
+
+    adapter = YouTubeMusicAdapter(client=FakeYTJpContext())
+    related = adapter.get_related_tracks("SEED_1", limit=12, reject_japanese_context=True)
+    rel_vids = {t.video_id for t in related}
+    assert "VID_UGC_LOW" not in rel_vids
+    assert "VID_JP_ALBUM" not in rel_vids
+    assert "VID_WEST_OK" in rel_vids
+
+    deep = adapter.get_artist_related_deep_cuts("UC_SEED_US", reject_japanese_context=True)
+    deep_vids = {t.video_id for t in deep}
+    assert "VID_IDOL_ENG" not in deep_vids
+    assert "VID_IDOL_JP" not in deep_vids
+    assert "VID_DUCK_1" in deep_vids
+
+
+def test_western_only_dig_station_cuts_single_seed_low_views_but_keeps_cooc_and_high_views(tmp_path: Path) -> None:
+    class FakeYTLowViews:
+        def search(self, query: str, filter: str = "songs", limit: int = 8):
+            _ = (filter, limit)
+            if "bbno" in query.lower():
+                return [
+                    {
+                        "videoId": "SEED_BBNO",
+                        "title": "edamame",
+                        "artists": [{"name": "bbno$", "id": "UC_BBNO"}],
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "resultType": "song",
+                        "duration": "2:15",
+                        "views": "50M",
+                    }
+                ]
+            if "kyle" in query.lower():
+                return [
+                    {
+                        "videoId": "SEED_KYLE",
+                        "title": "iSpy",
+                        "artists": [{"name": "KYLE", "id": "UC_KYLE"}],
+                        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                        "resultType": "song",
+                        "duration": "4:12",
+                        "views": "100M",
+                    }
+                ]
+            return []
+
+        def get_watch_playlist(self, videoId: str, radio: bool = True, limit: int = 25):
+            _ = (radio, limit)
+            cooc_gem = {
+                "videoId": "VID_COOC_LOWV",
+                "title": "True Cult Gem",
+                "artists": [{"name": "Cult Artist", "id": "UC_CULT"}],
+                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                "length": "3:00",
+                "views": "25K",
+            }
+            if videoId == "SEED_BBNO":
+                return {
+                    "tracks": [
+                        cooc_gem,
+                        {
+                            "videoId": "VID_SINGLE_22K",
+                            "title": "ANKI WITH ME",
+                            "artists": [{"name": "MORE STAR", "id": "UC_MS"}],
+                            "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                            "length": "3:00",
+                            "views": "22K",
+                        },
+                        {
+                            "videoId": "VID_SINGLE_200K",
+                            "title": "Legit Single Cut",
+                            "artists": [{"name": "Amine", "id": "UC_AMINE"}],
+                            "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                            "length": "3:10",
+                            "views": "200K",
+                        },
+                    ]
+                }
+            return {"tracks": [cooc_gem]}
+
+        def get_artist(self, browseId: str):
+            _ = browseId
+            return {}
+
+    db = RadioDatabase(tmp_path / "radio.db")
+    digger = CandidatePoolDigger(db=db, yt_adapter=YouTubeMusicAdapter(client=FakeYTLowViews()))
+    st = StationConfig(
+        station_id="us_hiphop_bouncy",
+        name="US バウンス",
+        seed_tags=["hip hop"],
+        seed_artists=["bbno$", "KYLE"],
+        spotify_anchor_seeds=["bbno$ - edamame", "KYLE - iSpy"],
+        region_policy="western_only",
+        max_popularity_views=500_000_000,
+    )
+    res = digger.dig_station(st, target_pool_size=20)
+    assert res["skipped_low_views"] == 1
+
+    eligible = db.get_eligible_candidates("us_hiphop_bouncy", 500_000_000)
+    vids = {t.video_id for t in eligible}
+    assert "VID_SINGLE_22K" not in vids
+    assert "VID_COOC_LOWV" in vids
+    assert "VID_SINGLE_200K" in vids
+
+
+def test_bandit_penalizes_unverified_mir_low_view_candidate_below_measured_track(tmp_path: Path) -> None:
+    st = StationConfig(
+        station_id="us_hiphop_bouncy",
+        name="US バウンス",
+        seed_tags=["hip hop", "bouncy rap"],
+        seed_artists=["bbno$", "KYLE"],
+        region_policy="western_only",
+    )
+    bandit = ContextualBanditRecommender(
+        station_id="us_hiphop_bouncy",
+        seed_tags=st.seed_tags,
+        model_path=tmp_path / "bandit_unverified.pkl",
+        station_config=st,
+    )
+
+    measured_track = TrackEntity.build(
+        artist="Verified Rapper",
+        title="Measured Groove",
+        tags=["hip hop"],
+        view_count=1_200_000,
+        video_id="VID_MEASURED",
+        seed_artist="KYLE",
+        deezer_id=123456,
+        deezer_bpm=112.0,
+        mir_vector=[0.52, 0.78, 0.76, 0.78, 0.44, 0.48, 0.46, 0.46, 0.44, 0.28, 0.78, 0.62, 0.65, 0.80, 0.90, 0.55],
+    )
+    unverified_minor = TrackEntity.build(
+        artist="MORE STAR",
+        title="ANKI WITH ME",
+        tags=["hip hop"],
+        view_count=22_000,
+        video_id="VID_UNVERIFIED_22K",
+        seed_artist="bbno$",
+        cooccurrence_count=1,
+    )
+
+    ranked = bandit.rank_candidates(
+        [unverified_minor, measured_track],
+        seen_artists=set(),
+        limit=2,
+    )
+    assert ranked[0].track.video_id == "VID_MEASURED"
+    assert ranked[0].score > ranked[1].score + 0.25
+
+
